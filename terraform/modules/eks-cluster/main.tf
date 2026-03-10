@@ -14,12 +14,17 @@ module "eks" {
 
   cluster_endpoint_public_access = true
 
+  # Allow the provisioning IAM principal full cluster admin access
+  enable_cluster_creator_admin_permissions = true
+
   eks_managed_node_groups = {
     default = {
       instance_types = var.node_instance_types
       min_size       = var.node_min_size
       max_size       = var.node_max_size
       desired_size   = var.node_desired_size
+
+      force_update_version = true
 
       labels = {
         environment = var.environment

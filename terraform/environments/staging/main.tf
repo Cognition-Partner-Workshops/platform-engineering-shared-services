@@ -9,9 +9,11 @@ terraform {
   }
 
   backend "s3" {
-    bucket = "workshop-terraform-state"
-    key    = "platform/staging/terraform.tfstate"
-    region = "us-east-1"
+    bucket         = "workshop-terraform-state-599083837640"
+    key            = "platform/staging/terraform.tfstate"
+    region         = "us-east-1"
+    dynamodb_table = "workshop-terraform-lock"
+    encrypt        = true
   }
 }
 
