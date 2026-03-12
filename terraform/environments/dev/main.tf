@@ -6,6 +6,10 @@ terraform {
       source  = "hashicorp/aws"
       version = "~> 5.0"
     }
+    kubernetes = {
+      source  = "hashicorp/kubernetes"
+      version = "~> 2.0"
+    }
   }
 
   backend "s3" {
@@ -21,6 +25,18 @@ provider "aws" {
   region = var.region
 }
 
+# Kubernetes provider configured after EKS is created
+provider "kubernetes" {
+  host                   = module.eks.cluster_endpoint
+  cluster_ca_certificate = base64decode(module.eks.cluster_certificate_authority_data)
+
+  exec {
+    api_version = "client.authentication.k8s.io/v1beta1"
+    command     = "aws"
+    args        = ["eks", "get-token", "--cluster-name", module.eks.cluster_name]
+  }
+}
+
 locals {
   environment = "dev"
   tags = {
@@ -28,7 +44,35 @@ locals {
     ManagedBy   = "terraform"
     Project     = "workshop-platform"
   }
+
+  # ECR repositories for the dotnet-angular-monolith decomposition demo
+  ecr_repositories = [
+    "workshop/web-frontend",
+    "workshop/api-gateway",
+    "workshop/order-service",
+    "workshop/inventory-service",
+    "workshop/customer-service",
+    "workshop/product-service",
+  ]
+
+  # App namespaces for the decomposition demo
+  app_namespaces = [
+    {
+      name        = "decomposition-dev"
+      environment = "dev"
+      team        = "dotnet-angular-monolith"
+    },
+    {
+      name        = "decomposition-staging"
+      environment = "staging"
+      team        = "dotnet-angular-monolith"
+    },
+  ]
 }
+
+################################################################################
+# Core Infrastructure
+################################################################################
 
 module "networking" {
   source = "../../modules/networking"
@@ -55,6 +99,33 @@ module "eks" {
   tags                = local.tags
 }
 
+################################################################################
+# Container Registry
+################################################################################
+
+module "ecr" {
+  source = "../../modules/ecr"
+
+  repository_names = local.ecr_repositories
+  tags             = local.tags
+}
+
+################################################################################
+# App Namespaces
+################################################################################
+
+module "namespaces" {
+  source = "../../modules/namespaces"
+
+  namespaces = local.app_namespaces
+
+  depends_on = [module.eks]
+}
+
+################################################################################
+# Variables & Outputs
+################################################################################
+
 variable "region" {
   description = "AWS region"
   type        = string
@@ -67,4 +138,12 @@ output "cluster_endpoint" {
 
 output "cluster_name" {
   value = module.eks.cluster_name
+}
+
+output "ecr_repository_urls" {
+  value = module.ecr.repository_urls
+}
+
+output "app_namespaces" {
+  value = module.namespaces.namespace_names
 }
