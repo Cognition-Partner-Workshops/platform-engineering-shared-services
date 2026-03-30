@@ -88,9 +88,10 @@ export async function issuerRoutes(fastify: FastifyInstance) {
   });
 
   // Verify issuer (public endpoint for verifiers)
-  fastify.get<{ Params: { did: string } }>('/registry/verify/:did', async (req, reply) => {
-    const { did } = req.params;
-    const decodedDid = decodeURIComponent(did);
+  fastify.get('/registry/verify/*', async (req, reply) => {
+    const rawUrl = req.url;
+    const prefix = '/registry/verify/';
+    const decodedDid = decodeURIComponent(rawUrl.slice(rawUrl.indexOf(prefix) + prefix.length));
     const issuer = db.select().from(schema.issuers).where(eq(schema.issuers.did, decodedDid)).get();
     if (!issuer) {
       return { trusted: false, reason: 'Issuer not found in registry' };
