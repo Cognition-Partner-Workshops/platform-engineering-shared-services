@@ -1,0 +1,80 @@
+name: Terraform Validate
+
+on:
+  pull_request:
+    branches:
+      - "**"
+    paths:
+      - "terraform/**"
+      - ".github/workflows/terraform-validate.yml"
+
+jobs:
+  discover-modules:
+    name: Discover Modules
+    runs-on: ubuntu-latest
+    outputs:
+      modules: ${{ steps.find.outputs.modules }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Find Terraform modules
+        id: find
+        run: |
+          modules=$(ls -d terraform/modules/*/ | xargs -I{} basename {} | jq -R -s -c 'split("\n") | map(select(. != ""))')
+          echo "modules=${modules}" >> "$GITHUB_OUTPUT"
+          echo "Discovered modules: ${modules}"
+
+  validate:
+    name: "Validate: ${{ matrix.module }}"
+    runs-on: ubuntu-latest
+    needs: discover-modules
+    strategy:
+      fail-fast: false
+      matrix:
+        module: ${{ fromJson(needs.discover-modules.outputs.modules) }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: "~> 1.5"
+
+      - name: Terraform Format Check (module)
+        run: terraform fmt -check -recursive -diff
+        working-directory: terraform/modules/${{ matrix.module }}
+
+      - name: Terraform Init (fixture)
+        run: terraform init
+        working-directory: terraform/tests/fixtures/${{ matrix.module }}
+
+      - name: Terraform Validate (fixture)
+        run: terraform validate
+        working-directory: terraform/tests/fixtures/${{ matrix.module }}
+
+  tflint:
+    name: "TFLint: ${{ matrix.module }}"
+    runs-on: ubuntu-latest
+    needs: discover-modules
+    strategy:
+      fail-fast: false
+      matrix:
+        module: ${{ fromJson(needs.discover-modules.outputs.modules) }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup TFLint
+        uses: terraform-linters/setup-tflint@v4
+        with:
+          tflint_version: latest
+
+      - name: Init TFLint
+        run: tflint --init --config "${{ github.workspace }}/terraform/.tflint.hcl"
+        working-directory: terraform/modules/${{ matrix.module }}
+
+      - name: Run TFLint
+        run: tflint --config "${{ github.workspace }}/terraform/.tflint.hcl" --format compact
+        working-directory: terraform/modules/${{ matrix.module }}
