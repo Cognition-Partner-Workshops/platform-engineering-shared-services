@@ -100,6 +100,27 @@ module "eks" {
 }
 
 ################################################################################
+# Database
+################################################################################
+
+module "rds" {
+  source = "../../modules/rds-postgres"
+
+  vpc_id                     = module.networking.vpc_id
+  private_subnet_ids         = module.networking.private_subnet_ids
+  eks_node_security_group_id = module.eks.node_security_group_id
+  environment                = local.environment
+  db_name                    = "workshop"
+  db_username                = "postgres"
+  db_password                = var.db_password
+  instance_class             = "db.t3.micro"
+  multi_az                   = false
+  backup_retention_period    = 3
+  skip_final_snapshot        = true
+  tags                       = local.tags
+}
+
+################################################################################
 # Container Registry
 ################################################################################
 
@@ -132,6 +153,12 @@ variable "region" {
   default     = "us-east-1"
 }
 
+variable "db_password" {
+  description = "Master password for the RDS PostgreSQL instance"
+  type        = string
+  sensitive   = true
+}
+
 output "cluster_endpoint" {
   value = module.eks.cluster_endpoint
 }
@@ -146,4 +173,12 @@ output "ecr_repository_urls" {
 
 output "app_namespaces" {
   value = module.namespaces.namespace_names
+}
+
+output "db_endpoint" {
+  value = module.rds.db_endpoint
+}
+
+output "db_name" {
+  value = module.rds.db_name
 }
