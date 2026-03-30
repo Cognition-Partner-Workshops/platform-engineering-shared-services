@@ -99,6 +99,25 @@ module "eks" {
   tags                = local.tags
 }
 
+module "rds" {
+  source = "../../modules/rds"
+
+  identifier                 = "workshop-${local.environment}"
+  engine_version             = "16.4"
+  instance_class             = "db.t3.micro"
+  allocated_storage          = 20
+  max_allocated_storage      = 50
+  db_name                    = "workshop"
+  multi_az                   = false # single-AZ for dev to save costs
+  backup_retention_period    = 3     # shorter retention for dev
+  vpc_id                     = module.networking.vpc_id
+  private_subnet_ids         = module.networking.private_subnet_ids
+  eks_node_security_group_id = module.eks.node_security_group_id
+  deletion_protection        = false
+  skip_final_snapshot        = true
+  tags                       = local.tags
+}
+
 ################################################################################
 # Container Registry
 ################################################################################
@@ -146,4 +165,12 @@ output "ecr_repository_urls" {
 
 output "app_namespaces" {
   value = module.namespaces.namespace_names
+}
+
+output "rds_endpoint" {
+  value = module.rds.endpoint
+}
+
+output "rds_master_user_secret_arn" {
+  value = module.rds.master_user_secret_arn
 }

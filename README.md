@@ -29,6 +29,7 @@ terraform/
 │   ├── networking/          # VPC, subnets, security groups, NAT
 │   ├── ecr/                 # ECR repositories with lifecycle policies
 │   ├── namespaces/          # K8s namespace provisioning with quotas
+│   ├── rds/                 # RDS PostgreSQL with multi-AZ and EKS-scoped SG
 │   └── dns/                 # Route 53 hosted zone
 ├── environments/
 │   ├── dev/                 # Dev environment (t3.medium, 2 nodes, single NAT)
