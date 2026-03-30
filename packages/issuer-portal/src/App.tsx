@@ -71,7 +71,7 @@ function App() {
   const [newSchemaDesc, setNewSchemaDesc] = useState('');
   const [newSchemaJson, setNewSchemaJson] = useState('{"type":"object","properties":{},"required":[]}');
 
-  const authHeaders = token ? { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' } : { 'Content-Type': 'application/json' };
+  const authHeaders: Record<string, string> = token ? { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' } : { 'Content-Type': 'application/json' };
 
   const login = async () => {
     setLoading(true);

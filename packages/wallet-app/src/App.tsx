@@ -436,7 +436,7 @@ function App() {
                     presentResult.decision === 'accepted' ? 'bg-green-50 border border-green-200' : 'bg-red-50 border border-red-200'
                   }`}>
                     <h4 className="font-semibold mb-2">{presentResult.decision === 'accepted' ? 'Verification Passed' : 'Verification Failed'}</h4>
-                    {presentResult.failReason && <p className="text-sm text-red-700 mb-2">{String(presentResult.failReason)}</p>}
+                    {presentResult.failReason ? <p className="text-sm text-red-700 mb-2">{String(presentResult.failReason)}</p> : null}
                     {(presentResult.checks as Array<Record<string, unknown>>)?.map((check, i) => (
                       <div key={i} className="flex items-center gap-2 text-xs py-1">
                         <span className={check.passed === true ? 'text-green-600' : check.passed === false ? 'text-red-600' : 'text-gray-400'}>

@@ -75,6 +75,10 @@ function App() {
   const [auditItems, setAuditItems] = useState<AuditEntry[]>([]);
   const [auditDetail, setAuditDetail] = useState<{ sessionId: string; checks: CheckEntry[] } | null>(null);
 
+  const authHeaders: Record<string, string> = token
+    ? { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' }
+    : { 'Content-Type': 'application/json' };
+
   const login = async () => {
     setLoading(true);
     try {
@@ -143,7 +147,7 @@ function App() {
       const issuers = trustedIssuers.trim() === '*' ? '*' : trustedIssuers.split(',').map(s => s.trim());
       const res = await fetch(`${VERIFIER_URL}/policies`, {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: authHeaders,
         body: JSON.stringify({
           name: policyName,
           acceptedSchemas: acceptedSchemas.split(',').map(s => s.trim()),
@@ -171,7 +175,7 @@ function App() {
       if (!selectedPolicy) throw new Error('Select a policy');
       const res = await fetch(`${VERIFIER_URL}/presentations/request`, {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: authHeaders,
         body: JSON.stringify({ policyId: selectedPolicy, purpose }),
       });
       if (!res.ok) throw new Error('Failed to create request');
