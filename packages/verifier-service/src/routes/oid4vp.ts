@@ -247,7 +247,7 @@ async function processVpSubmission(sessionId: string, vpToken: string, reply: an
     let issuerTrusted = false;
     for (const registryUrl of trustedRegistries) {
       try {
-        const res = await fetch(`${registryUrl}/registry/verify/${encodeURIComponent(issuerDid)}`);
+        const res = await fetch(`${registryUrl}/registry/verify/${issuerDid}`);
         if (res.ok) {
           const data = await res.json() as { trusted: boolean };
           if (data.trusted) {
