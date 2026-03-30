@@ -1,0 +1,109 @@
+name: Terraform Validate & Lint
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - 'terraform/**'
+
+jobs:
+  discover-modules:
+    name: Discover Terraform Modules
+    runs-on: ubuntu-latest
+    outputs:
+      modules: ${{ steps.find-modules.outputs.modules }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Find module directories
+        id: find-modules
+        run: |
+          # Find all directories under terraform/modules/ that contain .tf files
+          modules=$(find terraform/modules -mindepth 1 -maxdepth 1 -type d | jq -R -s -c 'split("\n") | map(select(length > 0))')
+          echo "modules=$modules" >> "$GITHUB_OUTPUT"
+          echo "Found modules: $modules"
+
+  validate:
+    name: Validate - ${{ matrix.module }}
+    needs: discover-modules
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        module: ${{ fromJson(needs.discover-modules.outputs.modules) }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: "1.5.0"
+
+      - name: Terraform Format Check
+        run: terraform fmt -check -recursive -diff
+        working-directory: ${{ matrix.module }}
+
+      - name: Terraform Init
+        run: terraform init -backend=false
+        working-directory: ${{ matrix.module }}
+
+      - name: Terraform Validate
+        run: terraform validate
+        working-directory: ${{ matrix.module }}
+
+      - name: Setup TFLint
+        uses: terraform-linters/setup-tflint@v4
+        with:
+          tflint_version: latest
+
+      - name: Init TFLint
+        run: tflint --init --config=../../.tflint.hcl
+        working-directory: ${{ matrix.module }}
+
+      - name: Run TFLint
+        run: tflint --config=../../.tflint.hcl --format=compact
+        working-directory: ${{ matrix.module }}
+
+  validate-environments:
+    name: Validate Environments - ${{ matrix.environment }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        environment: [dev, prod, staging]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: "1.5.0"
+
+      - name: Terraform Format Check
+        run: terraform fmt -check -recursive -diff
+        working-directory: terraform/environments/${{ matrix.environment }}
+
+      - name: Terraform Init
+        run: terraform init -backend=false
+        working-directory: terraform/environments/${{ matrix.environment }}
+
+      - name: Terraform Validate
+        run: terraform validate
+        working-directory: terraform/environments/${{ matrix.environment }}
+
+  summary:
+    name: Validation Summary
+    needs: [validate, validate-environments]
+    runs-on: ubuntu-latest
+    if: always()
+    steps:
+      - name: Check results
+        run: |
+          if [ "${{ needs.validate.result }}" != "success" ] || [ "${{ needs.validate-environments.result }}" != "success" ]; then
+            echo "::error::One or more Terraform validation checks failed"
+            exit 1
+          fi
+          echo "All Terraform validation checks passed!"
