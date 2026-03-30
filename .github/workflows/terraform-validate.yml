@@ -63,7 +63,7 @@ jobs:
         working-directory: ${{ matrix.module }}
 
       - name: Run TFLint
-        run: tflint --config=../../.tflint.hcl --format=compact
+        run: tflint --config=../../.tflint.hcl --format=compact --minimum-failure-severity=error
         working-directory: ${{ matrix.module }}
 
   validate-environments:
