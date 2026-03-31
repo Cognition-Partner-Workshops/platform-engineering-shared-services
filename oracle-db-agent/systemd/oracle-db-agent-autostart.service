@@ -1,0 +1,18 @@
+[Unit]
+Description=Oracle DB Agent - Auto-Start Database After Reboot
+After=network.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+User=oracle
+Group=oinstall
+Environment=DB_AGENT_CONFIG=/etc/oracle-db-agent/db_agent_config.yaml
+ExecStart=/usr/local/bin/db-agent auto-start
+StandardOutput=journal
+StandardError=journal
+TimeoutStartSec=300
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,34 @@
+# ============================================================================
+# Oracle DB Agent - Example Crontab
+# ============================================================================
+# Install: crontab -e (as oracle user)
+# Ensure DB_AGENT_PASSWORD and SMTP credentials are in oracle user's env
+# ============================================================================
+
+# Environment variables (adjust paths to your environment)
+ORACLE_HOME=/u01/app/oracle/product/19.0.0/dbhome_1
+ORACLE_SID=ORCL
+ORACLE_BASE=/u01/app/oracle
+DB_AGENT_CONFIG=/etc/oracle-db-agent/db_agent_config.yaml
+PATH=/usr/local/bin:/usr/bin:/bin
+
+# -------------------------------------------------------------------
+# Auto-start database after reboot
+# -------------------------------------------------------------------
+@reboot /usr/local/bin/db-agent auto-start >> /var/log/db_agent/cron.log 2>&1
+
+# -------------------------------------------------------------------
+# Full monitoring pass every 30 minutes
+# -------------------------------------------------------------------
+*/30 * * * * /usr/local/bin/db-agent monitor >> /var/log/db_agent/cron.log 2>&1
+
+# -------------------------------------------------------------------
+# Statistics collection during maintenance window (nightly at 22:00)
+# The agent respects the maintenance_window config; this just triggers it.
+# -------------------------------------------------------------------
+0 22 * * * /usr/local/bin/db-agent gather-stats --force >> /var/log/db_agent/cron.log 2>&1
+
+# -------------------------------------------------------------------
+# Full health report (daily at 06:00)
+# -------------------------------------------------------------------
+0 6 * * * /usr/local/bin/db-agent report >> /var/log/db_agent/daily_report_$(date +\%Y\%m\%d).txt 2>&1

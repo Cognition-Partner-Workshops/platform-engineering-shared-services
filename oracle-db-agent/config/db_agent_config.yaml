@@ -1,0 +1,184 @@
+# ============================================================================
+# Oracle DB Agent Configuration
+# ============================================================================
+# Autonomous Oracle 19c Database Agent
+# All passwords are read from environment variables (never stored in config)
+# ============================================================================
+
+database:
+  host: "db-server.example.com"
+  port: 1521
+  service_name: "ORCL"
+  username: "db_agent_user"
+  # Password is read from this environment variable at runtime
+  password_env: "DB_AGENT_PASSWORD"
+  # Set to false for traditional (non-CDB) architecture
+  is_cdb: false
+  # Connection pool settings
+  pool_min: 1
+  pool_max: 5
+  pool_increment: 1
+
+# Oracle environment (used for auto-start and shell commands)
+oracle_env:
+  oracle_home: "/u01/app/oracle/product/19.0.0/dbhome_1"
+  oracle_sid: "ORCL"
+  oracle_base: "/u01/app/oracle"
+
+# ----------------------------------------------------------------------------
+# Thresholds
+# ----------------------------------------------------------------------------
+thresholds:
+  tablespace_warning_pct: 80
+  tablespace_critical_pct: 90
+  temp_warning_pct: 75
+  undo_warning_pct: 80
+  long_query_seconds: 300
+  session_utilization_warning_pct: 80
+  fra_warning_pct: 80
+  index_blevel_threshold: 3
+
+# ----------------------------------------------------------------------------
+# Tablespace Management
+# ----------------------------------------------------------------------------
+tablespace_management:
+  auto_extend: true
+  extend_size_mb: 512
+  max_datafile_size_gb: 32
+  # Filesystem path for new datafiles (Oracle 19c traditional architecture)
+  datafile_path: "/u01/app/oracle/oradata/ORCL/"
+  # Tablespaces to exclude from auto-management
+  exclude_tablespaces:
+    - "SYSTEM"
+    - "SYSAUX"
+
+# ----------------------------------------------------------------------------
+# Statistics Collection
+# ----------------------------------------------------------------------------
+stats_collection:
+  # Schemas to gather stats for
+  schemas:
+    - "APP_SCHEMA"
+  # Tables to exclude from stats collection
+  exclude_tables: []
+  # Degree of parallelism for DBMS_STATS
+  parallel_degree: 4
+  # Estimate percent (0 = AUTO_SAMPLE_SIZE)
+  estimate_percent: 0
+  # Maintenance window for scheduled stats collection
+  maintenance_window:
+    start: "22:00"
+    end: "05:00"
+    days: ["MON", "TUE", "WED", "THU", "FRI", "SAT", "SUN"]
+
+# ----------------------------------------------------------------------------
+# Auto-Start (post-reboot)
+# ----------------------------------------------------------------------------
+auto_start:
+  enabled: true
+  start_listener: true
+  # Max retries for startup attempts
+  max_retries: 3
+  retry_delay_seconds: 30
+
+# ----------------------------------------------------------------------------
+# Performance Testing Integration
+# ----------------------------------------------------------------------------
+performance_testing:
+  # Tasks to run BEFORE a performance test
+  pre_run_tasks:
+    - check_db_status
+    - check_listener
+    - check_tablespace
+    - gather_stale_stats
+    - recompile_invalid_objects
+    - check_resource_limits
+    - check_non_system_objects
+    - check_index_health
+    - clear_temp_segments
+    - awr_snapshot
+  # Tasks to run AFTER a performance test
+  post_run_tasks:
+    - awr_snapshot
+    - generate_awr_report
+    - check_alert_log
+    - report_long_sessions
+    - report_temp_usage
+    - report_tablespace_growth
+
+  # AWR report output directory
+  awr_report_dir: "/u01/app/oracle/admin/ORCL/awr_reports"
+
+# ----------------------------------------------------------------------------
+# Alerting
+# ----------------------------------------------------------------------------
+alerts:
+  email:
+    enabled: true
+    smtp_host: "smtp.example.com"
+    smtp_port: 587
+    smtp_use_tls: true
+    # SMTP credentials from environment variables
+    smtp_username_env: "SMTP_USERNAME"
+    smtp_password_env: "SMTP_PASSWORD"
+    from_address: "db-agent@example.com"
+    recipients:
+      - "dba-team@example.com"
+  log_file: "/var/log/db_agent/agent.log"
+  log_max_bytes: 10485760  # 10 MB
+  log_backup_count: 5
+
+# ----------------------------------------------------------------------------
+# Approval Workflow (for destructive actions)
+# ----------------------------------------------------------------------------
+approval:
+  # Destructive actions require email approval before execution
+  require_approval: true
+  # File where pending approvals are written
+  approval_file: "/var/log/db_agent/pending_approvals.json"
+  # Actions that require approval
+  actions_requiring_approval:
+    - kill_session
+    - move_object
+    - drop_temp_tablespace
+    - rebuild_index
+    - delete_archivelogs
+
+# ----------------------------------------------------------------------------
+# System Schemas (excluded from auditing)
+# ----------------------------------------------------------------------------
+system_schemas:
+  - "SYS"
+  - "SYSTEM"
+  - "OUTLN"
+  - "DBSNMP"
+  - "APPQOSSYS"
+  - "WMSYS"
+  - "XDB"
+  - "ORDSYS"
+  - "ORDDATA"
+  - "CTXSYS"
+  - "MDSYS"
+  - "OLAPSYS"
+  - "LBACSYS"
+  - "DVSYS"
+  - "DBSFWUSER"
+  - "AUDSYS"
+  - "GSMADMIN_INTERNAL"
+  - "OJVMSYS"
+  - "SI_INFORMTN_SCHEMA"
+  - "ORDPLUGINS"
+  - "ANONYMOUS"
+  - "XS$NULL"
+  - "GGSYS"
+  - "REMOTE_SCHEDULER_AGENT"
+  - "SYSBACKUP"
+  - "SYSDG"
+  - "SYSKM"
+  - "SYSRAC"
+  - "SYS$UMF"
+  - "DGPDB_INT"
+  - "GSMCATUSER"
+  - "GSMUSER"
+  - "DIP"
+  - "DVF"

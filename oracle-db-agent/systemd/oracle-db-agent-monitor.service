@@ -1,0 +1,13 @@
+[Unit]
+Description=Oracle DB Agent - Monitoring Pass
+After=network.target
+
+[Service]
+Type=oneshot
+User=oracle
+Group=oinstall
+Environment=DB_AGENT_CONFIG=/etc/oracle-db-agent/db_agent_config.yaml
+ExecStart=/usr/local/bin/db-agent monitor
+StandardOutput=journal
+StandardError=journal
+TimeoutStartSec=600
