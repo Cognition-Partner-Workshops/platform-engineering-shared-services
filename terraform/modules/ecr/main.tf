@@ -28,25 +28,11 @@ resource "aws_ecr_lifecycle_policy" "repos" {
     rules = [
       {
         rulePriority = 1
-        description  = "Keep last 10 tagged images"
-        selection = {
-          tagStatus     = "tagged"
-          tagPrefixList = ["v", "release"]
-          countType     = "imageCountMoreThan"
-          countNumber   = 10
-        }
-        action = {
-          type = "expire"
-        }
-      },
-      {
-        rulePriority = 2
-        description  = "Remove untagged images after 7 days"
+        description  = "Keep only the last 30 untagged images"
         selection = {
           tagStatus   = "untagged"
-          countType   = "sinceImagePushed"
-          countUnit   = "days"
-          countNumber = 7
+          countType   = "imageCountMoreThan"
+          countNumber = 30
         }
         action = {
           type = "expire"

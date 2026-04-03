@@ -1,14 +1,14 @@
 output "vpc_id" {
   description = "VPC ID"
-  value       = module.vpc.vpc_id
+  value       = aws_vpc.main.id
 }
 
 output "private_subnet_ids" {
   description = "List of private subnet IDs"
-  value       = module.vpc.private_subnets
+  value       = aws_subnet.private[*].id
 }
 
 output "public_subnet_ids" {
   description = "List of public subnet IDs"
-  value       = module.vpc.public_subnets
+  value       = aws_subnet.public[*].id
 }
