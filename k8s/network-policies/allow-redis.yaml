@@ -1,0 +1,42 @@
+# Allow egress to the shared Redis cache from app namespaces.
+# Applied per app namespace alongside the default-deny policy.
+#
+# This policy enables pods in app namespaces to reach:
+#   1. In-cluster Redis (bitnami/redis in the 'redis' namespace)
+#   2. ElastiCache Redis (via VPC networking on port 6379)
+#
+# The cache is NOT the source of truth — it accelerates reads only.
+# All writes must go to the database first. See docs/cache-strategy.md.
+---
+# Allow egress to in-cluster Redis namespace
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-redis-egress
+spec:
+  podSelector: {}
+  policyTypes:
+    - Egress
+  egress:
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: redis
+      ports:
+        - protocol: TCP
+          port: 6379
+---
+# Allow egress to ElastiCache Redis (VPC private subnets, port 6379)
+# This covers ElastiCache endpoints reachable from the VPC.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-elasticache-egress
+spec:
+  podSelector: {}
+  policyTypes:
+    - Egress
+  egress:
+    - ports:
+        - protocol: TCP
+          port: 6379

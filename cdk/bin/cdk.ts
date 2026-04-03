@@ -42,6 +42,10 @@ new PlatformStack(app, 'WorkshopPlatformDev', {
       team: 'dotnet-angular-monolith',
     },
   ],
+  // Shared cache — single-node Redis for dev (cost-optimized)
+  redisEnabled: true,
+  redisNodeType: 'cache.t3.micro',
+  redisNumNodes: 1,
 });
 
 // ────────────────────────────────────────────────────────────────────────────
@@ -76,6 +80,10 @@ new PlatformStack(app, 'WorkshopPlatformStaging', {
       team: 'dotnet-angular-monolith',
     },
   ],
+  // Shared cache — single-node Redis for staging (cost-optimized)
+  redisEnabled: true,
+  redisNodeType: 'cache.t3.micro',
+  redisNumNodes: 1,
 });
 
 // ────────────────────────────────────────────────────────────────────────────
@@ -110,6 +118,12 @@ new PlatformStack(app, 'WorkshopPlatformProd', {
       team: 'dotnet-angular-monolith',
     },
   ],
+  // Shared cache — HA Redis for production (multi-node with failover)
+  redisEnabled: true,
+  redisNodeType: 'cache.t3.medium',
+  redisNumNodes: 2,
+  redisAutomaticFailover: true,
+  redisMultiAz: true,
 });
 
 app.synth();

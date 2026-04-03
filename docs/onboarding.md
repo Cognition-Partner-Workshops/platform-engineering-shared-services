@@ -18,6 +18,7 @@ This document explains how application teams deploy their workloads onto the sha
 | Prometheus + Grafana | `monitoring` | Metrics collection and dashboards |
 | ArgoCD | `argocd` | GitOps continuous delivery |
 | ExternalDNS | `external-dns` | Automatic DNS record management |
+| Redis Cache | `redis` | Shared cache (single source of truth pattern) |
 
 ## Onboarding a New Microservice
 
@@ -192,7 +193,36 @@ Apply it:
 kubectl apply -f argocd/my-service.yaml
 ```
 
-### 7. Verify
+### 7. Connect to the Shared Cache
+
+The platform provides a shared Redis cache. **The database is always the source of truth** — Redis is a read-through acceleration layer only.
+
+**Environment variables** injected by the platform into your pods:
+
+| Variable | Description |
+|----------|-------------|
+| `REDIS_HOST` | Redis endpoint (ElastiCache or in-cluster) |
+| `REDIS_PORT` | Redis port (default: 6379) |
+| `REDIS_URL` | Full connection string |
+
+**Add Redis to your Helm chart values:**
+```yaml
+env:
+  - name: REDIS_HOST
+    value: redis-master.redis.svc.cluster.local  # In-cluster (dev/staging)
+  - name: REDIS_PORT
+    value: "6379"
+```
+
+**Follow the cache-aside pattern** (default for all services):
+1. Check Redis for cached data (with your service key prefix, e.g., `order-svc:`)
+2. On cache miss, read from the database (source of truth)
+3. Write the result to Redis with a TTL
+4. On writes, write to the database first, then delete the cache key
+
+See [`docs/cache-strategy.md`](cache-strategy.md) for full patterns, key naming conventions, TTL guidelines, and anti-patterns.
+
+### 8. Verify
 
 ```bash
 # Check pod status

@@ -17,6 +17,7 @@ This repo is the **platform standard** — application teams use it as context w
 | TLS Certificates | Helm (cert-manager) | Automatic Let's Encrypt TLS certificates |
 | Monitoring | Helm (Prometheus + Grafana) | Cluster-wide metrics and dashboards |
 | GitOps | Helm (ArgoCD) | Declarative continuous delivery for Kubernetes |
+| Shared Cache | AWS CDK (ElastiCache) + Helm (Redis) | Single-source-of-truth caching layer for microservices |
 | Network Policies | K8s manifests | Default-deny with explicit allow rules per namespace |
 
 > **Note:** All CDK resources use `RemovalPolicy.DESTROY` — stack deletion removes everything with no orphaned resources.
@@ -34,6 +35,7 @@ cdk/
 │       ├── ecr-repositories.ts  # ECR repos with lifecycle policies
 │       ├── dns-zone.ts      # Route 53 hosted zone
 │       ├── k8s-namespaces.ts    # Namespaces with quotas and limit ranges
+│       ├── elasticache-redis.ts # ElastiCache Redis shared cache
 │       └── index.ts         # Barrel exports
 ├── package.json
 ├── tsconfig.json
@@ -46,7 +48,8 @@ helm-releases/
 │   ├── prometheus/          # Prometheus stack values
 │   └── grafana/             # Grafana dashboards + values
 ├── external-dns/            # ExternalDNS for Route 53
-└── argocd/                  # Argo CD for GitOps deployments
+├── argocd/                  # Argo CD for GitOps deployments
+└── redis/                   # In-cluster Redis cache (dev/staging)
 k8s/
 ├── network-policies/        # Default-deny + allow templates per namespace
 └── resource-quotas/         # Standard resource quota templates
@@ -55,6 +58,7 @@ scripts/
 └── teardown-dev.sh          # Destroy dev environment to save costs
 docs/
 ├── architecture.md          # Platform architecture overview
+├── cache-strategy.md        # Cache strategy for single source of truth
 └── onboarding.md            # How app teams onboard to the platform
 ```
 
@@ -106,7 +110,8 @@ Application teams deploy their own Helm charts into dedicated namespaces. They d
 5. **Monitoring** — Prometheus ServiceMonitor resources for metrics
 6. **ArgoCD** — GitOps-driven deployments from app IaC repos
 7. **DNS** — automatic DNS records via ExternalDNS annotations
-8. **Network policies** — default-deny with explicit ingress/egress rules
+8. **Shared cache** — Redis (ElastiCache + in-cluster) with single-source-of-truth patterns
+9. **Network policies** — default-deny with explicit ingress/egress rules
 
 See [`docs/onboarding.md`](docs/onboarding.md) for detailed instructions.
 

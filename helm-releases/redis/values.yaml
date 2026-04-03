@@ -1,0 +1,57 @@
+# Redis Helm chart overrides (in-cluster Redis for dev/staging)
+# Chart: bitnami/redis
+# Repo: https://charts.bitnami.com/bitnami
+#
+# This in-cluster Redis serves as a lightweight cache proxy for environments
+# where ElastiCache is not provisioned, or as a local read-replica / fallback.
+# In production, services connect directly to ElastiCache via the
+# REDIS_ENDPOINT environment variable injected by the platform.
+#
+# Cache Strategy: Single Source of Truth
+# ────────────────────────────────────────
+# The database is ALWAYS the authoritative data store. Redis is a read-through
+# cache only. All writes go to the database first, then the cache is updated
+# or invalidated. See docs/cache-strategy.md for full patterns.
+
+architecture: standalone
+
+auth:
+  enabled: false
+
+master:
+  resources:
+    requests:
+      cpu: 100m
+      memory: 128Mi
+    limits:
+      cpu: 500m
+      memory: 256Mi
+  persistence:
+    enabled: false
+  configuration: |
+    # Evict least-recently-used keys when memory is full.
+    # The database remains the source of truth — evicted keys are simply
+    # re-fetched on the next read.
+    maxmemory-policy allkeys-lru
+    # Reserve 25% of maxmemory for non-cache overhead
+    maxmemory 192mb
+    # Enable keyspace notifications for cache invalidation events.
+    # 'Ex' = expired events. Services can subscribe to these to trigger
+    # background refresh from the database.
+    notify-keyspace-events Ex
+    # Disable RDB snapshots — cache data is ephemeral and reconstructable
+    # from the database (the single source of truth).
+    save ""
+
+metrics:
+  enabled: true
+  resources:
+    requests:
+      cpu: 50m
+      memory: 32Mi
+    limits:
+      cpu: 100m
+      memory: 64Mi
+  serviceMonitor:
+    enabled: true
+    namespace: monitoring

@@ -36,7 +36,7 @@ echo ""
 echo "[1/3] Removing Helm releases..."
 aws eks update-kubeconfig --region "$REGION" --name "$CLUSTER_NAME" --alias "$CLUSTER_NAME" 2>/dev/null || true
 
-for RELEASE_NS in "argocd:argocd" "prometheus:monitoring" "cert-manager:cert-manager" "ingress-nginx:ingress-nginx"; do
+for RELEASE_NS in "redis:redis" "argocd:argocd" "prometheus:monitoring" "cert-manager:cert-manager" "ingress-nginx:ingress-nginx"; do
   RELEASE="${RELEASE_NS%%:*}"
   NS="${RELEASE_NS##*:}"
   echo "  Uninstalling $RELEASE from $NS..."

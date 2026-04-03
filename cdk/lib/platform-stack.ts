@@ -9,6 +9,7 @@ import {
   DnsZone,
   K8sNamespaces,
   NamespaceConfig,
+  ElastiCacheRedis,
 } from './constructs';
 
 export interface PlatformStackProps extends cdk.StackProps {
@@ -74,6 +75,36 @@ export interface PlatformStackProps extends cdk.StackProps {
    * Kubernetes namespaces to provision.
    */
   readonly namespaces: NamespaceConfig[];
+
+  /**
+   * Whether to provision a shared ElastiCache Redis cluster.
+   * @default true
+   */
+  readonly redisEnabled?: boolean;
+
+  /**
+   * ElastiCache node type for Redis.
+   * @default 'cache.t3.micro'
+   */
+  readonly redisNodeType?: string;
+
+  /**
+   * Number of Redis cache nodes (1 for dev, 2+ for prod HA).
+   * @default 1
+   */
+  readonly redisNumNodes?: number;
+
+  /**
+   * Whether to enable Redis automatic failover (requires redisNumNodes >= 2).
+   * @default false
+   */
+  readonly redisAutomaticFailover?: boolean;
+
+  /**
+   * Whether to enable Redis Multi-AZ (requires automatic failover).
+   * @default false
+   */
+  readonly redisMultiAz?: boolean;
 }
 
 /**
@@ -89,6 +120,7 @@ export class PlatformStack extends cdk.Stack {
   public readonly ecrRepositories: EcrRepositories;
   public readonly dnsZone?: DnsZone;
   public readonly k8sNamespaces: K8sNamespaces;
+  public readonly elastiCacheRedis?: ElastiCacheRedis;
 
   constructor(scope: Construct, id: string, props: PlatformStackProps) {
     super(scope, id, props);
@@ -141,6 +173,21 @@ export class PlatformStack extends cdk.Stack {
     });
 
     // ──────────────────────────────────────────────────────────────────────
+    // Shared Cache (ElastiCache Redis)
+    // ──────────────────────────────────────────────────────────────────────
+    if (props.redisEnabled !== false) {
+      this.elastiCacheRedis = new ElastiCacheRedis(this, 'ElastiCacheRedis', {
+        clusterName: `workshop-${props.environment}`,
+        vpc: this.networking.vpc,
+        nodeType: props.redisNodeType,
+        numCacheNodes: props.redisNumNodes,
+        automaticFailoverEnabled: props.redisAutomaticFailover,
+        multiAzEnabled: props.redisMultiAz,
+        environment: props.environment,
+      });
+    }
+
+    // ──────────────────────────────────────────────────────────────────────
     // Outputs
     // ──────────────────────────────────────────────────────────────────────
     new cdk.CfnOutput(this, 'ClusterName', {
@@ -167,6 +214,18 @@ export class PlatformStack extends cdk.Stack {
       new cdk.CfnOutput(this, 'HostedZoneId', {
         value: this.dnsZone.zone.hostedZoneId,
         description: 'Route 53 hosted zone ID',
+      });
+    }
+
+    if (this.elastiCacheRedis) {
+      new cdk.CfnOutput(this, 'RedisEndpoint', {
+        value: this.elastiCacheRedis.primaryEndpoint,
+        description: 'ElastiCache Redis primary endpoint',
+      });
+
+      new cdk.CfnOutput(this, 'RedisPort', {
+        value: this.elastiCacheRedis.port,
+        description: 'ElastiCache Redis port',
       });
     }
   }

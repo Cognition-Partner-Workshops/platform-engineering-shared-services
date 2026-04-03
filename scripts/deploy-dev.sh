@@ -4,8 +4,8 @@
 #   1. Bootstrap CDK (first-time only)
 #   2. Deploy the WorkshopPlatformDev CDK stack (VPC, EKS, ECR, namespaces)
 #   3. Configure kubectl
-#   4. Install shared Helm releases (ingress-nginx, cert-manager, monitoring, ArgoCD)
-#   5. Apply network policies to app namespaces
+#   4. Install shared Helm releases (ingress-nginx, cert-manager, monitoring, ArgoCD, Redis)
+#   5. Apply network policies to app namespaces (including Redis egress)
 #
 # Prerequisites:
 #   - AWS CLI configured with appropriate credentials
@@ -75,6 +75,7 @@ helm repo add ingress-nginx https://kubernetes.github.io/ingress-nginx 2>/dev/nu
 helm repo add jetstack https://charts.jetstack.io 2>/dev/null || true
 helm repo add prometheus-community https://prometheus-community.github.io/helm-charts 2>/dev/null || true
 helm repo add argo https://argoproj.github.io/argo-helm 2>/dev/null || true
+helm repo add bitnami https://charts.bitnami.com/bitnami 2>/dev/null || true
 helm repo update
 
 # Ingress NGINX
@@ -106,6 +107,12 @@ helm upgrade --install argocd argo/argo-cd \
   -f "$REPO_ROOT/helm-releases/argocd/values.yaml" \
   -n argocd --create-namespace --wait --timeout 5m
 
+# Redis (in-cluster shared cache — single source of truth pattern)
+echo "  Installing Redis (shared cache)..."
+helm upgrade --install redis bitnami/redis \
+  -f "$REPO_ROOT/helm-releases/redis/values.yaml" \
+  -n redis --create-namespace --wait --timeout 5m
+
 echo "  ✓ All Helm releases installed"
 
 ################################################################################
@@ -116,6 +123,8 @@ echo "[5/5] Applying network policies to app namespaces..."
 for NS in decomposition-dev decomposition-staging; do
   echo "  Applying to namespace: $NS"
   kubectl apply -f "$REPO_ROOT/k8s/network-policies/default-deny.yaml" -n "$NS" 2>/dev/null || \
+    echo "  (namespace $NS may not exist yet — skipping)"
+  kubectl apply -f "$REPO_ROOT/k8s/network-policies/allow-redis.yaml" -n "$NS" 2>/dev/null || \
     echo "  (namespace $NS may not exist yet — skipping)"
 done
 echo "  ✓ Network policies applied"

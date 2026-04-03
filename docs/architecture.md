@@ -61,6 +61,7 @@ All infrastructure is defined in AWS CDK (TypeScript) under `cdk/`. Every resour
 | `EcrRepositories` | ECR repositories with lifecycle policies, scan-on-push, `emptyOnDelete` |
 | `DnsZone` | Route 53 public hosted zone (optional) |
 | `K8sNamespaces` | Kubernetes namespaces with resource quotas and limit ranges |
+| `ElastiCacheRedis` | Shared Redis cache cluster (single source of truth caching layer) |
 
 ### CDK Stacks
 
@@ -79,6 +80,7 @@ All infrastructure is defined in AWS CDK (TypeScript) under `cdk/`. Every resour
 | `kube-prometheus-stack` | `monitoring` | Metrics, alerting, dashboards |
 | `external-dns` | `external-dns` | Automatic DNS record management |
 | `argo-cd` | `argocd` | GitOps continuous delivery |
+| `redis` | `redis` | Shared in-cluster Redis cache (single source of truth) |
 
 ## Kubernetes Policies
 
@@ -88,6 +90,8 @@ All infrastructure is defined in AWS CDK (TypeScript) under `cdk/`. Every resour
 | NetworkPolicy (allow-dns) | All app namespaces | Allow DNS resolution |
 | NetworkPolicy (allow-ingress) | All app namespaces | Allow traffic from ingress-nginx |
 | NetworkPolicy (allow-prometheus) | All app namespaces | Allow Prometheus metric scraping |
+| NetworkPolicy (allow-redis) | All app namespaces | Allow egress to shared Redis cache |
+| NetworkPolicy (allow-elasticache) | All app namespaces | Allow egress to ElastiCache on port 6379 |
 | ResourceQuota | All app namespaces | Cap total CPU/memory/pods per namespace |
 | LimitRange | All app namespaces | Set default container resource requests |
 
