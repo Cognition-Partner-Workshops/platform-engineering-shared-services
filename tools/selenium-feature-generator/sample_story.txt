@@ -1,0 +1,9 @@
+As a registered user, I want to log in to the web application
+so that I can access my personalised dashboard.
+
+Acceptance Criteria:
+- User can enter username and password on the login page
+- Valid credentials redirect to the dashboard
+- Invalid credentials show an error message
+- Account locks after 3 failed attempts
+- "Forgot password" link is available on the login page
