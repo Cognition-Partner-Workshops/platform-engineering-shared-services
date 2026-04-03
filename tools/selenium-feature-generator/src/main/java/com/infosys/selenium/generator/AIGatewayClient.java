@@ -1,6 +1,5 @@
 package com.infosys.selenium.generator;
 
-import com.google.gson.Gson;
 import com.google.gson.JsonArray;
 import com.google.gson.JsonObject;
 import com.google.gson.JsonParser;
@@ -26,7 +25,6 @@ public class AIGatewayClient {
     private final String endpoint;
     private final String apiKey;
     private final HttpClient httpClient;
-    private final Gson gson;
 
     public AIGatewayClient(String apiKey) {
         this(apiKey, DEFAULT_ENDPOINT);
@@ -43,7 +41,6 @@ public class AIGatewayClient {
         this.httpClient = HttpClient.newBuilder()
                 .connectTimeout(Duration.ofSeconds(30))
                 .build();
-        this.gson = new Gson();
     }
 
     /**
