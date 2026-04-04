@@ -1,4 +1,4 @@
-"""Database connection profile manager — save and load profiles as JSON."""
+"""Database connection profile manager -- save and load profiles as JSON."""
 
 import json
 import logging
@@ -51,43 +51,42 @@ class ProfileManager:
         return list(self._load_all().keys())
 
     def get_profile(self, name: str) -> Optional[dict[str, Any]]:
-        """Retrieve a saved profile by name.
-
-        Args:
-            name: The profile name.
-
-        Returns:
-            A dict with connection parameters, or None if not found.
-        """
+        """Retrieve a saved profile by name."""
         profiles = self._load_all()
         return profiles.get(name)
 
     def save_profile(
         self,
         name: str,
+        db_type: str,
         host: str,
         port: int,
-        database: str,
         user: str,
         password: str,
+        database: str = "",
+        service_name: str = "",
         sslmode: str = "prefer",
     ) -> None:
         """Save a database connection profile.
 
         Args:
             name: A friendly name for the profile.
-            host: PostgreSQL host.
-            port: PostgreSQL port.
-            database: Database name.
+            db_type: 'postgresql' or 'oracle'.
+            host: Database host.
+            port: Database port.
             user: Database user.
             password: Database password.
-            sslmode: SSL mode (default: prefer).
+            database: Database name (PostgreSQL).
+            service_name: Service name (Oracle).
+            sslmode: SSL mode (PostgreSQL only, default: prefer).
         """
         profiles = self._load_all()
         profiles[name] = {
+            "db_type": db_type,
             "host": host,
             "port": port,
             "database": database,
+            "service_name": service_name,
             "user": user,
             "password": password,
             "sslmode": sslmode,
@@ -97,9 +96,6 @@ class ProfileManager:
 
     def delete_profile(self, name: str) -> bool:
         """Delete a saved profile.
-
-        Args:
-            name: The profile name to delete.
 
         Returns:
             True if deleted, False if not found.

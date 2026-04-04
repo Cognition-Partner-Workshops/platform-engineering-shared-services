@@ -8,7 +8,7 @@ from llm_client import LLMClient
 
 logger = logging.getLogger(__name__)
 
-SYSTEM_PROMPT = (
+_PG_SYSTEM_PROMPT = (
     "You are a PostgreSQL expert. You receive natural language questions about "
     "a PostgreSQL database and return ONLY valid SQL SELECT queries. "
     "Rules:\n"
@@ -16,6 +16,20 @@ SYSTEM_PROMPT = (
     "- Do NOT include explanations, comments, or markdown formatting.\n"
     "- Do NOT use DROP, DELETE, TRUNCATE, UPDATE, INSERT, ALTER, CREATE, or GRANT.\n"
     "- Only generate SELECT statements.\n"
+    "- Always terminate the query with a semicolon.\n"
+    "- If the question cannot be answered with a SELECT query, respond with: "
+    "-- CANNOT_GENERATE"
+)
+
+_ORA_SYSTEM_PROMPT = (
+    "You are an Oracle Database expert. You receive natural language questions about "
+    "an Oracle database and return ONLY valid SQL SELECT queries. "
+    "Rules:\n"
+    "- Return ONLY the SQL query, nothing else.\n"
+    "- Do NOT include explanations, comments, or markdown formatting.\n"
+    "- Do NOT use DROP, DELETE, TRUNCATE, UPDATE, INSERT, ALTER, CREATE, or GRANT.\n"
+    "- Only generate SELECT statements.\n"
+    "- Use Oracle SQL syntax (e.g. ROWNUM, FETCH FIRST, NVL, DUAL, etc.).\n"
     "- Always terminate the query with a semicolon.\n"
     "- If the question cannot be answered with a SELECT query, respond with: "
     "-- CANNOT_GENERATE"
@@ -54,17 +68,21 @@ class SQLGenerator:
     def __init__(
         self,
         llm_client: LLMClient,
+        db_type: str = "postgresql",
         schema_metadata: Optional[dict[str, Any]] = None,
     ) -> None:
         self.llm_client = llm_client
+        self.db_type = db_type
         self.schema_metadata = schema_metadata
 
-    def update_schema(self, schema_metadata: dict[str, Any]) -> None:
-        """Update the schema metadata used for prompt context.
+    @property
+    def system_prompt(self) -> str:
+        if self.db_type == "oracle":
+            return _ORA_SYSTEM_PROMPT
+        return _PG_SYSTEM_PROMPT
 
-        Args:
-            schema_metadata: Dict mapping table names to column info lists.
-        """
+    def update_schema(self, schema_metadata: dict[str, Any]) -> None:
+        """Update the schema metadata used for prompt context."""
         self.schema_metadata = schema_metadata
         logger.info("Schema metadata updated: %d tables", len(schema_metadata))
 
@@ -99,7 +117,7 @@ class SQLGenerator:
             try:
                 raw_response = self.llm_client.generate(
                     prompt=retry_prompt,
-                    system_prompt=SYSTEM_PROMPT,
+                    system_prompt=self.system_prompt,
                 )
             except (ConnectionError, RuntimeError) as exc:
                 logger.error("LLM request failed: %s", exc)
@@ -130,18 +148,12 @@ class SQLGenerator:
         )
 
     def _build_prompt(self, user_query: str) -> str:
-        """Build the full prompt including schema context.
-
-        Args:
-            user_query: The natural language question.
-
-        Returns:
-            The complete prompt string.
-        """
+        """Build the full prompt including schema context."""
         parts = []
 
         if self.schema_metadata:
-            parts.append("Database schema:")
+            db_label = "Oracle" if self.db_type == "oracle" else "PostgreSQL"
+            parts.append(f"Database schema ({db_label}):")
             for table_name, columns in self.schema_metadata.items():
                 col_defs = []
                 for col in columns:
@@ -164,16 +176,7 @@ class SQLGenerator:
 
     @staticmethod
     def _extract_sql(raw_response: str) -> str:
-        """Extract clean SQL from the LLM response.
-
-        Strips markdown code blocks, comments, and extra whitespace.
-
-        Args:
-            raw_response: The raw LLM output.
-
-        Returns:
-            A cleaned SQL string.
-        """
+        """Extract clean SQL from the LLM response."""
         text = raw_response.strip()
 
         # Remove markdown code fences
@@ -203,9 +206,6 @@ class SQLGenerator:
     @staticmethod
     def _validate_sql(sql: str) -> None:
         """Validate that the SQL is a safe SELECT query.
-
-        Args:
-            sql: The SQL query to validate.
 
         Raises:
             UnsafeSQLError: If the query contains dangerous keywords.

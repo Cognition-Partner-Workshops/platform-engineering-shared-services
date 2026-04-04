@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
-"""AI-powered PostgreSQL assistant — Streamlit web UI.
+"""AI-powered database assistant -- Streamlit web UI.
 
 Converts natural language questions into SQL queries using a local LLM (Ollama)
-and executes them directly against a PostgreSQL database.
+and executes them directly against PostgreSQL or Oracle databases.
 """
 
 import time
@@ -10,7 +10,14 @@ import time
 import pandas as pd
 import streamlit as st
 
-from db_client import DBClient
+from auto_analyse import PerformanceAnalyser
+from auto_monitor import TablespaceMonitor
+from db_client import (
+    DB_TYPE_ORACLE,
+    DB_TYPE_POSTGRESQL,
+    BaseDBClient,
+    create_db_client,
+)
 from llm_client import LLMClient
 from profile_manager import ProfileManager
 from sql_generator import SQLGenerationError, SQLGenerator, UnsafeSQLError
@@ -19,8 +26,8 @@ from sql_generator import SQLGenerationError, SQLGenerator, UnsafeSQLError
 # Page config
 # ---------------------------------------------------------------------------
 st.set_page_config(
-    page_title="PG Assistant",
-    page_icon="🐘",
+    page_title="DB Assistant",
+    page_icon="🛢️",
     layout="wide",
     initial_sidebar_state="expanded",
 )
@@ -34,6 +41,8 @@ _defaults: dict = {
     "sql_generator": None,
     "schema_metadata": None,
     "query_history": [],
+    "monitor": None,
+    "analyser": None,
 }
 for _key, _val in _defaults.items():
     if _key not in st.session_state:
@@ -42,11 +51,23 @@ for _key, _val in _defaults.items():
 profile_mgr = ProfileManager()
 
 # ---------------------------------------------------------------------------
-# Sidebar — connection & profile management
+# Helper: current db_type from connected client
+# ---------------------------------------------------------------------------
+
+
+def _connected_db_type() -> str:
+    client: BaseDBClient | None = st.session_state.db_client
+    if client and client.is_connected:
+        return client.db_type
+    return ""
+
+
+# ---------------------------------------------------------------------------
+# Sidebar -- connection & profile management
 # ---------------------------------------------------------------------------
 with st.sidebar:
-    st.title("🐘 PG Assistant")
-    st.caption("AI-powered PostgreSQL query tool")
+    st.title("🛢️ DB Assistant")
+    st.caption("AI-powered PostgreSQL & Oracle query tool")
     st.divider()
 
     # --- Ollama settings ---------------------------------------------------
@@ -68,6 +89,10 @@ with st.sidebar:
     # --- Database connection ------------------------------------------------
     st.subheader("🗄️ Database Connection")
 
+    db_type_options = ["PostgreSQL", "Oracle"]
+    db_type_map = {"PostgreSQL": DB_TYPE_POSTGRESQL, "Oracle": DB_TYPE_ORACLE}
+    reverse_map = {v: k for k, v in db_type_map.items()}
+
     saved_profiles = profile_mgr.list_profiles()
     profile_options = ["-- New Connection --"] + saved_profiles
     selected_profile = st.selectbox("Load Profile", profile_options)
@@ -76,54 +101,81 @@ with st.sidebar:
     if selected_profile != "-- New Connection --":
         profile_data = profile_mgr.get_profile(selected_profile) or {}
 
+    profile_db_type = profile_data.get("db_type", DB_TYPE_POSTGRESQL)
+    default_type_idx = db_type_options.index(
+        reverse_map.get(profile_db_type, "PostgreSQL")
+    )
+    selected_db_label = st.selectbox(
+        "Database Type", db_type_options, index=default_type_idx
+    )
+    selected_db_type = db_type_map[selected_db_label]
+
     col1, col2 = st.columns(2)
     with col1:
         db_host = st.text_input("Host", value=profile_data.get("host", "localhost"))
         db_port = st.number_input(
             "Port",
-            value=profile_data.get("port", 5432),
+            value=profile_data.get(
+                "port", 5432 if selected_db_type == DB_TYPE_POSTGRESQL else 1521
+            ),
             min_value=1,
             max_value=65535,
             step=1,
         )
-        db_name = st.text_input(
-            "Database", value=profile_data.get("database", "postgres")
-        )
+        if selected_db_type == DB_TYPE_POSTGRESQL:
+            db_name = st.text_input(
+                "Database", value=profile_data.get("database", "postgres")
+            )
+        else:
+            db_service = st.text_input(
+                "Service Name", value=profile_data.get("service_name", "ORCL")
+            )
     with col2:
-        db_user = st.text_input("User", value=profile_data.get("user", "postgres"))
+        db_user = st.text_input(
+            "User",
+            value=profile_data.get(
+                "user", "postgres" if selected_db_type == DB_TYPE_POSTGRESQL else ""
+            ),
+        )
         db_password = st.text_input(
             "Password",
             value=profile_data.get("password", ""),
             type="password",
         )
-        db_sslmode = st.selectbox(
-            "SSL Mode",
-            ["prefer", "disable", "require", "verify-ca", "verify-full"],
-            index=[
-                "prefer",
-                "disable",
-                "require",
-                "verify-ca",
-                "verify-full",
-            ].index(profile_data.get("sslmode", "prefer")),
-        )
+        if selected_db_type == DB_TYPE_POSTGRESQL:
+            db_sslmode = st.selectbox(
+                "SSL Mode",
+                ["prefer", "disable", "require", "verify-ca", "verify-full"],
+                index=[
+                    "prefer",
+                    "disable",
+                    "require",
+                    "verify-ca",
+                    "verify-full",
+                ].index(profile_data.get("sslmode", "prefer")),
+            )
 
     if st.button("🔌 Connect", use_container_width=True, type="primary"):
         try:
-            db = DBClient(
-                host=db_host,
-                port=int(db_port),
-                database=db_name,
-                user=db_user,
-                password=db_password,
-                sslmode=db_sslmode,
-            )
+            conn_kwargs: dict = {
+                "host": db_host,
+                "port": int(db_port),
+                "user": db_user,
+                "password": db_password,
+            }
+            if selected_db_type == DB_TYPE_POSTGRESQL:
+                conn_kwargs["database"] = db_name
+                conn_kwargs["sslmode"] = db_sslmode
+            else:
+                conn_kwargs["service_name"] = db_service
+
+            db = create_db_client(selected_db_type, **conn_kwargs)
             db.connect()
             st.session_state.db_client = db
 
             llm = LLMClient(base_url=ollama_url, model=ollama_model)
             st.session_state.llm_client = llm
-            gen = SQLGenerator(llm_client=llm)
+            gen = SQLGenerator(llm_client=llm, db_type=selected_db_type)
             st.session_state.sql_generator = gen
 
             schema = db.get_schema()
@@ -131,16 +183,23 @@ with st.sidebar:
                 gen.update_schema(schema)
                 st.session_state.schema_metadata = schema
 
+            st.session_state.monitor = None
+            st.session_state.analyser = None
+
             st.success(f"Connected to {db.get_connection_info()}")
-        except ConnectionError as exc:
+        except (ConnectionError, ImportError) as exc:
             st.error(str(exc))
 
     if st.session_state.db_client and st.session_state.db_client.is_connected:
         if st.button("Disconnect", use_container_width=True):
+            if st.session_state.monitor:
+                st.session_state.monitor.stop()
             st.session_state.db_client.disconnect()
             st.session_state.db_client = None
             st.session_state.sql_generator = None
             st.session_state.schema_metadata = None
+            st.session_state.monitor = None
+            st.session_state.analyser = None
             st.rerun()
 
     st.divider()
@@ -152,15 +211,20 @@ with st.sidebar:
         if not profile_name:
             st.warning("Enter a profile name first.")
         else:
-            profile_mgr.save_profile(
-                name=profile_name,
-                host=db_host,
-                port=int(db_port),
-                database=db_name,
-                user=db_user,
-                password=db_password,
-                sslmode=db_sslmode,
-            )
+            save_kwargs: dict = {
+                "name": profile_name,
+                "db_type": selected_db_type,
+                "host": db_host,
+                "port": int(db_port),
+                "user": db_user,
+                "password": db_password,
+            }
+            if selected_db_type == DB_TYPE_POSTGRESQL:
+                save_kwargs["database"] = db_name
+                save_kwargs["sslmode"] = db_sslmode
+            else:
+                save_kwargs["service_name"] = db_service
+            profile_mgr.save_profile(**save_kwargs)
             st.success(f"Profile '{profile_name}' saved!")
             st.rerun()
 
@@ -178,12 +242,13 @@ with st.sidebar:
 # ---------------------------------------------------------------------------
 # Main area
 # ---------------------------------------------------------------------------
-st.header("🐘 AI PostgreSQL Assistant")
+st.header("🛢️ AI Database Assistant")
 
 if st.session_state.db_client and st.session_state.db_client.is_connected:
+    db_label = _connected_db_type().upper()
     st.info(
         f"Connected to **{st.session_state.db_client.get_connection_info()}** "
-        f"| Model: **{ollama_model}**"
+        f"({db_label}) | Model: **{ollama_model}**"
     )
 else:
     st.warning("Not connected to a database. Use the sidebar to connect.")
@@ -191,7 +256,9 @@ else:
 # ---------------------------------------------------------------------------
 # Tabs
 # ---------------------------------------------------------------------------
-tab_query, tab_schema, tab_history = st.tabs(["💬 Query", "📋 Schema", "📜 History"])
+tab_query, tab_schema, tab_monitor, tab_analyse, tab_history = st.tabs(
+    ["💬 Query", "📋 Schema", "📡 Auto Monitor", "📊 Auto Analyse", "📜 History"]
+)
 
 # ---- Query tab ------------------------------------------------------------
 with tab_query:
@@ -324,6 +391,217 @@ with tab_schema:
             st.info("No schema loaded. Click 'Refresh Schema' to load.")
     else:
         st.warning("Connect to a database first.")
+
+# ---- Auto Monitor tab -----------------------------------------------------
+with tab_monitor:
+    st.subheader("📡 Tablespace Auto Monitor")
+
+    if not (st.session_state.db_client and st.session_state.db_client.is_connected):
+        st.warning("Connect to a database first.")
+    else:
+        db_client = st.session_state.db_client
+
+        st.markdown(
+            "Periodically monitors tablespace usage and automatically extends "
+            "datafiles when usage exceeds the threshold (Oracle). "
+            "For PostgreSQL, reports storage metrics."
+        )
+
+        mcol1, mcol2, mcol3 = st.columns(3)
+        with mcol1:
+            mon_threshold = st.slider(
+                "Usage threshold (%)", 50, 99, 85, key="mon_threshold"
+            )
+        with mcol2:
+            mon_interval = st.selectbox(
+                "Check interval",
+                [60, 300, 900, 1800, 3600],
+                index=4,
+                format_func=lambda x: (
+                    f"{x // 60} min" if x < 3600 else f"{x // 3600} hr"
+                ),
+                key="mon_interval",
+            )
+        with mcol3:
+            mon_max_gb = st.number_input(
+                "Max file size (GB)", 1, 100, 20, key="mon_max_gb"
+            )
+
+        bcol1, bcol2, bcol3 = st.columns(3)
+        with bcol1:
+            if st.button(
+                "▶️ Start Auto Monitor", use_container_width=True, type="primary"
+            ):
+                monitor = TablespaceMonitor(
+                    db_client=db_client,
+                    threshold_pct=mon_threshold,
+                    max_file_size_gb=mon_max_gb,
+                    interval_sec=mon_interval,
+                )
+                monitor.start()
+                st.session_state.monitor = monitor
+                st.success("Monitor started!")
+        with bcol2:
+            if st.button("⏹️ Stop Monitor", use_container_width=True):
+                if st.session_state.monitor:
+                    st.session_state.monitor.stop()
+                    st.info("Monitor stopped.")
+        with bcol3:
+            if st.button("🔍 Check Now", use_container_width=True):
+                monitor = st.session_state.monitor
+                if not monitor:
+                    monitor = TablespaceMonitor(
+                        db_client=db_client,
+                        threshold_pct=mon_threshold,
+                        max_file_size_gb=mon_max_gb,
+                    )
+                    st.session_state.monitor = monitor
+                with st.spinner("Checking tablespace usage..."):
+                    event = monitor.run_check()
+                st.success("Check complete!")
+
+        if st.session_state.monitor and st.session_state.monitor.running:
+            st.info(
+                f"Monitor is running (interval: {st.session_state.monitor.interval_sec}s, "
+                f"threshold: {st.session_state.monitor.threshold_pct}%)"
+            )
+
+        # Display monitor events
+        monitor = st.session_state.monitor
+        if monitor and monitor.events:
+            st.divider()
+            st.subheader("Monitor Events")
+            for i, evt in enumerate(reversed(monitor.events[-20:])):
+                status_icon = {"ok": "🟢", "warning": "🟡", "error": "🔴"}.get(
+                    evt["status"], "⚪"
+                )
+                with st.expander(
+                    f"{status_icon} {evt['timestamp']} - {evt['status'].upper()}"
+                ):
+                    if evt.get("error"):
+                        st.error(evt["error"])
+
+                    ts_data = evt.get("tablespace_data", [])
+                    display_rows = [
+                        r
+                        for r in ts_data
+                        if isinstance(r, dict) and "_section" not in r
+                    ]
+                    if display_rows:
+                        st.caption("Tablespace Usage")
+                        st.dataframe(
+                            pd.DataFrame(display_rows),
+                            use_container_width=True,
+                            hide_index=True,
+                        )
+
+                    for section_item in ts_data:
+                        if (
+                            isinstance(section_item, dict)
+                            and "_section" in section_item
+                        ):
+                            st.caption(section_item["_section"].title())
+                            sec_rows = section_item.get("rows", [])
+                            if sec_rows:
+                                st.dataframe(
+                                    pd.DataFrame(sec_rows),
+                                    use_container_width=True,
+                                    hide_index=True,
+                                )
+
+                    actions = evt.get("actions", [])
+                    if actions:
+                        st.caption("Actions Taken")
+                        for act in actions:
+                            act_icon = (
+                                "✅"
+                                if "added" in act.get("action", "")
+                                or "enabled" in act.get("action", "")
+                                else "❌"
+                            )
+                            st.markdown(f"{act_icon} **{act.get('action', '')}**")
+                            if act.get("sql"):
+                                st.code(act["sql"], language="sql")
+                            if act.get("error"):
+                                st.error(act["error"])
+
+# ---- Auto Analyse tab -----------------------------------------------------
+with tab_analyse:
+    st.subheader("📊 Performance Analysis")
+
+    if not (st.session_state.db_client and st.session_state.db_client.is_connected):
+        st.warning("Connect to a database first.")
+    elif not st.session_state.llm_client:
+        st.warning("Configure Ollama settings and connect first.")
+    else:
+        db_client = st.session_state.db_client
+        llm_client = st.session_state.llm_client
+        db_label = db_client.db_type.upper()
+
+        st.markdown(
+            f"Collects performance data from **{db_label}** "
+            f"({'AWR / V$ views' if db_client.db_type == DB_TYPE_ORACLE else 'pg_stat_statements / pg_stat_*'}) "
+            "and generates an AI-powered summary with action plan."
+        )
+
+        acol1, acol2 = st.columns(2)
+        with acol1:
+            if st.button("📈 Collect Data Only", use_container_width=True):
+                analyser = PerformanceAnalyser(
+                    db_client=db_client, llm_client=llm_client
+                )
+                with st.spinner("Collecting performance data..."):
+                    raw_data = analyser.collect_data()
+                st.session_state.analyser = analyser
+                st.session_state["_last_analysis"] = {
+                    "raw_data": raw_data,
+                    "analysis": None,
+                }
+                st.success("Data collected!")
+
+        with acol2:
+            if st.button(
+                "🧠 Full Analysis (Data + LLM)",
+                use_container_width=True,
+                type="primary",
+            ):
+                analyser = PerformanceAnalyser(
+                    db_client=db_client, llm_client=llm_client
+                )
+                with st.spinner("Collecting data and running LLM analysis..."):
+                    result = analyser.analyse()
+                st.session_state.analyser = analyser
+                st.session_state["_last_analysis"] = result
+                st.success("Analysis complete!")
+
+        # Display analysis results
+        last = st.session_state.get("_last_analysis")
+        if last:
+            st.divider()
+
+            if last.get("analysis"):
+                st.subheader("AI Analysis & Action Plan")
+                st.markdown(last["analysis"])
+
+            raw = last.get("raw_data", {})
+            if raw:
+                st.divider()
+                st.subheader("Raw Performance Data")
+                for section_name, section_data in raw.items():
+                    if section_name == "db_type":
+                        continue
+                    label = section_name.replace("_", " ").title()
+                    with st.expander(f"📊 {label}"):
+                        if isinstance(section_data, dict) and "error" in section_data:
+                            st.error(section_data["error"])
+                        elif isinstance(section_data, list) and section_data:
+                            st.dataframe(
+                                pd.DataFrame(section_data),
+                                use_container_width=True,
+                                hide_index=True,
+                            )
+                        else:
+                            st.info("No data available.")
 
 # ---- History tab ----------------------------------------------------------
 with tab_history:
