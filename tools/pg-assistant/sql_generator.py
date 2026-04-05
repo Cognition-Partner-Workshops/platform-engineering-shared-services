@@ -29,7 +29,10 @@ _ORA_SYSTEM_PROMPT = (
     "- Do NOT include explanations, comments, or markdown formatting.\n"
     "- Do NOT use DROP, DELETE, TRUNCATE, UPDATE, INSERT, ALTER, CREATE, or GRANT.\n"
     "- Only generate SELECT statements.\n"
-    "- Use Oracle SQL syntax (e.g. ROWNUM, FETCH FIRST, NVL, DUAL, etc.).\n"
+    "- Use classic Oracle SQL syntax compatible with Oracle 11g and above.\n"
+    "- For limiting rows, ALWAYS use WHERE ROWNUM <= N (wrap in a subquery if "
+    "ordering is needed). NEVER use FETCH FIRST or OFFSET/FETCH.\n"
+    "- Use NVL instead of COALESCE, DUAL for dummy selects, TO_DATE for dates.\n"
     "- Always terminate the query with a semicolon.\n"
     "- If the question cannot be answered with a SELECT query, respond with: "
     "-- CANNOT_GENERATE"
@@ -51,7 +54,7 @@ DANGEROUS_KEYWORDS = frozenset(
     }
 )
 
-MAX_RETRIES = 2
+MAX_RETRIES = 3
 
 
 class SQLGenerationError(Exception):

@@ -321,54 +321,81 @@ with tab_query:
                     gen_elapsed = 0
 
             if sql:
-                st.subheader("Generated SQL")
-                st.code(sql, language="sql")
-                st.caption(f"Generated in {gen_elapsed:.2f}s")
+                max_exec_retries = 2
+                for exec_attempt in range(1, max_exec_retries + 1):
+                    st.subheader("Generated SQL")
+                    st.code(sql, language="sql")
+                    st.caption(f"Generated in {gen_elapsed:.2f}s")
 
-                with st.spinner("Executing query..."):
-                    result = db.execute_query(sql)
+                    with st.spinner("Executing query..."):
+                        result = db.execute_query(sql)
 
-                if "error" in result:
-                    st.error(f"**Query Error:** {result['error']}")
-                    st.session_state.query_history.append(
-                        {
-                            "question": user_question.strip(),
-                            "sql": sql,
-                            "status": "error",
-                            "error": result["error"],
-                            "elapsed_ms": result.get("elapsed_ms", 0),
-                        }
-                    )
-                else:
-                    rows = result.get("rows", [])
-                    row_count = result.get("row_count", 0)
-                    elapsed_ms = result.get("elapsed_ms", 0)
+                    if "error" in result and exec_attempt < max_exec_retries:
+                        db_error = result["error"]
+                        st.warning(
+                            f"**Query failed** (attempt {exec_attempt}): {db_error}\n\n"
+                            "Regenerating SQL with error feedback..."
+                        )
+                        with st.spinner("Regenerating SQL with error context..."):
+                            retry_start = time.monotonic()
+                            try:
+                                sql = generator.generate_sql(
+                                    f"{user_question.strip()}\n\n"
+                                    f"IMPORTANT: The previous SQL failed with this "
+                                    f"database error: {db_error}\n"
+                                    f"Previous failing SQL: {sql}\n"
+                                    f"Please generate a corrected query that avoids "
+                                    f"this error."
+                                )
+                                gen_elapsed = time.monotonic() - retry_start
+                            except (UnsafeSQLError, SQLGenerationError) as exc:
+                                st.error(f"**Retry failed:** {exc}")
+                                sql = None
+                                break
+                        continue
 
-                    st.subheader("Results")
-                    if rows:
-                        df = pd.DataFrame(rows)
-                        st.dataframe(df, use_container_width=True)
-                        st.caption(f"{row_count} row(s) returned in {elapsed_ms}ms")
-
-                        csv = df.to_csv(index=False)
-                        st.download_button(
-                            "📥 Download CSV",
-                            csv,
-                            file_name="query_results.csv",
-                            mime="text/csv",
+                    if "error" in result:
+                        st.error(f"**Query Error:** {result['error']}")
+                        st.session_state.query_history.append(
+                            {
+                                "question": user_question.strip(),
+                                "sql": sql,
+                                "status": "error",
+                                "error": result["error"],
+                                "elapsed_ms": result.get("elapsed_ms", 0),
+                            }
                         )
                     else:
-                        st.info("Query returned no results.")
+                        rows = result.get("rows", [])
+                        row_count = result.get("row_count", 0)
+                        elapsed_ms = result.get("elapsed_ms", 0)
 
-                    st.session_state.query_history.append(
-                        {
-                            "question": user_question.strip(),
-                            "sql": sql,
-                            "status": "success",
-                            "row_count": row_count,
-                            "elapsed_ms": elapsed_ms,
-                        }
-                    )
+                        st.subheader("Results")
+                        if rows:
+                            df = pd.DataFrame(rows)
+                            st.dataframe(df, use_container_width=True)
+                            st.caption(f"{row_count} row(s) returned in {elapsed_ms}ms")
+
+                            csv = df.to_csv(index=False)
+                            st.download_button(
+                                "📥 Download CSV",
+                                csv,
+                                file_name="query_results.csv",
+                                mime="text/csv",
+                            )
+                        else:
+                            st.info("Query returned no results.")
+
+                        st.session_state.query_history.append(
+                            {
+                                "question": user_question.strip(),
+                                "sql": sql,
+                                "status": "success",
+                                "row_count": row_count,
+                                "elapsed_ms": elapsed_ms,
+                            }
+                        )
+                    break
 
 # ---- Schema tab -----------------------------------------------------------
 with tab_schema:
