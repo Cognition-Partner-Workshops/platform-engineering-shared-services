@@ -569,44 +569,248 @@ with tab_analyse:
         db_client = st.session_state.db_client
         llm_client = st.session_state.llm_client
         db_label = db_client.db_type.upper()
+        is_oracle = db_client.db_type == DB_TYPE_ORACLE
 
         st.markdown(
             f"Collects performance data from **{db_label}** "
-            f"({'AWR / V$ views' if db_client.db_type == DB_TYPE_ORACLE else 'pg_stat_statements / pg_stat_*'}) "
+            f"({'AWR / V$ views' if is_oracle else 'pg_stat_statements / pg_stat_* / pgProfile'}) "
             "and generates an AI-powered summary with action plan."
         )
 
-        acol1, acol2 = st.columns(2)
-        with acol1:
-            if st.button("📈 Collect Data Only", use_container_width=True):
-                analyser = PerformanceAnalyser(
-                    db_client=db_client, llm_client=llm_client
-                )
-                with st.spinner("Collecting performance data..."):
-                    raw_data = analyser.collect_data()
-                st.session_state.analyser = analyser
-                st.session_state["_last_analysis"] = {
-                    "raw_data": raw_data,
-                    "analysis": None,
-                }
-                st.success("Data collected!")
+        # Analysis mode selector
+        if is_oracle:
+            analyse_mode = st.radio(
+                "Analysis mode",
+                [
+                    "Live V$ views",
+                    "AWR Snap ID range",
+                    "Upload report file",
+                ],
+                horizontal=True,
+                key="analyse_mode",
+            )
+        else:
+            analyse_mode = st.radio(
+                "Analysis mode",
+                [
+                    "Live pg_stat_* views",
+                    "pgProfile Snap ID range",
+                    "Latest pg_stat_statements",
+                    "Upload report file",
+                ],
+                horizontal=True,
+                key="analyse_mode",
+            )
 
-        with acol2:
+        st.divider()
+
+        # ------- Mode: Live V$ / pg_stat_* -----------------------------------
+        if analyse_mode in ("Live V$ views", "Live pg_stat_* views"):
+            acol1, acol2 = st.columns(2)
+            with acol1:
+                if st.button("📈 Collect Data Only", use_container_width=True):
+                    analyser = PerformanceAnalyser(
+                        db_client=db_client, llm_client=llm_client
+                    )
+                    with st.spinner("Collecting performance data..."):
+                        raw_data = analyser.collect_data()
+                    st.session_state.analyser = analyser
+                    st.session_state["_last_analysis"] = {
+                        "raw_data": raw_data,
+                        "analysis": None,
+                    }
+                    st.success("Data collected!")
+
+            with acol2:
+                if st.button(
+                    "🧠 Full Analysis (Data + LLM)",
+                    use_container_width=True,
+                    type="primary",
+                ):
+                    analyser = PerformanceAnalyser(
+                        db_client=db_client, llm_client=llm_client
+                    )
+                    with st.spinner("Collecting data and running LLM analysis..."):
+                        result = analyser.analyse()
+                    st.session_state.analyser = analyser
+                    st.session_state["_last_analysis"] = result
+                    st.success("Analysis complete!")
+
+        # ------- Mode: AWR Snap ID range (Oracle) ----------------------------
+        elif analyse_mode == "AWR Snap ID range":
+            analyser = PerformanceAnalyser(db_client=db_client, llm_client=llm_client)
+            st.markdown("Select an AWR snapshot range from `DBA_HIST_SNAPSHOT`.")
+
+            if st.button("🔄 Load AWR Snapshots"):
+                with st.spinner("Querying DBA_HIST_SNAPSHOT..."):
+                    snaps = analyser.list_awr_snapshots()
+                st.session_state["_awr_snapshots"] = snaps
+
+            snaps = st.session_state.get("_awr_snapshots", [])
+            if snaps:
+                snap_df = pd.DataFrame(snaps)
+                st.dataframe(
+                    snap_df, use_container_width=True, hide_index=True, height=250
+                )
+                snap_ids = [int(s["snap_id"]) for s in snaps]
+                scol1, scol2 = st.columns(2)
+                with scol1:
+                    begin_snap = st.selectbox(
+                        "Begin Snap ID",
+                        sorted(snap_ids),
+                        index=max(0, len(snap_ids) - 2),
+                        key="awr_begin",
+                    )
+                with scol2:
+                    end_snap = st.selectbox(
+                        "End Snap ID",
+                        sorted(snap_ids),
+                        index=len(snap_ids) - 1,
+                        key="awr_end",
+                    )
+
+                if st.button(
+                    "🧠 Analyse AWR Range",
+                    use_container_width=True,
+                    type="primary",
+                ):
+                    if begin_snap >= end_snap:
+                        st.error("Begin Snap ID must be less than End Snap ID.")
+                    else:
+                        with st.spinner(
+                            f"Collecting AWR data for snaps {begin_snap}–{end_snap}..."
+                        ):
+                            result = analyser.analyse_awr_snaps(begin_snap, end_snap)
+                        st.session_state.analyser = analyser
+                        st.session_state["_last_analysis"] = result
+                        st.success("AWR analysis complete!")
+            else:
+                st.info("Click 'Load AWR Snapshots' to list available snapshot IDs.")
+
+        # ------- Mode: pgProfile Snap ID range (PostgreSQL) ------------------
+        elif analyse_mode == "pgProfile Snap ID range":
+            analyser = PerformanceAnalyser(db_client=db_client, llm_client=llm_client)
+            st.markdown(
+                "Select a pgProfile sample range from `profile.samples`. "
+                "Requires the [pgProfile](https://github.com/zubkov-andrei/pg_profile) extension."
+            )
+
+            if st.button("🔄 Load pgProfile Samples"):
+                with st.spinner("Querying profile.samples..."):
+                    samples = analyser.list_pgprofile_samples()
+                if not samples:
+                    st.warning(
+                        "No pgProfile samples found. Is the pgProfile extension "
+                        "installed and configured?"
+                    )
+                st.session_state["_pgprofile_samples"] = samples
+
+            samples = st.session_state.get("_pgprofile_samples", [])
+            if samples:
+                samp_df = pd.DataFrame(samples)
+                st.dataframe(
+                    samp_df, use_container_width=True, hide_index=True, height=250
+                )
+                sample_ids = [int(s["sample_id"]) for s in samples]
+                pcol1, pcol2 = st.columns(2)
+                with pcol1:
+                    begin_sample = st.selectbox(
+                        "Begin Sample ID",
+                        sorted(sample_ids),
+                        index=max(0, len(sample_ids) - 2),
+                        key="pgp_begin",
+                    )
+                with pcol2:
+                    end_sample = st.selectbox(
+                        "End Sample ID",
+                        sorted(sample_ids),
+                        index=len(sample_ids) - 1,
+                        key="pgp_end",
+                    )
+
+                if st.button(
+                    "🧠 Analyse pgProfile Range",
+                    use_container_width=True,
+                    type="primary",
+                ):
+                    if begin_sample >= end_sample:
+                        st.error("Begin Sample ID must be less than End Sample ID.")
+                    else:
+                        with st.spinner(
+                            f"Collecting pgProfile data for samples "
+                            f"{begin_sample}–{end_sample}..."
+                        ):
+                            result = analyser.analyse_pgprofile_snaps(
+                                begin_sample, end_sample
+                            )
+                        st.session_state.analyser = analyser
+                        st.session_state["_last_analysis"] = result
+                        st.success("pgProfile analysis complete!")
+            else:
+                st.info("Click 'Load pgProfile Samples' to list available sample IDs.")
+
+        # ------- Mode: Latest pg_stat_statements (PostgreSQL) ----------------
+        elif analyse_mode == "Latest pg_stat_statements":
+            analyser = PerformanceAnalyser(db_client=db_client, llm_client=llm_client)
+            st.markdown(
+                "Collects the **latest cumulative snapshot** from "
+                "`pg_stat_statements` plus table, database, bgwriter stats "
+                "and unused indexes."
+            )
+
             if st.button(
-                "🧠 Full Analysis (Data + LLM)",
+                "🧠 Analyse Latest pg_stat_statements",
                 use_container_width=True,
                 type="primary",
             ):
-                analyser = PerformanceAnalyser(
-                    db_client=db_client, llm_client=llm_client
-                )
-                with st.spinner("Collecting data and running LLM analysis..."):
-                    result = analyser.analyse()
-                st.session_state.analyser = analyser
-                st.session_state["_last_analysis"] = result
-                st.success("Analysis complete!")
+                with st.spinner("Checking pg_stat_statements extension..."):
+                    has_ext = analyser.check_pg_stat_statements()
+                if not has_ext:
+                    st.error(
+                        "pg_stat_statements extension is not installed. "
+                        "Run `CREATE EXTENSION pg_stat_statements;` first."
+                    )
+                else:
+                    with st.spinner(
+                        "Collecting pg_stat_statements data and running LLM analysis..."
+                    ):
+                        result = analyser.analyse_pg_stat_latest()
+                    st.session_state.analyser = analyser
+                    st.session_state["_last_analysis"] = result
+                    st.success("pg_stat_statements analysis complete!")
 
-        # Display analysis results
+        # ------- Mode: Upload report file ------------------------------------
+        elif analyse_mode == "Upload report file":
+            st.markdown(
+                "Upload an **AWR report** (HTML/text), **pg_stat_statements CSV**, "
+                "or **pgProfile report** (HTML/text) for LLM-powered analysis."
+            )
+            uploaded_file = st.file_uploader(
+                "Choose a report file",
+                type=["html", "htm", "txt", "csv", "log"],
+                key="report_upload",
+            )
+            if uploaded_file is not None:
+                if st.button(
+                    "🧠 Analyse Uploaded Report",
+                    use_container_width=True,
+                    type="primary",
+                ):
+                    analyser = PerformanceAnalyser(
+                        db_client=db_client, llm_client=llm_client
+                    )
+                    file_content = uploaded_file.getvalue().decode(
+                        "utf-8", errors="replace"
+                    )
+                    with st.spinner(f"Parsing and analysing {uploaded_file.name}..."):
+                        result = analyser.analyse_uploaded_report(
+                            file_content, uploaded_file.name
+                        )
+                    st.session_state.analyser = analyser
+                    st.session_state["_last_analysis"] = result
+                    st.success("Report analysis complete!")
+
+        # ------- Display analysis results (shared across all modes) ----------
         last = st.session_state.get("_last_analysis")
         if last:
             st.divider()
@@ -620,7 +824,7 @@ with tab_analyse:
                 st.divider()
                 st.subheader("Raw Performance Data")
                 for section_name, section_data in raw.items():
-                    if section_name == "db_type":
+                    if section_name in ("db_type", "snap_range", "sample_range"):
                         continue
                     label = section_name.replace("_", " ").title()
                     with st.expander(f"📊 {label}"):
@@ -634,6 +838,10 @@ with tab_analyse:
                             )
                         else:
                             st.info("No data available.")
+
+            if last.get("report_text") and not raw:
+                with st.expander("📄 Parsed Report Text"):
+                    st.text(last["report_text"][:5000])
 
 # ---- History tab ----------------------------------------------------------
 with tab_history:

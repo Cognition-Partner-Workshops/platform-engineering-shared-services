@@ -1,6 +1,15 @@
-"""Performance analysis for Oracle (AWR/V$) and PostgreSQL (pg_stat_statements)."""
+"""Performance analysis for Oracle (AWR/V$) and PostgreSQL (pg_stat_statements).
 
+Supports three analysis modes:
+1. Live collection from V$/pg_stat_* views
+2. AWR snap-ID based report generation (Oracle)
+3. Uploaded report file parsing (AWR HTML/text, pg_stat_statements CSV, pgProfile)
+"""
+
+import csv
+import io
 import logging
+import re
 from typing import Any
 
 from db_client import BaseDBClient, DB_TYPE_ORACLE, DB_TYPE_POSTGRESQL
@@ -76,6 +85,121 @@ _ORA_TABLESPACE_IO = """
         GROUP BY ts.name
         ORDER BY physical_reads + physical_writes DESC
     ) WHERE ROWNUM <= 20
+"""
+
+# ---------------------------------------------------------------------------
+# Oracle AWR snapshot queries
+# ---------------------------------------------------------------------------
+_ORA_LIST_SNAPSHOTS = """
+    SELECT
+        snap_id,
+        dbid,
+        instance_number,
+        TO_CHAR(begin_interval_time, 'YYYY-MM-DD HH24:MI') AS begin_time,
+        TO_CHAR(end_interval_time, 'YYYY-MM-DD HH24:MI') AS end_time
+    FROM dba_hist_snapshot
+    ORDER BY snap_id DESC
+"""
+
+_ORA_AWR_TOP_SQL = """
+    SELECT * FROM (
+        SELECT
+            s.sql_id,
+            s.plan_hash_value,
+            SUM(s.elapsed_time_delta) / 1e6 AS elapsed_sec,
+            SUM(s.executions_delta) AS executions,
+            SUM(s.buffer_gets_delta) AS buffer_gets,
+            SUM(s.disk_reads_delta) AS disk_reads,
+            DBMS_LOB.SUBSTR(t.sql_text, 200, 1) AS sql_text
+        FROM dba_hist_sqlstat s
+        JOIN dba_hist_sqltext t ON s.sql_id = t.sql_id AND s.dbid = t.dbid
+        WHERE s.snap_id BETWEEN :begin_snap AND :end_snap
+        GROUP BY s.sql_id, s.plan_hash_value,
+                 DBMS_LOB.SUBSTR(t.sql_text, 200, 1)
+        ORDER BY elapsed_sec DESC
+    ) WHERE ROWNUM <= 20
+"""
+
+_ORA_AWR_WAIT_EVENTS = """
+    SELECT * FROM (
+        SELECT
+            event_name AS event,
+            SUM(total_waits_fg) AS total_waits,
+            ROUND(SUM(time_waited_micro_fg) / 1e6, 2) AS time_waited_sec
+        FROM dba_hist_system_event
+        WHERE snap_id BETWEEN :begin_snap AND :end_snap
+          AND wait_class != 'Idle'
+        GROUP BY event_name
+        ORDER BY time_waited_sec DESC
+    ) WHERE ROWNUM <= 20
+"""
+
+_ORA_AWR_SYS_STATS = """
+    SELECT
+        stat_name AS name,
+        SUM(value) AS value
+    FROM dba_hist_sysstat
+    WHERE snap_id BETWEEN :begin_snap AND :end_snap
+      AND stat_name IN (
+        'db block gets', 'consistent gets', 'physical reads',
+        'redo size', 'sorts (memory)', 'sorts (disk)',
+        'rows processed', 'parse count (total)', 'parse count (hard)',
+        'execute count', 'user commits', 'user rollbacks'
+    )
+    GROUP BY stat_name
+    ORDER BY stat_name
+"""
+
+# ---------------------------------------------------------------------------
+# PostgreSQL pgProfile snapshot queries
+# ---------------------------------------------------------------------------
+_PG_LIST_PGPROFILE_SAMPLES = """
+    SELECT
+        sample_id,
+        sample_time::text AS sample_time,
+        server_name
+    FROM profile.samples
+    ORDER BY sample_id DESC
+    LIMIT 100
+"""
+
+_PG_PGPROFILE_TOP_SQL = """
+    SELECT
+        queryid,
+        LEFT(query, 200) AS query_text,
+        calls,
+        ROUND((total_exec_time / 1000)::numeric, 2) AS total_exec_sec,
+        ROUND((mean_exec_time / 1000)::numeric, 4) AS mean_exec_sec,
+        rows,
+        shared_blks_hit,
+        shared_blks_read
+    FROM profile.stmt_list sl
+    JOIN profile.sample_statements ss ON sl.queryid_md5 = ss.queryid_md5
+    WHERE ss.sample_id BETWEEN {begin_sample} AND {end_sample}
+    ORDER BY total_exec_time DESC
+    LIMIT 20
+"""
+
+_PG_PGPROFILE_WAIT_EVENTS = """
+    SELECT
+        event_type,
+        event,
+        SUM(tot_waited)::numeric AS total_waited_sec,
+        SUM(tot_waits) AS total_waits
+    FROM profile.wait_sampling_total
+    WHERE sample_id BETWEEN {begin_sample} AND {end_sample}
+    GROUP BY event_type, event
+    ORDER BY total_waited_sec DESC
+    LIMIT 20
+"""
+
+# ---------------------------------------------------------------------------
+# PostgreSQL pg_stat_statements snapshot (latest cumulative)
+# ---------------------------------------------------------------------------
+_PG_STAT_STATEMENTS_EXISTS = """
+    SELECT COUNT(*) AS cnt
+    FROM pg_extension
+    WHERE extname = 'pg_stat_statements'
 """
 
 # ---------------------------------------------------------------------------
@@ -178,6 +302,8 @@ class PerformanceAnalyser:
         self.db_client = db_client
         self.llm_client = llm_client
 
+    # -- public API ----------------------------------------------------------
+
     def collect_data(self) -> dict[str, Any]:
         """Collect raw performance data from the database."""
         if self.db_client.db_type == DB_TYPE_ORACLE:
@@ -187,8 +313,58 @@ class PerformanceAnalyser:
     def analyse(self) -> dict[str, Any]:
         """Collect data, generate LLM analysis, and return everything."""
         raw_data = self.collect_data()
-        report_text = self._format_report(raw_data)
+        return self._run_llm_analysis(raw_data)
 
+    def analyse_awr_snaps(self, begin_snap: int, end_snap: int) -> dict[str, Any]:
+        """Collect AWR data for a snap-ID range and generate LLM analysis."""
+        raw_data = self._collect_oracle_awr(begin_snap, end_snap)
+        return self._run_llm_analysis(raw_data)
+
+    def analyse_uploaded_report(
+        self, file_content: str, file_name: str
+    ) -> dict[str, Any]:
+        """Parse an uploaded report file and generate LLM analysis."""
+        parsed = parse_uploaded_report(file_content, file_name)
+        return self._run_llm_analysis_from_text(parsed)
+
+    def list_awr_snapshots(self) -> list[dict[str, Any]]:
+        """Return available AWR snapshots from DBA_HIST_SNAPSHOT."""
+        result = self.db_client.execute_query(_ORA_LIST_SNAPSHOTS)
+        if "error" in result:
+            return []
+        return result.get("rows", [])
+
+    def list_pgprofile_samples(self) -> list[dict[str, Any]]:
+        """Return available pgProfile samples from profile.samples."""
+        result = self.db_client.execute_query(_PG_LIST_PGPROFILE_SAMPLES)
+        if "error" in result:
+            return []
+        return result.get("rows", [])
+
+    def analyse_pgprofile_snaps(
+        self, begin_sample: int, end_sample: int
+    ) -> dict[str, Any]:
+        """Collect pgProfile data for a sample-ID range and run LLM analysis."""
+        raw_data = self._collect_pgprofile(begin_sample, end_sample)
+        return self._run_llm_analysis(raw_data)
+
+    def analyse_pg_stat_latest(self) -> dict[str, Any]:
+        """Collect latest pg_stat_statements data and run LLM analysis."""
+        raw_data = self._collect_postgresql()
+        return self._run_llm_analysis(raw_data)
+
+    def check_pg_stat_statements(self) -> bool:
+        """Check if pg_stat_statements extension is installed."""
+        result = self.db_client.execute_query(_PG_STAT_STATEMENTS_EXISTS)
+        if "error" in result:
+            return False
+        rows = result.get("rows", [])
+        return bool(rows and int(rows[0].get("cnt", 0)) > 0)
+
+    # -- internal helpers ----------------------------------------------------
+
+    def _run_llm_analysis(self, raw_data: dict[str, Any]) -> dict[str, Any]:
+        report_text = self._format_report(raw_data)
         try:
             llm_response = self.llm_client.generate(
                 prompt=report_text,
@@ -196,9 +372,22 @@ class PerformanceAnalyser:
             )
         except (ConnectionError, RuntimeError) as exc:
             llm_response = f"LLM analysis failed: {exc}"
-
         return {
             "raw_data": raw_data,
+            "report_text": report_text,
+            "analysis": llm_response,
+        }
+
+    def _run_llm_analysis_from_text(self, report_text: str) -> dict[str, Any]:
+        try:
+            llm_response = self.llm_client.generate(
+                prompt=report_text,
+                system_prompt=ANALYSIS_SYSTEM_PROMPT,
+            )
+        except (ConnectionError, RuntimeError) as exc:
+            llm_response = f"LLM analysis failed: {exc}"
+        return {
+            "raw_data": {},
             "report_text": report_text,
             "analysis": llm_response,
         }
@@ -221,6 +410,51 @@ class PerformanceAnalyser:
             else:
                 sections[name] = result.get("rows", [])
         sections["db_type"] = DB_TYPE_ORACLE
+        return sections
+
+    def _collect_oracle_awr(self, begin_snap: int, end_snap: int) -> dict[str, Any]:
+        """Collect AWR historical data between two snap IDs."""
+        sections: dict[str, Any] = {}
+        snap_range = {":begin_snap": str(begin_snap), ":end_snap": str(end_snap)}
+        queries = {
+            "awr_top_sql": _ORA_AWR_TOP_SQL,
+            "awr_wait_events": _ORA_AWR_WAIT_EVENTS,
+            "awr_system_stats": _ORA_AWR_SYS_STATS,
+        }
+        for name, sql in queries.items():
+            bound_sql = sql
+            for placeholder, val in snap_range.items():
+                bound_sql = bound_sql.replace(placeholder, val)
+            result = self.db_client.execute_query(bound_sql)
+            if "error" in result:
+                sections[name] = {"error": result["error"]}
+            else:
+                sections[name] = result.get("rows", [])
+        sections["db_type"] = DB_TYPE_ORACLE
+        sections["snap_range"] = f"{begin_snap} - {end_snap}"
+        return sections
+
+    # -- pgProfile collection ------------------------------------------------
+
+    def _collect_pgprofile(self, begin_sample: int, end_sample: int) -> dict[str, Any]:
+        """Collect pgProfile historical data between two sample IDs."""
+        sections: dict[str, Any] = {}
+        queries = {
+            "pgprofile_top_sql": _PG_PGPROFILE_TOP_SQL.format(
+                begin_sample=begin_sample, end_sample=end_sample
+            ),
+            "pgprofile_wait_events": _PG_PGPROFILE_WAIT_EVENTS.format(
+                begin_sample=begin_sample, end_sample=end_sample
+            ),
+        }
+        for name, sql in queries.items():
+            result = self.db_client.execute_query(sql)
+            if "error" in result:
+                sections[name] = {"error": result["error"]}
+            else:
+                sections[name] = result.get("rows", [])
+        sections["db_type"] = DB_TYPE_POSTGRESQL
+        sections["sample_range"] = f"{begin_sample} - {end_sample}"
         return sections
 
     # -- PostgreSQL collection -----------------------------------------------
@@ -278,3 +512,116 @@ def _format_row(row: dict[str, Any]) -> str:
             continue
         items.append(f"{k}={v}")
     return ", ".join(items)
+
+
+# ---------------------------------------------------------------------------
+# Report file parsing
+# ---------------------------------------------------------------------------
+def parse_uploaded_report(content: str, file_name: str) -> str:
+    """Parse an uploaded report file and return text suitable for LLM analysis.
+
+    Supported formats:
+    - AWR HTML report (Oracle)
+    - AWR text report (Oracle)
+    - pg_stat_statements CSV export
+    - pgProfile text/HTML report
+    - Plain text report
+    """
+    lower_name = file_name.lower()
+
+    if lower_name.endswith(".csv"):
+        return _parse_csv_report(content, file_name)
+    if lower_name.endswith((".html", ".htm")):
+        return _parse_html_report(content, file_name)
+    return _parse_text_report(content, file_name)
+
+
+def _parse_csv_report(content: str, file_name: str) -> str:
+    """Parse a CSV file (e.g. pg_stat_statements export)."""
+    parts = [f"UPLOADED REPORT: {file_name}\n{'=' * 60}\n"]
+    parts.append("Format: CSV (likely pg_stat_statements or similar export)\n")
+
+    reader = csv.DictReader(io.StringIO(content))
+    rows = list(reader)
+    if not rows:
+        parts.append("(empty CSV)")
+        return "\n".join(parts)
+
+    parts.append(f"Columns: {', '.join(rows[0].keys())}")
+    parts.append(f"Total rows: {len(rows)}\n")
+
+    for i, row in enumerate(rows[:30]):
+        parts.append(f"  [{i + 1}] {_format_row(row)}")
+    if len(rows) > 30:
+        parts.append(f"  ... and {len(rows) - 30} more rows")
+
+    return "\n".join(parts)
+
+
+def _parse_html_report(content: str, file_name: str) -> str:
+    """Parse an HTML report (AWR or pgProfile) by extracting text content."""
+    parts = [f"UPLOADED REPORT: {file_name}\n{'=' * 60}\n"]
+
+    if (
+        "AWR" in content[:2000].upper()
+        or "WORKLOAD REPOSITORY" in content[:2000].upper()
+    ):
+        parts.append("Format: Oracle AWR HTML Report\n")
+    elif (
+        "pgprofile" in content[:2000].lower() or "pg_profile" in content[:2000].lower()
+    ):
+        parts.append("Format: pgProfile HTML Report\n")
+    else:
+        parts.append("Format: HTML Report\n")
+
+    # Strip HTML tags to get text content
+    text = re.sub(
+        r"<style[^>]*>.*?</style>", "", content, flags=re.DOTALL | re.IGNORECASE
+    )
+    text = re.sub(
+        r"<script[^>]*>.*?</script>", "", text, flags=re.DOTALL | re.IGNORECASE
+    )
+    text = re.sub(r"<[^>]+>", " ", text)
+    text = re.sub(r"&nbsp;", " ", text)
+    text = re.sub(r"&lt;", "<", text)
+    text = re.sub(r"&gt;", ">", text)
+    text = re.sub(r"&amp;", "&", text)
+    text = re.sub(r"\s+", " ", text).strip()
+
+    # Truncate to a reasonable size for LLM context
+    max_chars = 15000
+    if len(text) > max_chars:
+        parts.append(text[:max_chars])
+        parts.append(f"\n... (truncated, {len(text)} total characters)")
+    else:
+        parts.append(text)
+
+    return "\n".join(parts)
+
+
+def _parse_text_report(content: str, file_name: str) -> str:
+    """Parse a plain text report (AWR text, pgProfile text, etc.)."""
+    parts = [f"UPLOADED REPORT: {file_name}\n{'=' * 60}\n"]
+
+    if (
+        "AWR" in content[:2000].upper()
+        or "WORKLOAD REPOSITORY" in content[:2000].upper()
+    ):
+        parts.append("Format: Oracle AWR Text Report\n")
+    elif (
+        "pgprofile" in content[:2000].lower() or "pg_profile" in content[:2000].lower()
+    ):
+        parts.append("Format: pgProfile Text Report\n")
+    elif "pg_stat_statements" in content[:2000].lower():
+        parts.append("Format: pg_stat_statements Report\n")
+    else:
+        parts.append("Format: Text Report\n")
+
+    max_chars = 15000
+    if len(content) > max_chars:
+        parts.append(content[:max_chars])
+        parts.append(f"\n... (truncated, {len(content)} total characters)")
+    else:
+        parts.append(content)
+
+    return "\n".join(parts)
