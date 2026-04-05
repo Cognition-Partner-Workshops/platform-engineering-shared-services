@@ -74,6 +74,9 @@ with st.sidebar:
     st.subheader("🤖 Ollama Settings")
     ollama_url = st.text_input("Ollama URL", value="http://localhost:11434")
     ollama_model = st.text_input("Model", value="codellama")
+    ollama_timeout = st.slider(
+        "Request timeout (seconds)", 60, 600, 300, step=30, key="ollama_timeout"
+    )
 
     if st.button("Test Ollama Connection"):
         test_llm = LLMClient(base_url=ollama_url, model=ollama_model)
@@ -173,7 +176,9 @@ with st.sidebar:
             db.connect()
             st.session_state.db_client = db
 
-            llm = LLMClient(base_url=ollama_url, model=ollama_model)
+            llm = LLMClient(
+                base_url=ollama_url, model=ollama_model, timeout=ollama_timeout
+            )
             st.session_state.llm_client = llm
             gen = SQLGenerator(llm_client=llm, db_type=selected_db_type)
             st.session_state.sql_generator = gen

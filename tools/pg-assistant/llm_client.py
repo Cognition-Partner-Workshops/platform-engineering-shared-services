@@ -10,7 +10,7 @@ logger = logging.getLogger(__name__)
 
 DEFAULT_OLLAMA_URL = "http://localhost:11434"
 DEFAULT_MODEL = "codellama"
-DEFAULT_TIMEOUT = 120
+DEFAULT_TIMEOUT = 300
 
 
 class LLMClient:
@@ -67,7 +67,9 @@ class LLMClient:
         except requests.Timeout as exc:
             logger.error("Ollama request timed out after %ds", self.timeout)
             raise RuntimeError(
-                f"Ollama request timed out after {self.timeout}s."
+                f"Ollama request timed out after {self.timeout}s. "
+                "Try increasing the timeout in the sidebar settings, or ensure "
+                "the model is fully loaded (first request is slower)."
             ) from exc
 
         elapsed = time.monotonic() - start
