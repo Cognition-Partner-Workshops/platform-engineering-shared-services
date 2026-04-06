@@ -856,27 +856,17 @@ class SnapshotComparator:
 
     def _get_llm_comparison(self, text: str) -> str:
         system_prompt = (
-            "You are a senior DBA comparing two database performance snapshots. "
-            "Produce a detailed comparison report with these sections:\n\n"
+            "You are a senior DBA comparing two REAL database snapshots.\n\n"
+            "CRITICAL: ONLY reference sql_ids, queryids, table names, and SQL text "
+            "that appear in the data below. NEVER invent fake IDs or placeholders.\n\n"
+            "Produce these sections (skip sections with no relevant data):\n"
             "## Executive Summary\n"
-            "2-3 sentences on overall change in database health between the two periods.\n\n"
             "## Key Metric Changes\n"
-            "For each metric that changed significantly (>10%), explain the change "
-            "and its likely cause. Reference specific sql_id/queryid values.\n\n"
             "## New or Regressed SQL\n"
-            "Identify SQL that appeared in Snapshot B but not A (new workload), or SQL "
-            "whose elapsed time increased significantly. For each, explain the likely "
-            "cause and provide specific fix SQL (CREATE INDEX, ANALYZE, rewrite).\n\n"
             "## Wait Event Changes\n"
-            "Highlight wait events that increased or decreased. Explain implications "
-            "(e.g., increased 'enq: TX - row lock contention' suggests locking issues).\n\n"
-            "## Recommendations\n"
-            "Numbered action plan sorted by impact. Each item must include:\n"
-            "- The specific sql_id/queryid/object affected\n"
-            "- The exact SQL command to execute\n"
-            "- Expected improvement\n\n"
-            "IMPORTANT: Be SPECIFIC. Always reference sql_id, queryid, or table names. "
-            "Never give generic advice. Use markdown code blocks for SQL."
+            "## Recommendations\n\n"
+            "For each problematic SQL, copy the ACTUAL query text from the data "
+            "into a ```sql code block. Provide exact fix commands."
         )
         try:
             return self.llm.generate(prompt=text, system_prompt=system_prompt)
