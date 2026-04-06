@@ -20,7 +20,9 @@ from db_client import (
 )
 from llm_client import LLMClient
 from profile_manager import ProfileManager
+from session_monitor import SessionMonitor
 from sql_generator import SQLGenerationError, SQLGenerator, UnsafeSQLError
+from sql_tuning_advisor import SQLTuningAdvisor
 
 # ---------------------------------------------------------------------------
 # Page config
@@ -261,8 +263,24 @@ else:
 # ---------------------------------------------------------------------------
 # Tabs
 # ---------------------------------------------------------------------------
-tab_query, tab_schema, tab_monitor, tab_analyse, tab_history = st.tabs(
-    ["💬 Query", "📋 Schema", "📡 Auto Monitor", "📊 Auto Analyse", "📜 History"]
+(
+    tab_query,
+    tab_schema,
+    tab_monitor,
+    tab_analyse,
+    tab_sessions,
+    tab_tuning,
+    tab_history,
+) = st.tabs(
+    [
+        "💬 Query",
+        "📋 Schema",
+        "📡 Auto Monitor",
+        "📊 Auto Analyse",
+        "🔒 Sessions & Locks",
+        "🔧 SQL Tuning Advisor",
+        "📜 History",
+    ]
 )
 
 # ---- Query tab ------------------------------------------------------------
@@ -842,6 +860,195 @@ with tab_analyse:
             if last.get("report_text") and not raw:
                 with st.expander("📄 Parsed Report Text"):
                     st.text(last["report_text"][:5000])
+
+# ---- Sessions & Locks tab -------------------------------------------------
+with tab_sessions:
+    st.subheader("🔒 Session & Lock Monitor")
+
+    if not (st.session_state.db_client and st.session_state.db_client.is_connected):
+        st.warning("Connect to a database first.")
+    else:
+        db_client = st.session_state.db_client
+        monitor = SessionMonitor(db_client)
+        is_oracle = db_client.db_type == DB_TYPE_ORACLE
+
+        sess_view = st.radio(
+            "View",
+            [
+                "Active Sessions",
+                "Blocking Lock Tree",
+                "Lock Details",
+                "Long-Running Queries",
+                "Wait Events",
+            ],
+            horizontal=True,
+            key="sess_view",
+        )
+
+        if st.button("🔄 Refresh", key="sess_refresh"):
+            st.session_state["_sess_data"] = None
+
+        # Fetch data based on selected view
+        with st.spinner("Querying sessions..."):
+            if sess_view == "Active Sessions":
+                result = monitor.get_active_sessions()
+            elif sess_view == "Blocking Lock Tree":
+                result = monitor.get_blocking_tree()
+            elif sess_view == "Lock Details":
+                result = monitor.get_lock_details()
+            elif sess_view == "Long-Running Queries":
+                result = monitor.get_long_running()
+            else:
+                result = monitor.get_wait_events()
+
+        if "error" in result:
+            st.error(result["error"])
+        else:
+            rows = result.get("rows", [])
+            if rows:
+                st.caption(f"{len(rows)} row(s)")
+                st.dataframe(
+                    pd.DataFrame(rows),
+                    use_container_width=True,
+                    hide_index=True,
+                )
+
+                # Kill session UI
+                st.divider()
+                st.subheader("Kill / Cancel Session")
+                st.warning(
+                    "Use with caution. This will terminate the selected session."
+                )
+                kcol1, kcol2, kcol3 = st.columns([2, 2, 2])
+
+                if is_oracle:
+                    with kcol1:
+                        kill_sid = st.number_input(
+                            "SID", min_value=1, step=1, key="kill_sid"
+                        )
+                    with kcol2:
+                        kill_serial = st.number_input(
+                            "Serial#", min_value=1, step=1, key="kill_serial"
+                        )
+                    with kcol3:
+                        if st.button(
+                            "⚠️ Kill Session (Oracle)",
+                            type="primary",
+                            key="kill_ora",
+                        ):
+                            kill_result = monitor.kill_session(kill_sid, kill_serial)
+                            if kill_result.get("success"):
+                                st.success(f"Session {kill_sid},{kill_serial} killed.")
+                            else:
+                                st.error(kill_result.get("error", "Kill failed"))
+                else:
+                    with kcol1:
+                        kill_pid = st.number_input(
+                            "PID", min_value=1, step=1, key="kill_pid"
+                        )
+                    with kcol2:
+                        kill_force = st.checkbox(
+                            "Force terminate (pg_terminate_backend)",
+                            key="kill_force",
+                        )
+                    with kcol3:
+                        label = "⚠️ Terminate Backend" if kill_force else "Cancel Query"
+                        if st.button(label, type="primary", key="kill_pg"):
+                            kill_result = monitor.kill_session(
+                                kill_pid, force=kill_force
+                            )
+                            if "error" in kill_result:
+                                st.error(kill_result["error"])
+                            else:
+                                st.success(
+                                    f"PID {kill_pid} "
+                                    f"{'terminated' if kill_force else 'cancel sent'}."
+                                )
+            else:
+                st.info("No sessions/locks found for this view.")
+
+# ---- SQL Tuning Advisor tab -----------------------------------------------
+with tab_tuning:
+    st.subheader("🔧 SQL Tuning Advisor")
+    st.markdown(
+        "Paste a SQL statement to get its **execution plan**, table metadata, "
+        "and **LLM-powered tuning recommendations** (index suggestions, "
+        "SQL rewrites, stats maintenance)."
+    )
+
+    if not (st.session_state.db_client and st.session_state.db_client.is_connected):
+        st.warning("Connect to a database first.")
+    elif not st.session_state.llm_client:
+        st.warning("Configure Ollama settings and connect first.")
+    else:
+        db_client = st.session_state.db_client
+        llm_client = st.session_state.llm_client
+        is_oracle = db_client.db_type == DB_TYPE_ORACLE
+
+        tune_sql = st.text_area(
+            "SQL to tune",
+            height=200,
+            placeholder=(
+                "SELECT o.order_id, c.customer_name, p.product_name\n"
+                "FROM orders o\n"
+                "JOIN customers c ON o.customer_id = c.id\n"
+                "JOIN products p ON o.product_id = p.id\n"
+                "WHERE o.order_date > '2024-01-01'\n"
+                "ORDER BY o.order_date DESC"
+            ),
+            key="tune_sql_input",
+        )
+
+        tcol1, tcol2 = st.columns(2)
+        with tcol1:
+            if not is_oracle:
+                run_analyze = st.checkbox(
+                    "Use EXPLAIN ANALYZE (executes the query — use with caution)",
+                    key="tune_analyze",
+                )
+            else:
+                run_analyze = False
+
+        with tcol2:
+            tune_btn = st.button(
+                "🔧 Analyse & Tune",
+                use_container_width=True,
+                type="primary",
+                key="tune_btn",
+            )
+
+        if tune_btn and tune_sql.strip():
+            advisor = SQLTuningAdvisor(db_client=db_client, llm_client=llm_client)
+            with st.spinner(
+                "Running EXPLAIN, collecting metadata, analysing with LLM..."
+            ):
+                result = advisor.analyse_sql(tune_sql.strip(), run_analyze=run_analyze)
+
+            if result.get("error"):
+                st.error(result["error"])
+            else:
+                # Show execution plan
+                plan_text = result.get("plan_text", "")
+                if plan_text:
+                    st.subheader("Execution Plan")
+                    st.code(plan_text, language="text")
+
+                # Show LLM analysis
+                analysis = result.get("analysis", "")
+                if analysis:
+                    st.divider()
+                    st.subheader("AI Tuning Recommendations")
+                    st.markdown(analysis)
+
+                # Show raw metadata in expander
+                metadata = result.get("metadata", {})
+                table_meta = metadata.get("table_metadata", "")
+                if table_meta:
+                    with st.expander("📋 Table Metadata (columns, indexes, stats)"):
+                        st.text(table_meta[:8000])
+
+        elif tune_btn:
+            st.warning("Please enter a SQL statement to tune.")
 
 # ---- History tab ----------------------------------------------------------
 with tab_history:
