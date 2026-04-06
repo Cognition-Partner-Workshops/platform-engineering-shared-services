@@ -281,19 +281,11 @@ class SnapshotComparator:
         # Build delta summary table
         delta_table = self._build_delta_table(data_a, data_b, label_a, label_b)
 
-        # Programmatic comparison — Python code identifies all changes.
+        # Fully programmatic comparison — no LLM involved.
         findings = self._build_programmatic_comparison(
             data_a, data_b, label_a, label_b, delta_table
         )
-
-        # Optional LLM summary appended after the real findings.
-        comparison_text = self._format_comparison_text(
-            data_a, data_b, label_a, label_b, delta_table
-        )
-        llm_summary = self._get_llm_comparison(comparison_text)
         analysis = findings
-        if llm_summary:
-            analysis += f"\n\n---\n## LLM Summary\n{llm_summary}"
 
         return {
             "figures": figures,

@@ -85,10 +85,10 @@ def _render_comparison(result: dict) -> None:
                 st.markdown(f"**{title}**")
                 st.plotly_chart(fig, use_container_width=True)
 
-    # LLM analysis
+    # Comparison analysis
     analysis = result.get("analysis", "")
     if analysis:
-        st.markdown("### AI Comparison Analysis")
+        st.markdown("### Comparison Analysis")
         st.markdown(analysis)
 
 
@@ -864,7 +864,7 @@ with tab_analyse:
             st.divider()
 
             if last.get("analysis"):
-                st.subheader("AI Analysis & Action Plan")
+                st.subheader("Performance Analysis Report")
                 st.markdown(last["analysis"])
 
             raw = last.get("raw_data", {})
