@@ -796,6 +796,119 @@ _PG_CHECKPOINT_STATS_V17 = """
     CROSS JOIN pg_stat_bgwriter bg
 """
 
+_PG_TABLE_SIZES = """
+    SELECT
+        schemaname,
+        relname,
+        pg_relation_size(relid) / 1048576 AS table_size_mb,
+        pg_total_relation_size(relid) / 1048576 AS total_size_mb,
+        (pg_total_relation_size(relid) - pg_relation_size(relid)) / 1048576
+            AS toast_index_size_mb,
+        n_live_tup,
+        n_dead_tup,
+        n_tup_ins, n_tup_upd, n_tup_del
+    FROM pg_stat_user_tables
+    ORDER BY pg_total_relation_size(relid) DESC
+    LIMIT 20
+"""
+
+_PG_WAL_STATS = """
+    SELECT
+        wal_records,
+        wal_fpi,
+        wal_bytes,
+        wal_buffers_full,
+        wal_write,
+        wal_sync,
+        ROUND(wal_write_time::numeric, 2) AS wal_write_time_ms,
+        ROUND(wal_sync_time::numeric, 2) AS wal_sync_time_ms,
+        stats_reset::text AS stats_reset
+    FROM pg_stat_wal
+"""
+
+_PG_IDLE_IN_TRANSACTION = """
+    SELECT
+        pid,
+        usename,
+        datname,
+        state,
+        LEFT(query, 300) AS query,
+        ROUND(EXTRACT(EPOCH FROM (now() - state_change))::numeric, 0)
+            AS idle_duration_sec,
+        ROUND(EXTRACT(EPOCH FROM (now() - xact_start))::numeric, 0)
+            AS xact_duration_sec
+    FROM pg_stat_activity
+    WHERE state = 'idle in transaction'
+    ORDER BY xact_start
+    LIMIT 20
+"""
+
+_PG_CONFIG_PARAMS = """
+    SELECT name, setting, unit
+    FROM pg_settings
+    WHERE name IN (
+        'shared_buffers', 'effective_cache_size', 'work_mem',
+        'maintenance_work_mem', 'max_connections', 'max_wal_size',
+        'min_wal_size', 'checkpoint_timeout', 'checkpoint_completion_target',
+        'random_page_cost', 'effective_io_concurrency',
+        'autovacuum_max_workers', 'autovacuum_vacuum_scale_factor',
+        'autovacuum_analyze_scale_factor', 'statement_timeout',
+        'idle_in_transaction_session_timeout', 'wal_level',
+        'max_worker_processes', 'max_parallel_workers',
+        'max_parallel_workers_per_gather', 'wal_compression',
+        'huge_pages', 'shared_preload_libraries'
+    )
+    ORDER BY name
+"""
+
+_PG_REPLICATION_STATUS = """
+    SELECT
+        client_addr::text,
+        state,
+        sent_lsn::text,
+        write_lsn::text,
+        flush_lsn::text,
+        replay_lsn::text,
+        ROUND(EXTRACT(EPOCH FROM write_lag)::numeric, 3) AS write_lag_sec,
+        ROUND(EXTRACT(EPOCH FROM flush_lag)::numeric, 3) AS flush_lag_sec,
+        ROUND(EXTRACT(EPOCH FROM replay_lag)::numeric, 3) AS replay_lag_sec
+    FROM pg_stat_replication
+"""
+
+_ORA_CONFIG_PARAMS = """
+    SELECT name, value, description
+    FROM v$parameter
+    WHERE name IN (
+        'sga_target', 'sga_max_size', 'pga_aggregate_target',
+        'db_cache_size', 'shared_pool_size', 'log_buffer',
+        'processes', 'sessions', 'open_cursors',
+        'cursor_sharing', 'optimizer_mode', 'db_file_multiblock_read_count',
+        'undo_retention', 'undo_tablespace',
+        'result_cache_max_size', 'parallel_max_servers',
+        'parallel_min_servers', 'job_queue_processes'
+    )
+    ORDER BY name
+"""
+
+_ORA_IDLE_SESSIONS = """
+    SELECT * FROM (
+        SELECT
+            sid,
+            serial#,
+            username,
+            status,
+            machine,
+            program,
+            ROUND(last_call_et / 60, 1) AS idle_minutes,
+            sql_id AS last_sql_id
+        FROM v$session
+        WHERE status = 'INACTIVE'
+          AND type = 'USER'
+          AND last_call_et > 300
+        ORDER BY last_call_et DESC
+    ) WHERE ROWNUM <= 20
+"""
+
 # ---------------------------------------------------------------------------
 # Programmatic analysis — Python code does the heavy lifting, not the LLM.
 # ---------------------------------------------------------------------------
@@ -827,32 +940,60 @@ def _truncate_sql(sql_text: str, length: int = 200) -> str:
     return sql_text
 
 
-def _build_findings_report(data: dict[str, Any]) -> str:
-    """Analyse collected data programmatically and build a markdown report.
+def _fmt_bytes(b: float) -> str:
+    """Format bytes into human-readable size."""
+    if b >= 1073741824:
+        return f"{b / 1073741824:.1f} GB"
+    if b >= 1048576:
+        return f"{b / 1048576:.1f} MB"
+    if b >= 1024:
+        return f"{b / 1024:.1f} KB"
+    return f"{b:.0f} B"
 
-    This function does the actual analysis in Python code — identifying
-    problematic SQL, full table scans, missing indexes, etc. from the
-    real data. No LLM is involved in finding issues.
+
+def _fmt_secs(s: float) -> str:
+    """Format seconds into human-readable duration."""
+    if s >= 86400:
+        return f"{s / 86400:.1f} days"
+    if s >= 3600:
+        return f"{s / 3600:.1f} hrs"
+    if s >= 60:
+        return f"{s / 60:.1f} min"
+    return f"{s:.2f} sec"
+
+
+def _build_findings_report(data: dict[str, Any]) -> str:
+    """Production-grade performance analysis report.
+
+    Analyses collected data programmatically — identifies bottlenecks,
+    groups by severity, references specific SQL IDs / table names / metrics.
+    No LLM is involved. Output format inspired by enterprise DBA assessments.
     """
     db_type = data.get("db_type", "unknown")
     is_oracle = db_type == DB_TYPE_ORACLE
-    parts: list[str] = []
-    action_items: list[str] = []
-    action_idx = 0
-
-    parts.append(f"# Performance Analysis Report ({db_type.upper()})")
-    parts.append("")
+    # Accumulate bottlenecks as (severity, title, details_markdown)
+    bottlenecks: list[tuple[int, str, str]] = []
+    # Accumulate prioritised actions as (priority, action_text)
+    actions: list[tuple[int, str]] = []
+    # Accumulate risks as (likelihood, impact, description)
+    risks: list[tuple[str, str, str]] = []
+    act_idx = 0
 
     # =====================================================================
-    # DATABASE-LEVEL OVERVIEW
+    # PHASE 1 — Extract key metrics
     # =====================================================================
 
-    # --- Database Stats (PostgreSQL) ------------------------------------------
+    # --- PostgreSQL database stats ---
+    cache_hit = 100.0
+    commits = rollbacks = 0
+    backends = 0
+    temp_bytes = temp_files = 0
+    blks_read = blks_hit = 0
     if not is_oracle:
         db_rows = _get_rows(data, "database_stats")
         if db_rows:
             row = db_rows[0]
-            cache_hit = _safe_float(row.get("cache_hit_pct", 0))
+            cache_hit = _safe_float(row.get("cache_hit_pct", 100))
             commits = _safe_int(row.get("xact_commit", 0))
             rollbacks = _safe_int(row.get("xact_rollback", 0))
             backends = _safe_int(row.get("numbackends", 0))
@@ -860,853 +1001,1138 @@ def _build_findings_report(data: dict[str, Any]) -> str:
             blks_hit = _safe_int(row.get("blks_hit", 0))
             temp_bytes = _safe_int(row.get("temp_bytes", 0))
             temp_files = _safe_int(row.get("temp_files", 0))
-            parts.append("## Database Overview")
-            parts.append(
-                f"- **Cache hit ratio:** {cache_hit:.2f}%\n"
-                f"- **Active backends:** {backends}\n"
-                f"- **Transactions:** {commits:,} commits, {rollbacks:,} rollbacks\n"
-                f"- **Blocks:** {blks_hit:,} hit, {blks_read:,} read from disk\n"
-                f"- **Temp usage:** {temp_files:,} files, "
-                f"{temp_bytes / 1048576:.1f} MB"
-            )
-            if cache_hit < 95 and blks_read > 0:
-                action_idx += 1
-                action_items.append(
-                    f"{action_idx}. **[CACHE]** Cache hit ratio is {cache_hit:.2f}% "
-                    f"(target > 99%). Increase `shared_buffers`."
-                )
-            if rollbacks > 0 and commits > 0:
-                rb_pct = rollbacks / (commits + rollbacks) * 100
-                if rb_pct > 5:
-                    action_idx += 1
-                    action_items.append(
-                        f"{action_idx}. **[ROLLBACKS]** {rb_pct:.1f}% rollback rate "
-                        f"({rollbacks:,}/{commits + rollbacks:,}). "
-                        f"Investigate application error handling."
-                    )
-            parts.append("")
 
-    # --- Connection Stats (PostgreSQL) ----------------------------------------
-    if not is_oracle:
-        conn_rows = _get_rows(data, "connection_stats")
-        if conn_rows:
-            parts.append("## Connection Stats")
-            for row in conn_rows:
-                state = row.get("state", "unknown") or "null"
-                count = _safe_int(row.get("count", 0))
-                wtype = row.get("wait_event_type", "None")
-                parts.append(f"- **{state}**: {count} connections (wait: {wtype})")
-            idle_count = sum(
-                _safe_int(r.get("count", 0))
-                for r in conn_rows
-                if (r.get("state") or "").startswith("idle")
-            )
-            if idle_count > 50:
-                action_idx += 1
-                action_items.append(
-                    f"{action_idx}. **[CONNECTIONS]** {idle_count} idle connections. "
-                    f"Use connection pooling (PgBouncer)."
-                )
-            parts.append("")
-
-    # --- Oracle System Stats --------------------------------------------------
+    # --- Oracle system stats ---
+    ora_cache_hit = 100.0
+    ora_hard_parse_pct = 0.0
+    ora_disk_sort_pct = 0.0
+    ora_rb_count = 0
+    ora_commit_count = 0
     if is_oracle:
         sys_rows = _get_rows(data, "system_stats") or _get_rows(
             data, "awr_system_stats"
         )
-        if sys_rows:
-            parts.append("## System Statistics")
-            stats_map: dict[str, int] = {}
-            for row in sys_rows:
-                name = str(row.get("name", ""))
-                val = _safe_int(row.get("value", 0))
-                stats_map[name] = val
-                parts.append(f"- **{name}:** {val:,}")
-            # Cache hit ratio
-            db_gets = stats_map.get("db block gets", 0)
-            consistent = stats_map.get("consistent gets", 0)
-            phys_reads = stats_map.get("physical reads", 0)
-            logical = db_gets + consistent
-            if logical > 0:
-                hit_pct = (1 - phys_reads / logical) * 100
-                parts.append(f"\n**Buffer cache hit ratio: {hit_pct:.2f}%**")
-                if hit_pct < 95:
-                    action_idx += 1
-                    action_items.append(
-                        f"{action_idx}. **[CACHE]** Buffer cache hit ratio is "
-                        f"{hit_pct:.2f}% (target > 99%). "
-                        f"Increase `db_cache_size`."
-                    )
-            hard_parse = stats_map.get("parse count (hard)", 0)
-            total_parse = stats_map.get("parse count (total)", 0)
-            if total_parse > 0:
-                hard_pct = hard_parse / total_parse * 100
-                if hard_pct > 30:
-                    action_idx += 1
-                    action_items.append(
-                        f"{action_idx}. **[PARSING]** Hard parse ratio is "
-                        f"{hard_pct:.1f}%. Use bind variables."
-                    )
-            sorts_disk = stats_map.get("sorts (disk)", 0)
-            sorts_mem = stats_map.get("sorts (memory)", 0)
-            if sorts_disk > 0 and sorts_mem > 0:
-                disk_pct = sorts_disk / (sorts_mem + sorts_disk) * 100
-                if disk_pct > 5:
-                    action_idx += 1
-                    action_items.append(
-                        f"{action_idx}. **[SORTS]** {disk_pct:.1f}% sorts on disk "
-                        f"({sorts_disk:,}/{sorts_mem + sorts_disk:,}). "
-                        f"Increase `sort_area_size` / `PGA_AGGREGATE_TARGET`."
-                    )
-            parts.append("")
+        stats_map: dict[str, int] = {}
+        for row in sys_rows:
+            stats_map[str(row.get("name", ""))] = _safe_int(row.get("value", 0))
+        db_gets = stats_map.get("db block gets", 0)
+        consistent = stats_map.get("consistent gets", 0)
+        phys_reads = stats_map.get("physical reads", 0)
+        logical = db_gets + consistent
+        if logical > 0:
+            ora_cache_hit = (1 - phys_reads / logical) * 100
+        hard_parse = stats_map.get("parse count (hard)", 0)
+        total_parse = stats_map.get("parse count (total)", 0)
+        if total_parse > 0:
+            ora_hard_parse_pct = hard_parse / total_parse * 100
+        sorts_disk = stats_map.get("sorts (disk)", 0)
+        sorts_mem = stats_map.get("sorts (memory)", 0)
+        if sorts_mem + sorts_disk > 0:
+            ora_disk_sort_pct = sorts_disk / (sorts_mem + sorts_disk) * 100
+        ora_rb_count = stats_map.get("user rollbacks", 0)
+        ora_commit_count = stats_map.get("user commits", 0)
 
-    # --- Oracle SGA Info ------------------------------------------------------
-    if is_oracle:
-        sga_rows = _get_rows(data, "sga_info")
-        if sga_rows:
-            parts.append("## SGA Configuration")
-            for row in sga_rows:
-                name = row.get("name", "?")
-                size_mb = _safe_float(row.get("size_mb", 0))
-                parts.append(f"- **{name}:** {size_mb:.0f} MB")
-            parts.append("")
+    # --- WAL stats (PostgreSQL 14+) ---
+    wal_bytes = 0
+    wal_fpi = 0
+    wal_sync_time_ms = 0.0
+    wal_write_time_ms = 0.0
+    if not is_oracle:
+        wal_rows = _get_rows(data, "wal_stats")
+        if wal_rows:
+            w = wal_rows[0]
+            wal_bytes = _safe_int(w.get("wal_bytes", 0))
+            wal_fpi = _safe_int(w.get("wal_fpi", 0))
+            wal_sync_time_ms = _safe_float(w.get("wal_sync_time_ms", 0))
+            wal_write_time_ms = _safe_float(w.get("wal_write_time_ms", 0))
 
-    # --- Oracle Tablespace I/O ------------------------------------------------
-    if is_oracle:
-        ts_rows = _get_rows(data, "tablespace_io")
-        if ts_rows:
-            parts.append("## Tablespace I/O")
-            for row in ts_rows:
-                ts_name = row.get("tablespace_name", "?")
-                reads = _safe_int(row.get("physical_reads", 0))
-                writes = _safe_int(row.get("physical_writes", 0))
-                read_sec = _safe_float(row.get("read_time_sec", 0))
-                write_sec = _safe_float(row.get("write_time_sec", 0))
-                parts.append(
-                    f"- **`{ts_name}`** — reads: {reads:,} ({read_sec:.2f}s), "
-                    f"writes: {writes:,} ({write_sec:.2f}s)"
-                )
-                if read_sec > 10:
-                    action_idx += 1
-                    action_items.append(
-                        f"{action_idx}. **[I/O]** Tablespace `{ts_name}` has "
-                        f"{read_sec:.2f}s read time. Move to faster storage or "
-                        f"redistribute I/O."
-                    )
-            parts.append("")
+    # --- Connection counts ---
+    idle_in_tx_rows = _get_rows(data, "idle_in_transaction") if not is_oracle else []
+    idle_session_rows = _get_rows(data, "idle_sessions") if is_oracle else []
+    conn_rows = _get_rows(data, "connection_stats") if not is_oracle else []
+    idle_count = sum(
+        _safe_int(r.get("count", 0))
+        for r in conn_rows
+        if (r.get("state") or "").startswith("idle")
+    )
 
-    # --- Oracle Redo Log Switches ---------------------------------------------
-    if is_oracle:
-        redo_rows = _get_rows(data, "redo_log_switches")
-        if redo_rows:
-            parts.append("## Redo Log Switches (Last 24h)")
-            for row in redo_rows:
-                hour = row.get("switch_hour", "?")
-                switches = _safe_int(row.get("switches", 0))
-                parts.append(f"- **{hour}:** {switches} switches")
-                if switches > 10:
-                    action_idx += 1
-                    action_items.append(
-                        f"{action_idx}. **[REDO]** {switches} log switches in hour "
-                        f"{hour}. Increase redo log file size."
-                    )
-            parts.append("")
-
-    # --- Oracle Temp Usage ----------------------------------------------------
-    if is_oracle:
-        temp_rows = _get_rows(data, "temp_usage")
-        if temp_rows:
-            parts.append("## Temp Tablespace Usage")
-            for row in temp_rows:
-                ts_name = row.get("tablespace_name", "?")
-                used_mb = _safe_float(row.get("used_mb", 0))
-                free_mb = _safe_float(row.get("free_mb", 0))
-                pct = _safe_float(row.get("pct_used", 0))
-                parts.append(
-                    f"- **`{ts_name}`** — {used_mb:.0f} MB used, "
-                    f"{free_mb:.0f} MB free ({pct:.1f}% used)"
-                )
-                if pct > 80:
-                    action_idx += 1
-                    action_items.append(
-                        f"{action_idx}. **[TEMP]** `{ts_name}` is {pct:.1f}% full. "
-                        f"Add temp datafile or resize."
-                    )
-            parts.append("")
-
-    # =====================================================================
-    # TOP SQL BY RESOURCE CONSUMPTION
-    # =====================================================================
-
-    # --- Top CPU SQL (always show — this is the most important section) -------
-    cpu_key = "top_cpu_sql" if is_oracle else "top_cpu_queries"
-    cpu_rows = _get_rows(data, cpu_key)
-    # Also check AWR top SQL / pgProfile top SQL as alternatives
-    if not cpu_rows:
-        cpu_rows = _get_rows(data, "awr_top_sql")
-    if not cpu_rows:
-        cpu_rows = _get_rows(data, "pgprofile_top_sql")
-    if cpu_rows:
-        parts.append("## Top SQL by CPU / Elapsed Time")
-        parts.append("")
-        for i, row in enumerate(cpu_rows[:15]):
-            sid = row.get("sql_id") or row.get("queryid") or "?"
-            id_label = "sql_id" if is_oracle else "queryid"
-            if is_oracle:
-                cpu_sec = _safe_float(row.get("cpu_sec", 0))
-                elapsed_sec = _safe_float(row.get("elapsed_sec", 0))
-                execs = _safe_int(row.get("executions", 0))
-                gets = _safe_int(row.get("buffer_gets", 0))
-                gets_per = _safe_int(row.get("gets_per_exec", 0))
-                sql_text = str(row.get("sql_text") or "")
-                parts.append(
-                    f"**{i + 1}. {id_label}: `{sid}`** — "
-                    f"CPU: {cpu_sec:.2f}s, elapsed: {elapsed_sec:.2f}s, "
-                    f"{execs:,} executions, buffer gets: {gets:,} "
-                    f"({gets_per:,}/exec)"
-                )
-            else:
-                total_sec = _safe_float(
-                    row.get("total_exec_sec") or row.get("total_exec_time", 0)
-                )
-                mean_sec = _safe_float(
-                    row.get("mean_exec_sec") or row.get("mean_exec_time", 0)
-                )
-                calls = _safe_int(row.get("calls", 0))
-                cache_hit = _safe_float(row.get("cache_hit_pct", 100))
-                blk_read = _safe_int(row.get("shared_blks_read", 0))
-                blk_hit = _safe_int(row.get("shared_blks_hit", 0))
-                parts.append(
-                    f"**{i + 1}. {id_label}: `{sid}`** — "
-                    f"total: {total_sec:.2f}s, avg: {mean_sec:.4f}s/call, "
-                    f"{calls:,} calls, cache hit: {cache_hit:.1f}%, "
-                    f"blks read: {blk_read:,}, blks hit: {blk_hit:,}"
-                )
-            sql_text = str(row.get("sql_text") or row.get("query_text") or "")
-            if sql_text:
-                parts.append(f"```sql\n{_truncate_sql(sql_text, 400)}\n```")
-            # Generate action items for top offenders
-            if i < 5:
-                if is_oracle:
-                    if gets_per > 10000:
-                        action_idx += 1
-                        action_items.append(
-                            f"{action_idx}. **[TOP CPU]** `{sid}` — "
-                            f"{gets_per:,} buffer gets/exec. "
-                            f"Review execution plan: "
-                            f"`SELECT * FROM TABLE(DBMS_XPLAN.DISPLAY_CURSOR"
-                            f"('{sid}'));`"
-                        )
-                else:
-                    if cache_hit < 90 and blk_read > 1000:
-                        action_idx += 1
-                        action_items.append(
-                            f"{action_idx}. **[LOW CACHE HIT]** queryid `{sid}` — "
-                            f"cache hit {cache_hit:.1f}%, {blk_read:,} blocks read. "
-                            f"Add indexes or increase `shared_buffers`."
-                        )
-                    if mean_sec > 1.0:
-                        action_idx += 1
-                        action_items.append(
-                            f"{action_idx}. **[SLOW QUERY]** queryid `{sid}` — "
-                            f"avg {mean_sec:.4f}s/call. Run "
-                            f"`EXPLAIN (ANALYZE, BUFFERS) <query>` to investigate."
-                        )
-        parts.append("")
-
-    # --- Top Queries by Total Elapsed (fallback if different from CPU) --------
-    elapsed_key = "top_elapsed_sql" if is_oracle else "top_queries"
-    elapsed_rows = _get_rows(data, elapsed_key)
-    # Only show if we have data AND it's different from cpu_rows
-    if elapsed_rows and elapsed_key != cpu_key:
-        # Check if these are substantially different from the CPU rows
-        cpu_ids = (
-            {str(r.get("sql_id") or r.get("queryid") or "") for r in cpu_rows[:10]}
-            if cpu_rows
-            else set()
+    # --- Top SQL ---
+    top_cpu = (
+        _get_rows(data, "top_cpu_sql")
+        if is_oracle
+        else _get_rows(data, "top_cpu_queries")
+    )
+    top_elapsed = (
+        _get_rows(data, "top_elapsed_sql")
+        if is_oracle
+        else _get_rows(data, "top_queries")
+    )
+    # Fallback to AWR / pgProfile
+    if not top_cpu and not top_elapsed:
+        top_elapsed = _get_rows(data, "awr_top_sql") or _get_rows(
+            data, "pgprofile_top_sql"
         )
-        new_rows = [
-            r
-            for r in elapsed_rows
-            if str(r.get("sql_id") or r.get("queryid") or "") not in cpu_ids
-        ]
-        if new_rows:
-            parts.append("## Additional Top SQL by Total Elapsed Time")
-            parts.append("*(Not already listed in Top CPU section)*\n")
-            for i, row in enumerate(new_rows[:10]):
-                sid = row.get("sql_id") or row.get("queryid") or "?"
-                id_label = "sql_id" if is_oracle else "queryid"
-                if is_oracle:
-                    elapsed_sec = _safe_float(row.get("elapsed_sec", 0))
-                    execs = _safe_int(row.get("executions", 0))
-                    gets = _safe_int(row.get("buffer_gets", 0))
-                    sql_text = str(row.get("sql_text") or "")
-                    parts.append(
-                        f"**{i + 1}. {id_label}: `{sid}`** — "
-                        f"elapsed: {elapsed_sec:.2f}s, {execs:,} execs, "
-                        f"buffer gets: {gets:,}"
-                    )
-                else:
-                    total_sec = _safe_float(row.get("total_exec_sec", 0))
-                    mean_sec = _safe_float(row.get("mean_exec_sec", 0))
-                    calls = _safe_int(row.get("calls", 0))
-                    cache_hit = _safe_float(row.get("cache_hit_pct", 100))
-                    parts.append(
-                        f"**{i + 1}. {id_label}: `{sid}`** — "
-                        f"total: {total_sec:.2f}s, avg: {mean_sec:.4f}s/call, "
-                        f"{calls:,} calls, cache hit: {cache_hit:.1f}%"
-                    )
-                sql_text = str(row.get("sql_text") or row.get("query_text") or "")
-                if sql_text:
-                    parts.append(f"```sql\n{_truncate_sql(sql_text, 400)}\n```")
-            parts.append("")
-
-    # =====================================================================
-    # THRESHOLD-BASED FINDINGS
-    # =====================================================================
-
-    # --- High Elapsed Time SQL ------------------------------------------------
-    section_key = "high_elapsed_per_exec"
-    rows = _get_rows(data, section_key)
-    parts.append("## High Elapsed Time per Execution (> 1s avg)")
-    if not rows:
-        parts.append("No queries exceed the 1s/exec threshold.\n")
-    else:
-        parts.append("")
-        for row in rows:
-            sid = row.get("sql_id") or row.get("queryid") or "?"
-            avg_elapsed = _safe_float(row.get("avg_elapsed_sec", 0))
-            total_elapsed = _safe_float(
-                row.get("total_elapsed_sec") or row.get("total_exec_sec", 0)
-            )
-            execs = _safe_int(row.get("executions") or row.get("calls", 0))
-            sql_text = str(row.get("sql_text") or row.get("query_text") or "")
-            gets = _safe_int(row.get("buffer_gets") or row.get("shared_blks_read", 0))
-            id_label = "sql_id" if is_oracle else "queryid"
-            parts.append(
-                f"**{id_label}: `{sid}`** — "
-                f"avg {avg_elapsed:.4f}s/exec, {execs:,} executions, "
-                f"total {total_elapsed:.2f}s, buffer gets/reads: {gets:,}"
-            )
-            if sql_text:
-                parts.append(f"```sql\n{_truncate_sql(sql_text, 400)}\n```")
-            action_idx += 1
-            if is_oracle:
-                action_items.append(
-                    f"{action_idx}. **[HIGH ELAPSED]** `{sid}` "
-                    f"(avg {avg_elapsed:.4f}s/exec). Check plan: "
-                    f"`SELECT * FROM TABLE(DBMS_XPLAN.DISPLAY_CURSOR"
-                    f"('{sid}'));` — add indexes on WHERE/JOIN columns."
-                )
-            else:
-                action_items.append(
-                    f"{action_idx}. **[HIGH ELAPSED]** queryid `{sid}` "
-                    f"(avg {avg_elapsed:.4f}s/exec). Run "
-                    f"`EXPLAIN (ANALYZE, BUFFERS)` on this query and "
-                    f"add indexes on filtered columns."
-                )
-        parts.append("")
-
-    # --- High Execution Count SQL ---------------------------------------------
-    section_key = "high_execution_count"
-    rows = _get_rows(data, section_key)
-    parts.append("## High Execution Count SQL (> 1000 calls)")
-    if not rows:
-        parts.append("No queries exceed the 1000 execution threshold.\n")
-    else:
-        parts.append("")
-        for row in rows:
-            sid = row.get("sql_id") or row.get("queryid") or "?"
-            execs = _safe_int(row.get("executions") or row.get("calls", 0))
-            total_elapsed = _safe_float(
-                row.get("total_elapsed_sec") or row.get("total_exec_sec", 0)
-            )
-            sql_text = str(row.get("sql_text") or row.get("query_text") or "")
-            id_label = "sql_id" if is_oracle else "queryid"
-            parts.append(
-                f"**{id_label}: `{sid}`** — "
-                f"{execs:,} executions, total {total_elapsed:.2f}s"
-            )
-            if sql_text:
-                parts.append(f"```sql\n{_truncate_sql(sql_text, 400)}\n```")
-            if execs > 100000:
-                action_idx += 1
-                action_items.append(
-                    f"{action_idx}. **[HIGH EXEC COUNT]** `{sid}` executed "
-                    f"{execs:,} times. Consider caching results, batching, "
-                    f"or reducing call frequency."
-                )
-        parts.append("")
-
-    # --- Full Table Scans -----------------------------------------------------
-    fts_key = "full_table_scans" if is_oracle else "seq_scan_tables"
-    rows = _get_rows(data, fts_key)
-    parts.append("## Full Table Scans / Sequential Scans")
-    if not rows:
-        parts.append("No issues found.\n")
-    else:
-        parts.append("")
-        for row in rows:
-            if is_oracle:
-                table = row.get("table_name", "?")
-                owner = row.get("object_owner", "")
-                sid = row.get("sql_id", "?")
-                execs = _safe_int(row.get("executions", 0))
-                elapsed = _safe_float(row.get("elapsed_sec", 0))
-                gets = _safe_int(row.get("buffer_gets", 0))
-                sql_text = str(row.get("sql_text") or "")
-                parts.append(
-                    f"**Table: `{owner}.{table}`** — sql_id: `{sid}`, "
-                    f"{execs:,} execs, {elapsed:.2f}s elapsed, "
-                    f"{gets:,} buffer gets"
-                )
-                if sql_text:
-                    parts.append(f"```sql\n{_truncate_sql(sql_text, 400)}\n```")
-                action_idx += 1
-                action_items.append(
-                    f"{action_idx}. **[FULL TABLE SCAN]** `{owner}.{table}` "
-                    f"via sql_id `{sid}`. Add index on columns in WHERE clause "
-                    f"or use hints to force index access."
-                )
-            else:
-                table = row.get("relname", "?")
-                schema = row.get("schemaname", "public")
-                seq_scans = _safe_int(row.get("seq_scan", 0))
-                seq_tup_read = _safe_int(row.get("seq_tup_read", 0))
-                idx_scans = _safe_int(row.get("idx_scan", 0))
-                live_tup = _safe_int(row.get("n_live_tup", 0))
-                size_mb = _safe_float(row.get("table_size_mb", 0))
-                avg_rows = _safe_int(row.get("avg_rows_per_seq_scan", 0))
-                parts.append(
-                    f"**Table: `{schema}.{table}`** — "
-                    f"{seq_scans:,} seq scans ({avg_rows:,} rows/scan avg, "
-                    f"{seq_tup_read:,} rows read), "
-                    f"{idx_scans:,} idx scans, {live_tup:,} live rows, "
-                    f"{size_mb:.1f} MB"
-                )
-                if seq_scans > 100 and live_tup > 10000:
-                    action_idx += 1
-                    action_items.append(
-                        f"{action_idx}. **[SEQ SCAN]** `{schema}.{table}` has "
-                        f"{seq_scans:,} seq scans on {live_tup:,} rows "
-                        f"({size_mb:.1f} MB). Add indexes on frequently "
-                        f"filtered columns: "
-                        f"`CREATE INDEX ON {schema}.{table} (column_name);`"
-                    )
-        parts.append("")
-
-    # --- Execution Plans (Oracle) ---------------------------------------------
-    if is_oracle:
-        plans = data.get("execution_plans", [])
-        if isinstance(plans, list) and plans:
-            parts.append("## Execution Plans (Top SQL)")
-            parts.append("")
-            for plan in plans[:5]:
-                sid = plan.get("sql_id", "?")
-                steps = plan.get("steps", [])
-                parts.append(f"### Plan for sql_id: `{sid}`")
-                has_full_scan = False
-                has_hash_join = False
-                for step in steps[:20]:
-                    op = str(step.get("operation", ""))
-                    obj = step.get("object_name", "")
-                    cost = step.get("cost", "")
-                    est = step.get("est_rows", "")
-                    line = f"- {op}"
-                    if obj:
-                        line += f" on `{obj}`"
-                    if cost:
-                        line += f" (cost={cost}, rows={est})"
-                    parts.append(line)
-                    if "FULL" in op.upper():
-                        has_full_scan = True
-                    if "HASH JOIN" in op.upper():
-                        has_hash_join = True
-                if has_full_scan:
-                    action_idx += 1
-                    action_items.append(
-                        f"{action_idx}. **[PLAN]** sql_id `{sid}` has TABLE ACCESS "
-                        f"FULL in plan. Add appropriate index."
-                    )
-                if has_hash_join:
-                    action_idx += 1
-                    action_items.append(
-                        f"{action_idx}. **[PLAN]** sql_id `{sid}` uses HASH JOIN. "
-                        f"Ensure join columns are indexed for NESTED LOOPS "
-                        f"if table is small."
-                    )
-                parts.append("")
-
-    # --- Oracle Parallel Queries ----------------------------------------------
-    if is_oracle:
-        px_rows = _get_rows(data, "parallel_queries")
-        if px_rows:
-            parts.append("## Parallel Queries")
-            for row in px_rows:
-                sid = row.get("sql_id", "?")
-                px = _safe_int(row.get("px_servers", 0))
-                elapsed = _safe_float(row.get("elapsed_sec", 0))
-                sql_text = str(row.get("sql_text") or "")
-                parts.append(
-                    f"- **sql_id: `{sid}`** — {px:,} PX servers, {elapsed:.2f}s elapsed"
-                )
-                if sql_text:
-                    parts.append(f"```sql\n{_truncate_sql(sql_text, 300)}\n```")
-            parts.append("")
-
-    # --- Row Contention & Locking ---------------------------------------------
-    contention_key = "row_contention" if is_oracle else "lock_waits"
-    rows = _get_rows(data, contention_key)
-    parts.append("## Row Contention & Locking")
-    if not rows:
-        parts.append("No active contention detected.\n")
-    else:
-        parts.append("")
-        for row in rows:
-            if is_oracle:
-                event = row.get("event", "?")
-                waits = _safe_int(row.get("total_waits", 0))
-                waited_sec = _safe_float(row.get("time_waited_sec", 0))
-                avg_wait = _safe_float(row.get("avg_wait_sec", 0))
-                parts.append(
-                    f"**Event: `{event}`** — {waits:,} waits, "
-                    f"{waited_sec:.2f}s total, avg {avg_wait:.4f}s/wait"
-                )
-                if waited_sec > 1:
-                    action_idx += 1
-                    action_items.append(
-                        f"{action_idx}. **[CONTENTION]** `{event}` — "
-                        f"{waited_sec:.2f}s total. Reduce hot-row updates, "
-                        f"increase INITRANS, or tune locking strategy."
-                    )
-            else:
-                pid = row.get("pid", "?")
-                user = row.get("usename", "?")
-                event = row.get("wait_event", "?")
-                event_type = row.get("wait_event_type", "")
-                running_sec = _safe_float(row.get("running_sec", 0))
-                state = row.get("state", "")
-                query = str(row.get("query") or "")
-                parts.append(
-                    f"**PID {pid}** (user: {user}, state: {state}) — "
-                    f"wait: {event_type}/{event}, running {running_sec:.2f}s"
-                )
-                if query:
-                    parts.append(f"```sql\n{_truncate_sql(query, 300)}\n```")
-                if running_sec > 60:
-                    action_idx += 1
-                    action_items.append(
-                        f"{action_idx}. **[LONG WAIT]** PID {pid} waiting on "
-                        f"{event_type}/{event} for {running_sec:.0f}s. "
-                        f"Consider `SELECT pg_cancel_backend({pid});`"
-                    )
-        parts.append("")
-
-    # --- Wait Events (Oracle / AWR) -------------------------------------------
-    if is_oracle:
-        wait_rows = _get_rows(data, "wait_events") or _get_rows(data, "awr_wait_events")
-        if wait_rows:
-            parts.append("## Top Wait Events")
-            parts.append("")
-            for row in wait_rows[:15]:
-                event = row.get("event", "?")
-                waits = _safe_int(row.get("total_waits", 0))
-                waited = _safe_float(row.get("time_waited_sec", 0))
-                avg_w = _safe_float(row.get("avg_wait_sec", 0))
-                line = f"- **`{event}`** — {waits:,} waits, {waited:.2f}s total"
-                if avg_w > 0:
-                    line += f", avg {avg_w:.4f}s"
-                parts.append(line)
-                if waited > 60:
-                    action_idx += 1
-                    action_items.append(
-                        f"{action_idx}. **[WAIT]** `{event}` — "
-                        f"{waited:.2f}s total wait time. "
-                        f"Investigate root cause (I/O, lock, latch)."
-                    )
-            parts.append("")
-
-    # --- pgProfile Wait Events ------------------------------------------------
-    if not is_oracle:
-        pgp_wait_rows = _get_rows(data, "pgprofile_wait_events")
-        if pgp_wait_rows:
-            parts.append("## Wait Events (pgProfile)")
-            for row in pgp_wait_rows[:15]:
-                etype = row.get("event_type", "?")
-                event = row.get("event", "?")
-                waits = _safe_int(row.get("total_waits", 0))
-                waited = _safe_float(row.get("total_waited_sec", 0))
-                parts.append(f"- **{etype}/{event}** — {waits:,} waits, {waited:.2f}s")
-            parts.append("")
-
-    # --- Sequence Caching Issues -----------------------------------------------
-    seq_key = "sequence_no_cache" if is_oracle else "sequence_cache_issues"
-    rows = _get_rows(data, seq_key)
-    parts.append("## Sequence Caching Issues")
-    if not rows:
-        parts.append("No issues found.\n")
-    else:
-        parts.append("")
-        for row in rows:
-            if is_oracle:
-                owner = row.get("sequence_owner", "")
-                name = row.get("sequence_name", "?")
-                cache = _safe_int(row.get("cache_size", 0))
-                parts.append(
-                    f"**`{owner}.{name}`** — cache_size={cache} (should be >= 20)"
-                )
-                action_idx += 1
-                action_items.append(
-                    f"{action_idx}. **[SEQUENCE]** "
-                    f"`ALTER SEQUENCE {owner}.{name} CACHE 20;`"
-                )
-            else:
-                schema = row.get("schemaname", "public")
-                name = row.get("sequencename", "?")
-                cache = _safe_int(row.get("cache_size") or 0)
-                parts.append(
-                    f"**`{schema}.{name}`** — cache_size={cache} (should be >= 20)"
-                )
-                action_idx += 1
-                action_items.append(
-                    f"{action_idx}. **[SEQUENCE]** "
-                    f"`ALTER SEQUENCE {schema}.{name} CACHE 20;`"
-                )
-        parts.append("")
-
-    # --- Stale Statistics / Vacuum / Bloat ------------------------------------
-    if is_oracle:
-        rows = _get_rows(data, "stale_statistics")
-    else:
-        rows = _get_rows(data, "stale_stats_vacuum") + _get_rows(data, "bloat_estimate")
-        seen_tables: set[str] = set()
-        deduped: list[dict[str, Any]] = []
-        for r in rows:
-            key = f"{r.get('schemaname', '')}.{r.get('relname', '')}"
-            if key not in seen_tables:
-                seen_tables.add(key)
-                deduped.append(r)
-        rows = deduped
-
-    parts.append("## Stale Statistics / Vacuum / Bloat")
-    if not rows:
-        parts.append("No issues found.\n")
-    else:
-        parts.append("")
-        for row in rows:
-            if is_oracle:
-                table = row.get("table_name", "?")
-                num_rows = _safe_int(row.get("num_rows", 0))
-                stale = row.get("stale_stats", "?")
-                last_analyzed = row.get("last_analyzed", "never")
-                days = _safe_float(row.get("days_since_analyzed", 0))
-                parts.append(
-                    f"**`{table}`** — {num_rows:,} rows, stale={stale}, "
-                    f"last analyzed: {last_analyzed} ({days:.0f} days ago)"
-                )
-                action_idx += 1
-                action_items.append(
-                    f"{action_idx}. **[STALE STATS]** "
-                    f"`EXEC DBMS_STATS.GATHER_TABLE_STATS"
-                    f"(ownname=>USER, tabname=>'{table}');`"
-                )
-            else:
-                schema = row.get("schemaname", "public")
-                table = row.get("relname", "?")
-                dead = _safe_int(row.get("n_dead_tup", 0))
-                live = _safe_int(row.get("n_live_tup", 0))
-                dead_pct = _safe_float(row.get("dead_pct", 0))
-                last_vac = (
-                    row.get("last_autovacuum") or row.get("last_vacuum") or "never"
-                )
-                last_analyze = (
-                    row.get("last_autoanalyze") or row.get("last_analyze") or "never"
-                )
-                parts.append(
-                    f"**`{schema}.{table}`** — {live:,} live, {dead:,} dead "
-                    f"({dead_pct:.1f}% bloat), last vacuum: {last_vac}, "
-                    f"last analyze: {last_analyze}"
-                )
-                if dead_pct > 20 or dead > 50000:
-                    action_idx += 1
-                    action_items.append(
-                        f"{action_idx}. **[BLOAT]** "
-                        f"`VACUUM ANALYZE {schema}.{table};` "
-                        f"— {dead_pct:.1f}% dead tuples"
-                    )
-                elif str(last_analyze) in ("never", "None"):
-                    action_idx += 1
-                    action_items.append(
-                        f"{action_idx}. **[STALE STATS]** "
-                        f"`ANALYZE {schema}.{table};` — never analyzed"
-                    )
-        parts.append("")
-
-    # --- Unused Indexes -------------------------------------------------------
-    rows = _get_rows(data, "unused_indexes")
-    if rows:
-        parts.append("## Unused Indexes")
-        parts.append("")
-        for row in rows:
-            schema = row.get("schemaname", "public")
-            table = row.get("relname", "?")
-            idx_name = row.get("indexrelname", "?")
-            size_mb = _safe_float(row.get("index_size_mb", 0))
-            parts.append(
-                f"**`{schema}.{idx_name}`** on `{table}` — {size_mb:.1f} MB, 0 scans"
-            )
-            if size_mb > 1:
-                action_idx += 1
-                action_items.append(
-                    f"{action_idx}. **[UNUSED INDEX]** "
-                    f"`DROP INDEX {schema}.{idx_name};` — "
-                    f"{size_mb:.1f} MB wasted"
-                )
-        parts.append("")
-
-    # --- Table Stats (PostgreSQL) — top tables by activity --------------------
-    if not is_oracle:
-        tbl_rows = _get_rows(data, "table_stats")
-        if tbl_rows:
-            parts.append("## Top Tables by Activity")
-            parts.append("")
-            for row in tbl_rows[:10]:
-                schema = row.get("schemaname", "public")
-                table = row.get("relname", "?")
-                seq_scan = _safe_int(row.get("seq_scan", 0))
-                idx_scan = _safe_int(row.get("idx_scan", 0))
-                inserts = _safe_int(row.get("n_tup_ins", 0))
-                updates = _safe_int(row.get("n_tup_upd", 0))
-                deletes = _safe_int(row.get("n_tup_del", 0))
-                live = _safe_int(row.get("n_live_tup", 0))
-                dead = _safe_int(row.get("n_dead_tup", 0))
-                parts.append(
-                    f"- **`{schema}.{table}`** — seq: {seq_scan:,}, "
-                    f"idx: {idx_scan:,}, ins/upd/del: "
-                    f"{inserts:,}/{updates:,}/{deletes:,}, "
-                    f"live: {live:,}, dead: {dead:,}"
-                )
-            parts.append("")
-
-    # --- Checkpoint / WAL Issues (PostgreSQL) ---------------------------------
-    if not is_oracle:
-        cp_rows = _get_rows(data, "checkpoint_stats")
-        parts.append("## Checkpoint / WAL Issues")
-        has_issue = False
-        if cp_rows:
-            row = cp_rows[0]
-            backend_pct = _safe_float(row.get("backend_write_pct", 0))
-            req = _safe_int(row.get("checkpoints_req", 0))
-            timed = _safe_int(row.get("checkpoints_timed", 0))
-            buf_cp = _safe_int(row.get("buffers_checkpoint", 0))
-            buf_clean = _safe_int(row.get("buffers_clean", 0))
-            buf_backend = _safe_int(row.get("buffers_backend", 0))
-            parts.append(
-                f"- Checkpoints: {timed:,} timed, {req:,} requested\n"
-                f"- Buffers: checkpoint={buf_cp:,}, clean={buf_clean:,}, "
-                f"backend={buf_backend:,}\n"
-                f"- Backend write %: {backend_pct:.1f}%"
-            )
-            if backend_pct > 10:
-                has_issue = True
-                action_idx += 1
-                action_items.append(
-                    f"{action_idx}. **[CHECKPOINT]** Backend writes are "
-                    f"{backend_pct:.1f}% of total — increase "
-                    f"`shared_buffers` and `checkpoint_completion_target`."
-                )
-            if req > timed and timed > 0:
-                has_issue = True
-                action_idx += 1
-                action_items.append(
-                    f"{action_idx}. **[CHECKPOINT]** More requested ({req:,}) "
-                    f"than timed ({timed:,}) checkpoints — increase "
-                    f"`max_wal_size`."
-                )
-        if not has_issue:
-            parts.append("No issues found.")
-        parts.append("")
-
-    # --- Temp File Usage (PostgreSQL) -----------------------------------------
-    if not is_oracle:
-        rows = _get_rows(data, "temp_file_usage")
-        if rows:
-            parts.append("## Temp File Usage")
-            parts.append("")
-            for row in rows[:10]:
-                sid = row.get("queryid", "?")
-                temp_mb = _safe_float(row.get("temp_mb", 0))
-                calls = _safe_int(row.get("calls", 0))
-                sql_text = str(row.get("query_text") or "")
-                parts.append(
-                    f"**queryid: `{sid}`** — {temp_mb:.1f} MB temp, {calls:,} calls"
-                )
-                if sql_text:
-                    parts.append(f"```sql\n{_truncate_sql(sql_text, 300)}\n```")
-                if temp_mb > 100:
-                    action_idx += 1
-                    action_items.append(
-                        f"{action_idx}. **[TEMP FILES]** queryid `{sid}` uses "
-                        f"{temp_mb:.1f} MB temp. Increase `work_mem` or "
-                        f"optimize sort/join."
-                    )
-            parts.append("")
-
-    # =====================================================================
-    # EXECUTIVE SUMMARY & ACTION PLAN
-    # =====================================================================
-    summary_parts: list[str] = []
     high_elapsed = _get_rows(data, "high_elapsed_per_exec")
     high_exec = _get_rows(data, "high_execution_count")
-    fts = _get_rows(data, "full_table_scans" if is_oracle else "seq_scan_tables")
-    contention = _get_rows(data, "row_contention" if is_oracle else "lock_waits")
-    seqs = _get_rows(
-        data, "sequence_no_cache" if is_oracle else "sequence_cache_issues"
-    )
-    top_sql = (
-        _get_rows(data, "top_cpu_sql" if is_oracle else "top_cpu_queries")
-        or _get_rows(data, "awr_top_sql")
-        or _get_rows(data, "pgprofile_top_sql")
+    fts = (
+        _get_rows(data, "full_table_scans")
+        if is_oracle
+        else _get_rows(data, "seq_scan_tables")
     )
 
-    if top_sql:
-        summary_parts.append(f"{len(top_sql)} top SQL statements analysed")
+    # --- Tables ---
+    table_sizes = _get_rows(data, "table_sizes") if not is_oracle else []
+    bloat_rows = _get_rows(data, "bloat_estimate") if not is_oracle else []
+    unused_idx = _get_rows(data, "unused_indexes")
+    stale_rows = (
+        _get_rows(data, "stale_stats_vacuum")
+        if not is_oracle
+        else _get_rows(data, "stale_statistics")
+    )
+
+    # --- Contention ---
+    contention = (
+        _get_rows(data, "row_contention")
+        if is_oracle
+        else _get_rows(data, "lock_waits")
+    )
+    wait_rows = (
+        _get_rows(data, "wait_events")
+        or _get_rows(data, "awr_wait_events")
+        or _get_rows(data, "pgprofile_wait_events")
+    )
+
+    # --- Sequences ---
+    seqs = (
+        _get_rows(data, "sequence_no_cache")
+        if is_oracle
+        else _get_rows(data, "sequence_cache_issues")
+    )
+
+    # --- Config ---
+    config_rows = _get_rows(data, "config_params")
+
+    # --- Checkpoint (PG) ---
+    ckpt_rows = _get_rows(data, "checkpoint_stats") if not is_oracle else []
+
+    # --- Replication (PG) ---
+    repl_rows = _get_rows(data, "replication_status") if not is_oracle else []
+
+    # --- Temp file usage (PG) ---
+    temp_sql_rows = _get_rows(data, "temp_file_usage") if not is_oracle else []
+
+    # =====================================================================
+    # PHASE 2 -- Identify bottlenecks with severity
+    # =====================================================================
+    # Severity 1 = critical, 2 = important, 3 = advisory
+
+    # -- Rollback explosion --
+    rb_rate = 0.0
+    if not is_oracle and commits + rollbacks > 0:
+        rb_rate = rollbacks / (commits + rollbacks) * 100
+    elif is_oracle and ora_commit_count + ora_rb_count > 0:
+        rb_rate = ora_rb_count / (ora_commit_count + ora_rb_count) * 100
+    if rb_rate > 10:
+        detail = (
+            f"**{rollbacks:,} rollbacks** vs {commits:,} commits "
+            f"(**{rb_rate:.1f}% rollback rate**)\n\n"
+            if not is_oracle
+            else f"**{ora_rb_count:,} rollbacks** vs {ora_commit_count:,} commits "
+            f"(**{rb_rate:.1f}% rollback rate**)\n\n"
+        )
+        detail += (
+            "This almost always means:\n"
+            "- Business validation aborts\n"
+            "- Exception-based flow control\n"
+            "- Retry loops without guardrails\n\n"
+            "Directly increases WAL, dead tuples, autovacuum load."
+        )
+        bottlenecks.append((1, "Rollback Explosion", detail))
+        act_idx += 1
+        actions.append(
+            (
+                0,
+                f"{act_idx}. **Root-cause rollbacks** -- identify "
+                f"why {rb_rate:.1f}% of transactions are aborted",
+            )
+        )
+        risks.append(("High", "Severe", "Dead tuple accumulation from rollbacks"))
+    elif rb_rate > 5:
+        total_rb = rollbacks if not is_oracle else ora_rb_count
+        bottlenecks.append(
+            (
+                2,
+                "Elevated Rollback Rate",
+                f"Rollback rate is **{rb_rate:.1f}%** "
+                f"({total_rb:,} rollbacks). Investigate application "
+                f"error handling.",
+            )
+        )
+        act_idx += 1
+        actions.append((1, f"{act_idx}. Investigate rollback sources"))
+
+    # -- Idle-in-transaction (PG) --
+    if idle_in_tx_rows:
+        total_idle_sec = sum(
+            _safe_float(r.get("xact_duration_sec", 0)) for r in idle_in_tx_rows
+        )
+        longest = max(
+            _safe_float(r.get("xact_duration_sec", 0)) for r in idle_in_tx_rows
+        )
+        detail = (
+            f"**{len(idle_in_tx_rows)} sessions** idle in transaction, "
+            f"cumulative **{_fmt_secs(total_idle_sec)}**, "
+            f"longest **{_fmt_secs(longest)}**\n\n"
+            "| PID | User | Duration | Query |\n"
+            "| --- | --- | --- | --- |\n"
+        )
+        for r in idle_in_tx_rows[:10]:
+            pid = r.get("pid", "?")
+            user = r.get("usename", "?")
+            dur = _fmt_secs(_safe_float(r.get("xact_duration_sec", 0)))
+            q = _truncate_sql(str(r.get("query", "")), 80)
+            detail += f"| {pid} | {user} | {dur} | `{q}` |\n"
+        detail += (
+            "\nImpact: prevents vacuum, creates dead tuples, "
+            "increases lock contention.\n"
+            "This is an **application defect**, not a DB tuning issue."
+        )
+        sev = 1 if total_idle_sec > 3600 else 2
+        bottlenecks.append((sev, "Idle-in-Transaction Sessions", detail))
+        act_idx += 1
+        actions.append(
+            (
+                0,
+                f"{act_idx}. **Fix idle-in-transaction at app layer** -- "
+                f"enforce connection/transaction guards, "
+                f"set `idle_in_transaction_session_timeout`",
+            )
+        )
+        risks.append(("High", "Severe", "Bloat & lock risk from idle-in-tx"))
+
+    # -- Idle Oracle sessions --
+    if idle_session_rows and len(idle_session_rows) > 5:
+        detail = (
+            f"**{len(idle_session_rows)} sessions** idle > 5 minutes\n\n"
+            "| SID | User | Idle (min) | Program |\n"
+            "| --- | --- | --- | --- |\n"
+        )
+        for r in idle_session_rows[:10]:
+            detail += (
+                f"| {r.get('sid', '?')} | {r.get('username', '?')} "
+                f"| {_safe_float(r.get('idle_minutes', 0)):.0f} "
+                f"| {r.get('program', '?')} |\n"
+            )
+        bottlenecks.append((2, "Excessive Idle Sessions", detail))
+        act_idx += 1
+        actions.append(
+            (
+                1,
+                f"{act_idx}. Review idle sessions -- consider "
+                f"connection pooling or session timeout",
+            )
+        )
+
+    # -- Cache hit ratio --
+    eff_cache_hit = cache_hit if not is_oracle else ora_cache_hit
+    if eff_cache_hit < 95:
+        detail = f"Buffer cache hit ratio: **{eff_cache_hit:.2f}%** (target > 99%)\n\n"
+        if not is_oracle:
+            detail += (
+                f"Blocks hit: {blks_hit:,}, blocks read from disk: {blks_read:,}\n\n"
+                f"**Fix:** Increase `shared_buffers` "
+                f"(current value shown in Configuration Review below)."
+            )
+        else:
+            detail += "**Fix:** Increase `db_cache_size`."
+        sev = 1 if eff_cache_hit < 90 else 2
+        bottlenecks.append((sev, "Low Buffer Cache Hit Ratio", detail))
+        act_idx += 1
+        param = "shared_buffers" if not is_oracle else "db_cache_size"
+        actions.append(
+            (
+                0,
+                f"{act_idx}. **Increase `{param}`** -- cache hit is {eff_cache_hit:.2f}%",
+            )
+        )
+        risks.append(("High", "High", "Excessive disk I/O from cache misses"))
+
+    # -- WAL pressure (PG) --
+    if wal_bytes > 0:
+        wal_gb = wal_bytes / 1073741824
+        detail = (
+            f"**{wal_gb:.1f} GB WAL** generated (since stats reset)\n"
+            f"- Full-page images (FPI): {wal_fpi:,}\n"
+            f"- WAL sync time: {wal_sync_time_ms / 1000:.1f} sec\n"
+            f"- WAL write time: {wal_write_time_ms / 1000:.1f} sec\n"
+        )
+        if wal_sync_time_ms > wal_write_time_ms * 5 and wal_sync_time_ms > 1000:
+            detail += (
+                "\nWAL sync time is **much higher** than write time "
+                "-- disk sync latency issue."
+            )
+            bottlenecks.append((1, "WAL & Write Pressure", detail))
+            risks.append(("Medium-High", "Severe", "WAL disk saturation"))
+        elif wal_gb > 10:
+            bottlenecks.append((2, "High WAL Volume", detail))
+        act_idx += 1
+        actions.append(
+            (
+                1,
+                f"{act_idx}. Review WAL generation -- "
+                f"batch commits, consider `wal_compression`",
+            )
+        )
+
+    # -- Hard parse ratio (Oracle) --
+    if is_oracle and ora_hard_parse_pct > 30:
+        bottlenecks.append(
+            (
+                2,
+                "High Hard Parse Ratio",
+                f"Hard parse ratio: **{ora_hard_parse_pct:.1f}%**\n\n"
+                f"**Fix:** Use bind variables instead of literal values.",
+            )
+        )
+        act_idx += 1
+        actions.append(
+            (
+                1,
+                f"{act_idx}. Use bind variables -- "
+                f"hard parse ratio is {ora_hard_parse_pct:.1f}%",
+            )
+        )
+
+    # -- Disk sorts (Oracle) --
+    if is_oracle and ora_disk_sort_pct > 5:
+        bottlenecks.append(
+            (
+                2,
+                "Disk Sorts",
+                f"**{ora_disk_sort_pct:.1f}%** of sorts go to disk.\n\n"
+                f"**Fix:** Increase `PGA_AGGREGATE_TARGET` or `SORT_AREA_SIZE`.",
+            )
+        )
+        act_idx += 1
+        actions.append(
+            (1, f"{act_idx}. Increase PGA -- {ora_disk_sort_pct:.1f}% disk sorts")
+        )
+
+    # -- Top SQL bottlenecks --
+    top_sql_all = top_cpu or top_elapsed
+    if top_sql_all:
+        total_elapsed = sum(
+            _safe_float(
+                r.get("elapsed_sec", 0)
+                or r.get("total_exec_sec", 0)
+                or r.get("cpu_sec", 0)
+            )
+            for r in top_sql_all
+        )
+        top1 = top_sql_all[0]
+        if is_oracle:
+            t1_id = top1.get("sql_id", "?")
+            t1_elapsed = _safe_float(
+                top1.get("elapsed_sec", 0) or top1.get("cpu_sec", 0)
+            )
+            t1_execs = _safe_int(top1.get("executions", 0))
+            t1_gets = _safe_int(top1.get("buffer_gets", 0))
+            t1_sql = str(top1.get("sql_text", ""))
+        else:
+            t1_id = str(top1.get("queryid", "?"))
+            t1_elapsed = _safe_float(top1.get("total_exec_sec", 0))
+            t1_execs = _safe_int(top1.get("calls", 0))
+            t1_gets = _safe_int(top1.get("shared_blks_hit", 0)) + _safe_int(
+                top1.get("shared_blks_read", 0)
+            )
+            t1_sql = str(top1.get("query_text", ""))
+
+        detail = (
+            f"Top query alone: **{_fmt_secs(t1_elapsed)}** elapsed, "
+            f"**{t1_execs:,}** executions, **{t1_gets:,}** buffer gets\n\n"
+        )
+        id_col = "sql_id" if is_oracle else "queryid"
+        detail += (
+            f"| # | {id_col} | Elapsed | Executions | Buffer Gets | Query |\n"
+            f"| --- | --- | --- | --- | --- | --- |\n"
+        )
+        for i, r in enumerate(top_sql_all[:10]):
+            if is_oracle:
+                sid = r.get("sql_id", "?")
+                elapsed = _safe_float(r.get("elapsed_sec", 0) or r.get("cpu_sec", 0))
+                execs = _safe_int(r.get("executions", 0))
+                gets = _safe_int(r.get("buffer_gets", 0))
+                sql = _truncate_sql(str(r.get("sql_text", "")), 60)
+            else:
+                sid = str(r.get("queryid", "?"))
+                elapsed = _safe_float(r.get("total_exec_sec", 0))
+                execs = _safe_int(r.get("calls", 0))
+                gets = _safe_int(r.get("shared_blks_hit", 0)) + _safe_int(
+                    r.get("shared_blks_read", 0)
+                )
+                sql = _truncate_sql(str(r.get("query_text", "")), 60)
+            detail += (
+                f"| {i + 1} | `{sid}` | {_fmt_secs(elapsed)} "
+                f"| {execs:,} | {gets:,} | `{sql}` |\n"
+            )
+
+        if t1_sql:
+            detail += (
+                f"\n**Top #1 full query text:**\n"
+                f"```sql\n{_truncate_sql(t1_sql, 500)}\n```\n"
+            )
+
+        if len(top_sql_all) >= 3:
+            top3_elapsed = sum(
+                _safe_float(
+                    r.get("elapsed_sec", 0)
+                    or r.get("total_exec_sec", 0)
+                    or r.get("cpu_sec", 0)
+                )
+                for r in top_sql_all[:3]
+            )
+            if total_elapsed > 0 and top3_elapsed / total_elapsed > 0.7:
+                pct = top3_elapsed / total_elapsed * 100
+                detail += f"\n**Top 3 queries = ~{pct:.0f}% of total execution time.**"
+
+        bottlenecks.append((1, "Query-Level Offenders (Top SQL)", detail))
+        act_idx += 1
+        actions.append(
+            (
+                0,
+                f"{act_idx}. **Review top SQL** -- "
+                f"{id_col} `{t1_id}` accounts for "
+                f"{_fmt_secs(t1_elapsed)} elapsed",
+            )
+        )
+
+    # -- High elapsed per execution --
     if high_elapsed:
-        summary_parts.append(
-            f"{len(high_elapsed)} queries with high elapsed time per execution"
+        detail = "Queries taking > 1 sec per execution:\n\n"
+        id_col = "sql_id" if is_oracle else "queryid"
+        detail += (
+            f"| {id_col} | Avg Elapsed | Total Elapsed | Execs | Query |\n"
+            f"| --- | --- | --- | --- | --- |\n"
         )
+        for r in high_elapsed[:10]:
+            if is_oracle:
+                sid = r.get("sql_id", "?")
+                avg_e = _safe_float(r.get("avg_elapsed_sec", 0))
+                tot_e = _safe_float(r.get("total_elapsed_sec", 0))
+                execs = _safe_int(r.get("executions", 0))
+                sql = _truncate_sql(str(r.get("sql_text", "")), 60)
+            else:
+                sid = str(r.get("queryid", "?"))
+                avg_e = _safe_float(r.get("avg_elapsed_sec", 0))
+                tot_e = _safe_float(r.get("total_exec_sec", 0))
+                execs = _safe_int(r.get("calls", 0))
+                sql = _truncate_sql(str(r.get("query_text", "")), 60)
+            detail += (
+                f"| `{sid}` | {_fmt_secs(avg_e)} | {_fmt_secs(tot_e)} "
+                f"| {execs:,} | `{sql}` |\n"
+            )
+        bottlenecks.append((2, "High Elapsed Time per Execution", detail))
+        act_idx += 1
+        actions.append(
+            (
+                1,
+                f"{act_idx}. Tune slow queries -- "
+                f"{len(high_elapsed)} queries > 1 sec/exec",
+            )
+        )
+
+    # -- High execution count --
     if high_exec:
-        summary_parts.append(
-            f"{len(high_exec)} queries with very high execution counts"
+        detail = "Queries with > 1,000 executions (high frequency):\n\n"
+        id_col = "sql_id" if is_oracle else "queryid"
+        detail += (
+            f"| {id_col} | Calls | Total Elapsed | Avg Elapsed | Query |\n"
+            f"| --- | --- | --- | --- | --- |\n"
         )
+        for r in high_exec[:10]:
+            if is_oracle:
+                sid = r.get("sql_id", "?")
+                execs = _safe_int(r.get("executions", 0))
+                tot_e = _safe_float(r.get("total_elapsed_sec", 0))
+                avg_e = tot_e / max(execs, 1)
+                sql = _truncate_sql(str(r.get("sql_text", "")), 60)
+            else:
+                sid = str(r.get("queryid", "?"))
+                execs = _safe_int(r.get("calls", 0))
+                tot_e = _safe_float(r.get("total_exec_sec", 0))
+                avg_e = _safe_float(r.get("mean_exec_sec", 0))
+                sql = _truncate_sql(str(r.get("query_text", "")), 60)
+            detail += (
+                f"| `{sid}` | {execs:,} | {_fmt_secs(tot_e)} "
+                f"| {_fmt_secs(avg_e)} | `{sql}` |\n"
+            )
+        bottlenecks.append((2, "High Execution Count Queries", detail))
+
+    # -- Full table scans / Sequential scans --
     if fts:
-        summary_parts.append(
-            f"{len(fts)} "
-            f"{'full table scans' if is_oracle else 'tables with heavy seq scans'}"
-        )
+        if is_oracle:
+            detail = "Full table scans detected:\n\n"
+            detail += (
+                "| sql_id | Table | Executions | Elapsed | Query |\n"
+                "| --- | --- | --- | --- | --- |\n"
+            )
+            for r in fts[:10]:
+                owner = r.get("object_owner", "")
+                table = r.get("table_name", "?")
+                sid = r.get("sql_id", "?")
+                execs = _safe_int(r.get("executions", 0))
+                elapsed = _safe_float(r.get("elapsed_sec", 0))
+                sql = _truncate_sql(str(r.get("sql_text", "")), 60)
+                detail += (
+                    f"| `{sid}` | `{owner}.{table}` | {execs:,} "
+                    f"| {_fmt_secs(elapsed)} | `{sql}` |\n"
+                )
+                act_idx += 1
+                actions.append(
+                    (
+                        1,
+                        f"{act_idx}. **Add index** on `{owner}.{table}` "
+                        f"for sql_id `{sid}` (full table scan, "
+                        f"{execs:,} execs, {_fmt_secs(elapsed)})",
+                    )
+                )
+        else:
+            detail = "Tables with heavy sequential scans:\n\n"
+            detail += (
+                "| Table | Seq Scans | Rows/Scan | Size | "
+                "Idx Scans | Live Rows |\n"
+                "| --- | --- | --- | --- | --- | --- |\n"
+            )
+            for r in fts[:10]:
+                schema = r.get("schemaname", "public")
+                table = r.get("relname", "?")
+                ss = _safe_int(r.get("seq_scan", 0))
+                avg_r = _safe_int(r.get("avg_rows_per_seq_scan", 0))
+                sz = _safe_float(r.get("table_size_mb", 0))
+                idx_s = _safe_int(r.get("idx_scan", 0))
+                live = _safe_int(r.get("n_live_tup", 0))
+                detail += (
+                    f"| `{schema}.{table}` | {ss:,} | {avg_r:,} "
+                    f"| {sz:.1f} MB | {idx_s:,} | {live:,} |\n"
+                )
+                if ss > 100 and live > 10000:
+                    act_idx += 1
+                    actions.append(
+                        (
+                            1,
+                            f"{act_idx}. **Add index** on `{schema}.{table}` -- "
+                            f"{ss:,} seq scans on {live:,} rows ({sz:.1f} MB)",
+                        )
+                    )
+        sev = 1 if len(fts) > 5 else 2
+        bottlenecks.append((sev, "Full Table Scans / Sequential Scans", detail))
+        risks.append(("Medium-High", "High", "I/O amplification from table scans"))
+
+    # -- Contention & locking --
     if contention:
-        summary_parts.append(f"{len(contention)} contention/lock wait events")
+        if is_oracle:
+            detail = "Contention/lock wait events:\n\n"
+            detail += (
+                "| Event | Waits | Time Waited | Avg Wait |\n"
+                "| --- | --- | --- | --- |\n"
+            )
+            for r in contention[:10]:
+                event = r.get("event", "?")
+                waits = _safe_int(r.get("total_waits", 0))
+                tw = _safe_float(r.get("time_waited_sec", 0))
+                aw = _safe_float(r.get("avg_wait_sec", 0))
+                detail += (
+                    f"| {event} | {waits:,} | {_fmt_secs(tw)} | {_fmt_secs(aw)} |\n"
+                )
+        else:
+            detail = "Active lock waits:\n\n"
+            detail += (
+                "| PID | User | Wait Event | Running | Query |\n"
+                "| --- | --- | --- | --- | --- |\n"
+            )
+            for r in contention[:10]:
+                pid = r.get("pid", "?")
+                user = r.get("usename", "?")
+                we = f"{r.get('wait_event_type', '')}:{r.get('wait_event', '')}"
+                dur = _safe_float(r.get("running_sec", 0))
+                q = _truncate_sql(str(r.get("query", "")), 60)
+                detail += f"| {pid} | {user} | {we} | {_fmt_secs(dur)} | `{q}` |\n"
+        bottlenecks.append((2, "Row Contention & Locking", detail))
+        risks.append(("Medium", "High", "Lock escalation / deadlock risk"))
+
+    # -- Wait events --
+    if wait_rows and not contention:
+        detail = "Top wait events:\n\n"
+        detail += "| Event | Waits | Time Waited |\n| --- | --- | --- |\n"
+        for r in wait_rows[:10]:
+            event = r.get("event", r.get("event_name", "?"))
+            waits = _safe_int(r.get("total_waits", 0))
+            tw = _safe_float(r.get("time_waited_sec", 0))
+            detail += f"| {event} | {waits:,} | {_fmt_secs(tw)} |\n"
+        bottlenecks.append((2, "Top Wait Events", detail))
+
+    # -- Table sizes & bloat (PG) --
+    if table_sizes:
+        detail = "Largest tables:\n\n"
+        detail += (
+            "| Table | Total Size | Table Size | TOAST+Idx | "
+            "Live Rows | Ins | Upd | Del |\n"
+            "| --- | --- | --- | --- | --- | --- | --- | --- |\n"
+        )
+        for r in table_sizes[:10]:
+            schema = r.get("schemaname", "public")
+            table = r.get("relname", "?")
+            total = _safe_float(r.get("total_size_mb", 0))
+            tbl = _safe_float(r.get("table_size_mb", 0))
+            toast = _safe_float(r.get("toast_index_size_mb", 0))
+            live = _safe_int(r.get("n_live_tup", 0))
+            ins = _safe_int(r.get("n_tup_ins", 0))
+            upd = _safe_int(r.get("n_tup_upd", 0))
+            dele = _safe_int(r.get("n_tup_del", 0))
+            total_str = f"{total / 1024:.1f} GB" if total >= 1024 else f"{total:.0f} MB"
+            tbl_str = f"{tbl / 1024:.1f} GB" if tbl >= 1024 else f"{tbl:.0f} MB"
+            toast_str = f"{toast / 1024:.1f} GB" if toast >= 1024 else f"{toast:.0f} MB"
+            detail += (
+                f"| `{schema}.{table}` | {total_str} | {tbl_str} "
+                f"| {toast_str} | {live:,} | {ins:,} | {upd:,} | {dele:,} |\n"
+            )
+            if total > 10240:
+                risks.append(
+                    (
+                        "Medium",
+                        "Medium",
+                        f"`{schema}.{table}` is {total_str} -- consider partitioning",
+                    )
+                )
+                act_idx += 1
+                actions.append(
+                    (
+                        1,
+                        f"{act_idx}. **Partition** `{schema}.{table}` "
+                        f"({total_str}) -- time-based or business key",
+                    )
+                )
+            if toast > tbl and toast > 1024:
+                act_idx += 1
+                actions.append(
+                    (
+                        2,
+                        f"{act_idx}. Review TOAST usage on `{schema}.{table}` "
+                        f"-- TOAST+Idx ({toast_str}) > table ({tbl_str})",
+                    )
+                )
+        bottlenecks.append((2, "Table Sizes & Storage", detail))
+
+    # -- Bloat (PG) --
+    if bloat_rows:
+        high_bloat = [r for r in bloat_rows if _safe_float(r.get("dead_pct", 0)) > 20]
+        if high_bloat:
+            detail = "Tables with significant bloat (dead tuples > 20%):\n\n"
+            detail += (
+                "| Table | Dead % | Dead Tuples | Size | Last Vacuum |\n"
+                "| --- | --- | --- | --- | --- |\n"
+            )
+            for r in high_bloat[:10]:
+                schema = r.get("schemaname", "public")
+                table = r.get("relname", "?")
+                dp = _safe_float(r.get("dead_pct", 0))
+                dead = _safe_int(r.get("n_dead_tup", 0))
+                sz = _safe_float(r.get("table_size_mb", 0))
+                lv = r.get("last_autovacuum", "never") or "never"
+                detail += (
+                    f"| `{schema}.{table}` | {dp:.1f}% | {dead:,} "
+                    f"| {sz:.0f} MB | {lv} |\n"
+                )
+                act_idx += 1
+                actions.append(
+                    (
+                        1,
+                        f"{act_idx}. **VACUUM FULL** `{schema}.{table}` -- "
+                        f"{dp:.1f}% dead tuples ({dead:,}): "
+                        f"`VACUUM (VERBOSE, ANALYZE) {schema}.{table};`",
+                    )
+                )
+            bottlenecks.append((1, "Table Bloat", detail))
+            risks.append(("High", "Severe", "Disk exhaustion from bloat"))
+
+    # -- Stale statistics / missing vacuum --
+    stale_critical: list[dict[str, Any]] = []
+    if stale_rows:
+        for r in stale_rows:
+            if is_oracle:
+                stale = r.get("stale_stats", "")
+                days = _safe_float(r.get("days_since_analyzed", 0))
+                if stale == "YES" or days > 7:
+                    stale_critical.append(r)
+            else:
+                dead_pct = _safe_float(r.get("dead_pct", 0))
+                la = r.get("last_analyze") or r.get("last_autoanalyze")
+                if dead_pct > 10 or not la:
+                    stale_critical.append(r)
+    if stale_critical:
+        detail = "Tables with stale/missing statistics:\n\n"
+        if is_oracle:
+            detail += (
+                "| Table | Rows | Last Analyzed | Days Stale |\n"
+                "| --- | --- | --- | --- |\n"
+            )
+            for r in stale_critical[:15]:
+                table = r.get("table_name", "?")
+                rows = _safe_int(r.get("num_rows", 0))
+                la = r.get("last_analyzed", "never")
+                days = _safe_float(r.get("days_since_analyzed", 0))
+                detail += f"| `{table}` | {rows:,} | {la} | {days:.0f} |\n"
+                act_idx += 1
+                actions.append(
+                    (
+                        2,
+                        f"{act_idx}. `EXEC DBMS_STATS.GATHER_TABLE_STATS"
+                        f"(ownname=>USER, tabname=>'{table}');`",
+                    )
+                )
+        else:
+            detail += (
+                "| Table | Dead % | Dead Tuples | Last Analyze |\n"
+                "| --- | --- | --- | --- |\n"
+            )
+            for r in stale_critical[:15]:
+                schema = r.get("schemaname", "public")
+                table = r.get("relname", "?")
+                dp = _safe_float(r.get("dead_pct", 0))
+                dead = _safe_int(r.get("n_dead_tup", 0))
+                la = r.get("last_analyze") or r.get("last_autoanalyze") or "never"
+                detail += f"| `{schema}.{table}` | {dp:.1f}% | {dead:,} | {la} |\n"
+                act_idx += 1
+                actions.append((2, f"{act_idx}. `ANALYZE {schema}.{table};`"))
+        bottlenecks.append((2, "Stale Statistics / Missing Vacuum", detail))
+
+    # -- Unused indexes --
+    if unused_idx:
+        total_waste_mb = sum(_safe_float(r.get("index_size_mb", 0)) for r in unused_idx)
+        detail = (
+            f"**{len(unused_idx)} unused indexes** "
+            f"consuming **{total_waste_mb:.0f} MB**:\n\n"
+            "| Index | Table | Size |\n"
+            "| --- | --- | --- |\n"
+        )
+        for r in unused_idx[:15]:
+            if is_oracle:
+                idx = r.get("index_name", "?")
+                table = r.get("table_name", "?")
+                sz = _safe_float(r.get("index_rows", 0))
+                detail += f"| `{idx}` | `{table}` | {sz:,} rows |\n"
+            else:
+                schema = r.get("schemaname", "public")
+                idx = r.get("indexrelname", "?")
+                table = r.get("relname", "?")
+                sz = _safe_float(r.get("index_size_mb", 0))
+                detail += f"| `{schema}.{idx}` | `{table}` | {sz:.0f} MB |\n"
+                act_idx += 1
+                actions.append(
+                    (
+                        2,
+                        f"{act_idx}. `DROP INDEX {schema}.{idx};` "
+                        f"-- never used, {sz:.0f} MB",
+                    )
+                )
+        bottlenecks.append((3, "Unused Indexes", detail))
+
+    # -- Sequence caching --
     if seqs:
-        summary_parts.append(f"{len(seqs)} sequences with no/low caching")
+        detail = "Sequences with no/low caching (cache_size <= 1):\n\n"
+        detail += "| Sequence | Cache Size |\n| --- | --- |\n"
+        for r in seqs[:15]:
+            if is_oracle:
+                name = f"{r.get('sequence_owner', '')}.{r.get('sequence_name', '?')}"
+                cache = _safe_int(r.get("cache_size", 0))
+            else:
+                name = f"{r.get('schemaname', 'public')}.{r.get('sequencename', '?')}"
+                cache = _safe_int(r.get("cache_size", 0))
+            detail += f"| `{name}` | {cache} |\n"
+        detail += (
+            "\n**Fix:** Increase cache size to reduce contention:\n"
+            "```sql\nALTER SEQUENCE seq_name CACHE 100;\n```"
+        )
+        bottlenecks.append((3, "Sequence Caching Issues", detail))
 
-    exec_summary = (
-        "Found: " + "; ".join(summary_parts) + "."
-        if summary_parts
-        else "No significant performance issues detected in the collected data."
-    )
-
-    # Build final report: summary at top, then sections, then action plan
-    header = [f"## Executive Summary\n{exec_summary}\n"]
-    footer = ["\n## Action Plan (Priority Order)\n"]
-    if action_items:
-        footer.extend(action_items)
-    else:
-        footer.append(
-            "No critical action items — database appears healthy based "
-            "on collected data."
+    # -- Temp file usage (PG) --
+    if temp_sql_rows:
+        detail = "Queries spilling to temp files:\n\n"
+        detail += (
+            "| queryid | Temp MB | Calls | Elapsed | Query |\n"
+            "| --- | --- | --- | --- | --- |\n"
+        )
+        for r in temp_sql_rows[:10]:
+            qid = str(r.get("queryid", "?"))
+            tmb = _safe_float(r.get("temp_mb", 0))
+            calls = _safe_int(r.get("calls", 0))
+            elapsed = _safe_float(r.get("total_exec_sec", 0))
+            sql = _truncate_sql(str(r.get("query_text", "")), 60)
+            detail += (
+                f"| `{qid}` | {tmb:.1f} | {calls:,} "
+                f"| {_fmt_secs(elapsed)} | `{sql}` |\n"
+            )
+        detail += "\n**Fix:** Increase `work_mem` or optimise query to reduce sorting."
+        bottlenecks.append((2, "Temp File Usage", detail))
+        act_idx += 1
+        actions.append(
+            (
+                2,
+                f"{act_idx}. Increase `work_mem` -- "
+                f"{len(temp_sql_rows)} queries spilling to disk",
+            )
         )
 
-    return "\n".join(header + parts + footer)
+    # -- Checkpoint issues (PG) --
+    if ckpt_rows:
+        ck = ckpt_rows[0]
+        req = _safe_int(ck.get("checkpoints_req", 0))
+        timed = _safe_int(ck.get("checkpoints_timed", 0))
+        buffers_ckpt = _safe_int(ck.get("buffers_checkpoint", 0))
+        buffers_be = _safe_int(ck.get("buffers_backend", 0))
+        backend_pct = 0.0
+        if buffers_ckpt + buffers_be > 0:
+            backend_pct = buffers_be / (buffers_ckpt + buffers_be) * 100
+        if req > timed and timed > 0:
+            detail = (
+                f"Requested checkpoints ({req:,}) **exceed** timed "
+                f"checkpoints ({timed:,})\n\n"
+                f"Backend write %: {backend_pct:.1f}%\n\n"
+                "**Fix:** Increase `max_wal_size` and `checkpoint_timeout`."
+            )
+            bottlenecks.append((2, "Checkpoint Pressure", detail))
+            act_idx += 1
+            actions.append(
+                (
+                    1,
+                    f"{act_idx}. Increase `max_wal_size` -- "
+                    f"requested checkpoints ({req:,}) > timed ({timed:,})",
+                )
+            )
+        if backend_pct > 20:
+            detail_be = (
+                f"**{backend_pct:.1f}%** of buffers written by backends "
+                f"(should be < 5%)\n\n"
+                "**Fix:** Increase `shared_buffers`, tune `bgwriter_*` params."
+            )
+            bottlenecks.append((2, "Backend Buffer Writes", detail_be))
+
+    # -- Replication lag --
+    if repl_rows:
+        for r in repl_rows:
+            replay_lag = _safe_float(r.get("replay_lag_sec", 0))
+            client = r.get("client_addr", "?")
+            state = r.get("state", "?")
+            if replay_lag > 10:
+                bottlenecks.append(
+                    (
+                        1 if replay_lag > 60 else 2,
+                        f"Replication Lag ({client})",
+                        f"Replica `{client}` ({state}): "
+                        f"replay lag = **{_fmt_secs(replay_lag)}**",
+                    )
+                )
+                risks.append(
+                    (
+                        "Medium-High",
+                        "High",
+                        f"Replication lag {_fmt_secs(replay_lag)} on {client}",
+                    )
+                )
+
+    # -- Oracle SGA info --
+    sga_rows = _get_rows(data, "sga_info")
+    if sga_rows:
+        detail = "SGA Memory Allocation:\n\n"
+        detail += "| Component | Size |\n| --- | --- |\n"
+        for r in sga_rows:
+            name = r.get("name", "?")
+            sz = _safe_float(r.get("size_mb", 0))
+            sz_str = f"{sz / 1024:.1f} GB" if sz >= 1024 else f"{sz:.0f} MB"
+            detail += f"| {name} | {sz_str} |\n"
+        bottlenecks.append((3, "SGA Configuration", detail))
+
+    # -- Oracle tablespace I/O --
+    ts_io_rows = _get_rows(data, "tablespace_io")
+    if ts_io_rows:
+        detail = "Tablespace I/O:\n\n"
+        detail += (
+            "| Tablespace | Phys Reads | Phys Writes | "
+            "Read Time | Write Time |\n"
+            "| --- | --- | --- | --- | --- |\n"
+        )
+        for r in ts_io_rows[:10]:
+            ts = r.get("tablespace_name", "?")
+            pr = _safe_int(r.get("physical_reads", 0))
+            pw = _safe_int(r.get("physical_writes", 0))
+            rt = _safe_float(r.get("read_time_sec", 0))
+            wt = _safe_float(r.get("write_time_sec", 0))
+            detail += (
+                f"| {ts} | {pr:,} | {pw:,} | {_fmt_secs(rt)} | {_fmt_secs(wt)} |\n"
+            )
+        bottlenecks.append((3, "Tablespace I/O", detail))
+
+    # -- Oracle redo log switches --
+    redo_rows = _get_rows(data, "redo_log_switches")
+    if redo_rows:
+        max_switches = max(_safe_int(r.get("switches", 0)) for r in redo_rows)
+        if max_switches > 10:
+            detail = "Redo log switches per hour:\n\n"
+            detail += "| Hour | Switches |\n| --- | --- |\n"
+            for r in redo_rows[:12]:
+                detail += (
+                    f"| {r.get('switch_hour', '?')} "
+                    f"| {_safe_int(r.get('switches', 0))} |\n"
+                )
+            detail += (
+                f"\nPeak: **{max_switches} switches/hour** -- "
+                f"consider increasing redo log size."
+            )
+            bottlenecks.append((2, "High Redo Log Switches", detail))
+            act_idx += 1
+            actions.append(
+                (
+                    1,
+                    f"{act_idx}. Increase redo log size -- "
+                    f"peak {max_switches} switches/hour",
+                )
+            )
+
+    # -- Oracle temp usage --
+    temp_rows = _get_rows(data, "temp_usage")
+    if temp_rows:
+        for r in temp_rows:
+            pct = _safe_float(r.get("pct_used", 0))
+            if pct > 80:
+                ts = r.get("tablespace_name", "?")
+                used = _safe_float(r.get("used_mb", 0))
+                free = _safe_float(r.get("free_mb", 0))
+                bottlenecks.append(
+                    (
+                        2,
+                        f"Temp Tablespace `{ts}` at {pct:.0f}%",
+                        f"Used: {used:.0f} MB, Free: {free:.0f} MB",
+                    )
+                )
+                risks.append(("Medium", "High", f"Temp space exhaustion on {ts}"))
+
+    # =====================================================================
+    # PHASE 3 -- Generate formatted report
+    # =====================================================================
+    parts: list[str] = []
+
+    # --- Header ---
+    parts.append(f"# Performance Analysis Report -- {db_type.upper()}")
+    parts.append("*Programmatic analysis v2 -- no LLM involved*\n")
+    parts.append("---\n")
+
+    # --- 1. Executive Summary ---
+    sev1 = [b for b in bottlenecks if b[0] == 1]
+    sev2 = [b for b in bottlenecks if b[0] == 2]
+    sev3 = [b for b in bottlenecks if b[0] == 3]
+
+    if sev1:
+        health = "CRITICAL -- immediate action required"
+    elif sev2:
+        health = "WARNING -- important issues found"
+    elif sev3:
+        health = "ADVISORY -- minor improvements possible"
+    else:
+        health = "HEALTHY -- no significant issues detected"
+
+    parts.append("## 1. Executive Summary\n")
+    parts.append(f"**Overall health:** {health}\n")
+
+    headlines: list[str] = []
+    if not is_oracle:
+        headlines.append(f"Buffer cache hit ratio: **{cache_hit:.2f}%**")
+        headlines.append(f"Active backends: **{backends}**")
+        headlines.append(
+            f"Transactions: **{commits:,}** commits, **{rollbacks:,}** rollbacks"
+        )
+        if wal_bytes > 0:
+            headlines.append(f"WAL generated: **{_fmt_bytes(wal_bytes)}**")
+        if temp_bytes > 0:
+            headlines.append(
+                f"Temp files: **{temp_files:,}** files, **{_fmt_bytes(temp_bytes)}**"
+            )
+    else:
+        headlines.append(f"Buffer cache hit ratio: **{ora_cache_hit:.2f}%**")
+        headlines.append(f"Hard parse ratio: **{ora_hard_parse_pct:.1f}%**")
+        if ora_commit_count + ora_rb_count > 0:
+            headlines.append(
+                f"Transactions: **{ora_commit_count:,}** commits, "
+                f"**{ora_rb_count:,}** rollbacks"
+            )
+    headlines.append(
+        f"Issues found: **{len(sev1)}** critical, "
+        f"**{len(sev2)}** important, **{len(sev3)}** advisory"
+    )
+    for h in headlines:
+        parts.append(f"- {h}")
+    parts.append("")
+
+    # --- 2. Database & Workload Distribution ---
+    parts.append("## 2. Database & Workload Overview\n")
+    if not is_oracle:
+        parts.append(
+            "| Metric | Value |\n"
+            "| --- | --- |\n"
+            f"| Cache hit ratio | {cache_hit:.2f}% |\n"
+            f"| Active backends | {backends} |\n"
+            f"| Commits | {commits:,} |\n"
+            f"| Rollbacks | {rollbacks:,} |\n"
+            f"| Blocks hit | {blks_hit:,} |\n"
+            f"| Blocks read (disk) | {blks_read:,} |\n"
+            f"| Temp files | {temp_files:,} |\n"
+            f"| Temp bytes | {_fmt_bytes(temp_bytes)} |"
+        )
+        if wal_bytes > 0:
+            parts.append(
+                f"| WAL generated | {_fmt_bytes(wal_bytes)} |\n"
+                f"| WAL FPI count | {wal_fpi:,} |\n"
+                f"| WAL sync time | {wal_sync_time_ms / 1000:.1f} sec |\n"
+                f"| WAL write time | {wal_write_time_ms / 1000:.1f} sec |"
+            )
+    else:
+        parts.append(
+            "| Metric | Value |\n"
+            "| --- | --- |\n"
+            f"| Buffer cache hit | {ora_cache_hit:.2f}% |\n"
+            f"| Hard parse ratio | {ora_hard_parse_pct:.1f}% |\n"
+            f"| Disk sort ratio | {ora_disk_sort_pct:.1f}% |\n"
+            f"| Commits | {ora_commit_count:,} |\n"
+            f"| Rollbacks | {ora_rb_count:,} |"
+        )
+    parts.append("")
+
+    # Connection distribution
+    if conn_rows:
+        parts.append("**Connection Distribution:**\n")
+        parts.append("| State | Count | Wait Type |\n| --- | --- | --- |")
+        for r in conn_rows:
+            state = r.get("state", "unknown") or "null"
+            count = _safe_int(r.get("count", 0))
+            wtype = r.get("wait_event_type", "None")
+            parts.append(f"| {state} | {count} | {wtype} |")
+        if idle_count > 50:
+            act_idx += 1
+            actions.append(
+                (
+                    1,
+                    f"{act_idx}. Use connection pooling (PgBouncer) -- "
+                    f"{idle_count} idle connections",
+                )
+            )
+        parts.append("")
+
+    # --- 3. Top Bottlenecks ---
+    parts.append("## 3. Top Bottlenecks\n")
+    if not bottlenecks:
+        parts.append(
+            "No significant performance bottlenecks detected in the collected data.\n"
+        )
+    else:
+        sev_label = {
+            1: "SEV-1 (Critical)",
+            2: "SEV-2 (Important)",
+            3: "SEV-3 (Advisory)",
+        }
+        sev_emoji = {1: "SEV-1", 2: "SEV-2", 3: "SEV-3"}
+        bn_idx = 0
+        for sev in (1, 2, 3):
+            group = [b for b in bottlenecks if b[0] == sev]
+            if not group:
+                continue
+            for _, title, detail in group:
+                bn_idx += 1
+                parts.append(
+                    f"### {sev_emoji.get(sev, '')} {bn_idx}. "
+                    f"{title} ({sev_label[sev]})\n"
+                )
+                parts.append(detail)
+                parts.append("")
+
+    # --- 4. Configuration Review ---
+    section_num = 4
+    if config_rows:
+        parts.append(f"## {section_num}. Configuration Review\n")
+        if is_oracle:
+            parts.append("| Parameter | Value | Description |\n| --- | --- | --- |")
+            for r in config_rows:
+                name = r.get("name", "?")
+                val = r.get("value", "?")
+                desc = _truncate_sql(str(r.get("description", "")), 80)
+                parts.append(f"| `{name}` | `{val}` | {desc} |")
+        else:
+            parts.append("| Parameter | Value | Unit |\n| --- | --- | --- |")
+            risky_params: dict[str, str] = {}
+            for r in config_rows:
+                name = r.get("name", "?")
+                val = r.get("setting", "?")
+                unit = r.get("unit", "") or ""
+                parts.append(f"| `{name}` | `{val}` | {unit} |")
+                if name == "statement_timeout" and str(val) == "0":
+                    risky_params[name] = (
+                        "No statement timeout -- risk of runaway queries"
+                    )
+                if name == "idle_in_transaction_session_timeout" and str(val) == "0":
+                    risky_params[name] = "No idle-in-tx timeout -- risk of bloat"
+                if name == "max_connections":
+                    max_conn = _safe_int(val)
+                    if max_conn > 500:
+                        risky_params[name] = (
+                            f"max_connections={max_conn} is high -- "
+                            f"use connection pooling"
+                        )
+            if risky_params:
+                parts.append("\n**Risks:**")
+                for param, msg in risky_params.items():
+                    parts.append(f"- `{param}`: {msg}")
+                    risks.append(("Medium", "Medium", msg))
+        parts.append("")
+        section_num += 1
+
+    # --- 5. Risk Register ---
+    if risks:
+        parts.append(f"## {section_num}. Risk Register\n")
+        parts.append("| Risk | Likelihood | Impact |\n| --- | --- | --- |")
+        seen_risks: set[str] = set()
+        for likelihood, impact, desc in risks:
+            if desc not in seen_risks:
+                seen_risks.add(desc)
+                parts.append(f"| {desc} | {likelihood} | {impact} |")
+        parts.append("")
+        section_num += 1
+
+    # --- 6. Prioritised Action Plan ---
+    parts.append(f"## {section_num}. Prioritised Action Plan\n")
+    if not actions:
+        parts.append(
+            "No critical action items -- database appears healthy "
+            "based on collected data."
+        )
+    else:
+        p0 = [a for a in actions if a[0] == 0]
+        p1 = [a for a in actions if a[0] == 1]
+        p2 = [a for a in actions if a[0] == 2]
+        if p0:
+            parts.append("### Priority 0 -- Immediate (this sprint)\n")
+            for _, text in p0:
+                parts.append(text)
+            parts.append("")
+        if p1:
+            parts.append("### Priority 1 -- Structural\n")
+            for _, text in p1:
+                parts.append(text)
+            parts.append("")
+        if p2:
+            parts.append("### Priority 2 -- Performance Hygiene\n")
+            for _, text in p2:
+                parts.append(text)
+            parts.append("")
+
+    return "\n".join(parts)
 
 
 def _get_rows(data: dict[str, Any], key: str) -> list[dict[str, Any]]:
@@ -1752,9 +2178,9 @@ class PerformanceAnalyser:
     def analyse_uploaded_report(
         self, file_content: str, file_name: str
     ) -> dict[str, Any]:
-        """Parse an uploaded report file and generate LLM analysis."""
+        """Parse an uploaded report file and display it."""
         parsed = parse_uploaded_report(file_content, file_name)
-        return self._run_llm_analysis_from_text(parsed)
+        return self._run_uploaded_report_analysis(parsed)
 
     def list_awr_snapshots(self) -> list[dict[str, Any]]:
         """Return available AWR snapshots from DBA_HIST_SNAPSHOT."""
@@ -1804,23 +2230,19 @@ class PerformanceAnalyser:
             "analysis": findings_report,
         }
 
-    def _run_llm_analysis_from_text(self, report_text: str) -> dict[str, Any]:
-        # For uploaded reports, we still need the LLM since we don't
-        # have structured data — but we keep the prompt minimal.
-        llm_prompt = (
-            report_text + "\n\n---\n"
-            "Summarise the key performance issues in the report above. "
-            "Only reference data that actually appears above. "
-            "Do NOT invent sql_ids, table names, or metrics."
-        )
-        try:
-            llm_response = self.llm_client.generate(prompt=llm_prompt)
-        except (ConnectionError, RuntimeError) as exc:
-            llm_response = f"LLM analysis failed: {exc}"
+    def _run_uploaded_report_analysis(self, report_text: str) -> dict[str, Any]:
+        # For uploaded reports we cannot do structured analysis.
+        # Display the parsed text as-is — no LLM involved.
         return {
             "raw_data": {},
             "report_text": report_text,
-            "analysis": llm_response,
+            "analysis": (
+                "## Uploaded Report\n\n"
+                "The parsed report content is shown below. "
+                "For detailed programmatic analysis, use **Live** mode "
+                "which queries the database directly.\n\n"
+                "---\n\n" + report_text[:8000]
+            ),
         }
 
     # -- Oracle collection ---------------------------------------------------
@@ -1844,6 +2266,8 @@ class PerformanceAnalyser:
             "redo_log_switches": _ORA_REDO_LOG_SWITCHES,
             "temp_usage": _ORA_TEMP_USAGE,
             "parallel_queries": _ORA_PARALLEL_QUERIES,
+            "config_params": _ORA_CONFIG_PARAMS,
+            "idle_sessions": _ORA_IDLE_SESSIONS,
         }
         for name, sql in queries.items():
             result = self.db_client.execute_query(sql)
@@ -1958,6 +2382,7 @@ class PerformanceAnalyser:
             "existing_indexes": _PG_EXISTING_INDEXES,
             "stale_stats_vacuum": _PG_STALE_STATS,
             "table_stats": _PG_TABLE_STATS,
+            "table_sizes": _PG_TABLE_SIZES,
             "database_stats": _PG_DB_STATS,
             "bgwriter_stats": bgwriter_sql,
             "unused_indexes": _PG_UNUSED_INDEXES,
@@ -1967,7 +2392,13 @@ class PerformanceAnalyser:
             "temp_file_usage": _PG_TEMP_FILE_USAGE,
             "connection_stats": _PG_CONNECTION_STATS,
             "checkpoint_stats": checkpoint_sql,
+            "idle_in_transaction": _PG_IDLE_IN_TRANSACTION,
+            "config_params": _PG_CONFIG_PARAMS,
+            "replication_status": _PG_REPLICATION_STATUS,
         }
+        # WAL stats only available in PG 14+
+        if pg_major >= 14:
+            queries["wal_stats"] = _PG_WAL_STATS
         for name, sql in queries.items():
             result = self.db_client.execute_query(sql)
             if "error" in result:

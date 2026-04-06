@@ -814,60 +814,6 @@ class SnapshotComparator:
             "change_pct": f"{direction}{abs(pct):.1f}%",
         }
 
-    # -- LLM comparison analysis ---------------------------------------------
-
-    def _format_comparison_text(
-        self,
-        data_a: dict[str, Any],
-        data_b: dict[str, Any],
-        label_a: str,
-        label_b: str,
-        delta_table: list[dict[str, Any]],
-    ) -> str:
-        parts = [
-            f"SNAPSHOT COMPARISON REPORT\n{'=' * 60}",
-            f"Snapshot A: {label_a}",
-            f"Snapshot B: {label_b}\n",
-            "--- DELTA SUMMARY ---",
-        ]
-        for row in delta_table:
-            parts.append(
-                f"  {row['metric']}: {row[label_a]} -> {row[label_b]} "
-                f"(delta={row['delta']}, {row['change_pct']})"
-            )
-
-        parts.append("\n--- SNAPSHOT A: TOP SQL ---")
-        for i, row in enumerate(data_a.get("top_sql", [])[:10], 1):
-            parts.append(f"  [{i}] {_fmt(row)}")
-
-        parts.append("\n--- SNAPSHOT B: TOP SQL ---")
-        for i, row in enumerate(data_b.get("top_sql", [])[:10], 1):
-            parts.append(f"  [{i}] {_fmt(row)}")
-
-        parts.append("\n--- SNAPSHOT A: WAIT EVENTS ---")
-        for i, row in enumerate(data_a.get("wait_events", [])[:10], 1):
-            parts.append(f"  [{i}] {_fmt(row)}")
-
-        parts.append("\n--- SNAPSHOT B: WAIT EVENTS ---")
-        for i, row in enumerate(data_b.get("wait_events", [])[:10], 1):
-            parts.append(f"  [{i}] {_fmt(row)}")
-
-        return "\n".join(parts)
-
-    def _get_llm_comparison(self, text: str) -> str:
-        # Build programmatic comparison findings first, then ask LLM
-        # for a brief summary only.
-        try:
-            llm_prompt = (
-                text + "\n\n---\n"
-                "Based on the snapshot comparison data above, write 3-5 sentences "
-                "summarising what changed and what the DBA should investigate. "
-                "Do NOT invent any sql_ids, table names, or metrics."
-            )
-            return self.llm.generate(prompt=llm_prompt)
-        except (ConnectionError, RuntimeError) as exc:
-            return f"LLM comparison summary unavailable: {exc}"
-
     def _build_programmatic_comparison(
         self,
         data_a: dict[str, Any],

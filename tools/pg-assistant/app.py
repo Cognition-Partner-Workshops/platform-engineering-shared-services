@@ -671,14 +671,14 @@ with tab_analyse:
 
             with acol2:
                 if st.button(
-                    "🧠 Full Analysis (Data + LLM)",
+                    "🧠 Full Analysis",
                     use_container_width=True,
                     type="primary",
                 ):
                     analyser = PerformanceAnalyser(
                         db_client=db_client, llm_client=llm_client
                     )
-                    with st.spinner("Collecting data and running LLM analysis..."):
+                    with st.spinner("Collecting data and running analysis..."):
                         result = analyser.analyse()
                     st.session_state.analyser = analyser
                     st.session_state["_last_analysis"] = result
@@ -820,7 +820,7 @@ with tab_analyse:
                     )
                 else:
                     with st.spinner(
-                        "Collecting pg_stat_statements data and running LLM analysis..."
+                        "Collecting pg_stat_statements data and running analysis..."
                     ):
                         result = analyser.analyse_pg_stat_latest()
                     st.session_state.analyser = analyser
@@ -831,7 +831,7 @@ with tab_analyse:
         elif analyse_mode == "Upload report file":
             st.markdown(
                 "Upload an **AWR report** (HTML/text), **pg_stat_statements CSV**, "
-                "or **pgProfile report** (HTML/text) for LLM-powered analysis."
+                "or **pgProfile report** (HTML/text) for analysis."
             )
             uploaded_file = st.file_uploader(
                 "Choose a report file",
@@ -1002,7 +1002,7 @@ with tab_tuning:
     st.subheader("🔧 SQL Tuning Advisor")
     st.markdown(
         "Paste a SQL statement to get its **execution plan**, table metadata, "
-        "and **LLM-powered tuning recommendations** (index suggestions, "
+        "and **tuning recommendations** (index suggestions, "
         "SQL rewrites, stats maintenance)."
     )
 
@@ -1049,9 +1049,7 @@ with tab_tuning:
 
         if tune_btn and tune_sql.strip():
             advisor = SQLTuningAdvisor(db_client=db_client, llm_client=llm_client)
-            with st.spinner(
-                "Running EXPLAIN, collecting metadata, analysing with LLM..."
-            ):
+            with st.spinner("Running EXPLAIN, collecting metadata, analysing..."):
                 result = advisor.analyse_sql(tune_sql.strip(), run_analyze=run_analyze)
 
             if result.get("error"):
@@ -1063,7 +1061,7 @@ with tab_tuning:
                     st.subheader("Execution Plan")
                     st.code(plan_text, language="text")
 
-                # Show LLM analysis
+                # Show analysis
                 analysis = result.get("analysis", "")
                 if analysis:
                     st.divider()
