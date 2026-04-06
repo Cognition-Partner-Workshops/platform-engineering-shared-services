@@ -21,6 +21,7 @@ from db_client import (
 from llm_client import LLMClient
 from profile_manager import ProfileManager
 from session_monitor import SessionMonitor
+from snapshot_compare import SnapshotComparator
 from sql_generator import SQLGenerationError, SQLGenerator, UnsafeSQLError
 from sql_tuning_advisor import SQLTuningAdvisor
 
@@ -62,6 +63,33 @@ def _connected_db_type() -> str:
     if client and client.is_connected:
         return client.db_type
     return ""
+
+
+def _render_comparison(result: dict) -> None:
+    """Render the snapshot comparison results with charts and delta table."""
+    # Delta summary table
+    delta_table = result.get("delta_table", [])
+    if delta_table:
+        st.markdown("### Delta Summary")
+        df = pd.DataFrame(delta_table)
+        st.dataframe(df, use_container_width=True, hide_index=True)
+
+    # Plotly charts
+    figures = result.get("figures", [])
+    if figures:
+        st.markdown("### Visual Comparison")
+        for fig_info in figures:
+            title = fig_info.get("title", "")
+            fig = fig_info.get("fig")
+            if fig is not None:
+                st.markdown(f"**{title}**")
+                st.plotly_chart(fig, use_container_width=True)
+
+    # LLM analysis
+    analysis = result.get("analysis", "")
+    if analysis:
+        st.markdown("### AI Comparison Analysis")
+        st.markdown(analysis)
 
 
 # ---------------------------------------------------------------------------
@@ -268,6 +296,7 @@ else:
     tab_schema,
     tab_monitor,
     tab_analyse,
+    tab_compare,
     tab_sessions,
     tab_tuning,
     tab_history,
@@ -277,6 +306,7 @@ else:
         "📋 Schema",
         "📡 Auto Monitor",
         "📊 Auto Analyse",
+        "🔀 Compare Snapshots",
         "🔒 Sessions & Locks",
         "🔧 SQL Tuning Advisor",
         "📜 History",
@@ -1049,6 +1079,179 @@ with tab_tuning:
 
         elif tune_btn:
             st.warning("Please enter a SQL statement to tune.")
+
+# ---- Compare Snapshots tab ------------------------------------------------
+with tab_compare:
+    st.subheader("Compare Two Snapshots")
+
+    if not st.session_state.db_client:
+        st.warning("Connect to a database first.")
+    else:
+        db_type = _connected_db_type()
+        comparator = SnapshotComparator(
+            st.session_state.db_client, st.session_state.llm_client
+        )
+
+        if db_type == DB_TYPE_ORACLE:
+            st.markdown(
+                "Select **two AWR snapshot ranges** to compare. "
+                "The tool will show delta metrics and charts."
+            )
+            # Load available snapshots
+            analyser_cmp = PerformanceAnalyser(
+                st.session_state.db_client, st.session_state.llm_client
+            )
+            snap_result = analyser_cmp.list_awr_snapshots()
+            if "error" in snap_result:
+                st.error(f"Cannot load snapshots: {snap_result['error']}")
+            else:
+                snaps = snap_result.get("rows", [])
+                if not snaps:
+                    st.info("No AWR snapshots found.")
+                else:
+                    snap_ids = sorted(
+                        {int(s["snap_id"]) for s in snaps if s.get("snap_id")}
+                    )
+                    snap_labels = {
+                        int(s["snap_id"]): (
+                            f"{s['snap_id']} - {s.get('end_interval_time', '')}"
+                        )
+                        for s in snaps
+                        if s.get("snap_id")
+                    }
+
+                    col_a, col_b = st.columns(2)
+                    with col_a:
+                        st.markdown("**Snapshot Range A (Baseline)**")
+                        a_begin = st.selectbox(
+                            "A \u2014 Begin Snap",
+                            snap_ids,
+                            index=0,
+                            key="cmp_a_begin",
+                            format_func=lambda x: snap_labels.get(x, str(x)),
+                        )
+                        a_end = st.selectbox(
+                            "A \u2014 End Snap",
+                            snap_ids,
+                            index=min(1, len(snap_ids) - 1),
+                            key="cmp_a_end",
+                            format_func=lambda x: snap_labels.get(x, str(x)),
+                        )
+                    with col_b:
+                        st.markdown("**Snapshot Range B (Current)**")
+                        b_begin = st.selectbox(
+                            "B \u2014 Begin Snap",
+                            snap_ids,
+                            index=max(0, len(snap_ids) - 2),
+                            key="cmp_b_begin",
+                            format_func=lambda x: snap_labels.get(x, str(x)),
+                        )
+                        b_end = st.selectbox(
+                            "B \u2014 End Snap",
+                            snap_ids,
+                            index=len(snap_ids) - 1,
+                            key="cmp_b_end",
+                            format_func=lambda x: snap_labels.get(x, str(x)),
+                        )
+
+                    if st.button("\U0001f50d Compare Snapshots", key="cmp_ora_btn"):
+                        if a_begin >= a_end:
+                            st.error("Range A: Begin snap must be less than End snap.")
+                        elif b_begin >= b_end:
+                            st.error("Range B: Begin snap must be less than End snap.")
+                        else:
+                            with st.spinner("Comparing snapshots\u2026"):
+                                result = comparator.compare_oracle(
+                                    a_begin, a_end, b_begin, b_end
+                                )
+                            _render_comparison(result)
+
+        elif db_type == DB_TYPE_POSTGRESQL:
+            cmp_mode = st.radio(
+                "Comparison mode",
+                ["pgProfile Sample Ranges", "pg_stat_statements (latest)"],
+                key="cmp_pg_mode",
+                horizontal=True,
+            )
+
+            if cmp_mode == "pgProfile Sample Ranges":
+                analyser_cmp = PerformanceAnalyser(
+                    st.session_state.db_client, st.session_state.llm_client
+                )
+                samp_result = analyser_cmp.list_pgprofile_samples()
+                if "error" in samp_result:
+                    st.error(f"Cannot load pgProfile samples: {samp_result['error']}")
+                else:
+                    samps = samp_result.get("rows", [])
+                    if not samps:
+                        st.info("No pgProfile samples found.")
+                    else:
+                        samp_ids = sorted(
+                            {int(s["sample_id"]) for s in samps if s.get("sample_id")}
+                        )
+                        samp_labels = {
+                            int(s["sample_id"]): (
+                                f"{s['sample_id']} - {s.get('sample_time', '')}"
+                            )
+                            for s in samps
+                            if s.get("sample_id")
+                        }
+
+                        col_a, col_b = st.columns(2)
+                        with col_a:
+                            st.markdown("**Sample Range A (Baseline)**")
+                            sa_begin = st.selectbox(
+                                "A \u2014 Begin Sample",
+                                samp_ids,
+                                index=0,
+                                key="cmp_sa_begin",
+                                format_func=lambda x: samp_labels.get(x, str(x)),
+                            )
+                            sa_end = st.selectbox(
+                                "A \u2014 End Sample",
+                                samp_ids,
+                                index=min(1, len(samp_ids) - 1),
+                                key="cmp_sa_end",
+                                format_func=lambda x: samp_labels.get(x, str(x)),
+                            )
+                        with col_b:
+                            st.markdown("**Sample Range B (Current)**")
+                            sb_begin = st.selectbox(
+                                "B \u2014 Begin Sample",
+                                samp_ids,
+                                index=max(0, len(samp_ids) - 2),
+                                key="cmp_sb_begin",
+                                format_func=lambda x: samp_labels.get(x, str(x)),
+                            )
+                            sb_end = st.selectbox(
+                                "B \u2014 End Sample",
+                                samp_ids,
+                                index=len(samp_ids) - 1,
+                                key="cmp_sb_end",
+                                format_func=lambda x: samp_labels.get(x, str(x)),
+                            )
+
+                        if st.button("\U0001f50d Compare Samples", key="cmp_pg_btn"):
+                            if sa_begin >= sa_end:
+                                st.error("Range A: Begin must be less than End.")
+                            elif sb_begin >= sb_end:
+                                st.error("Range B: Begin must be less than End.")
+                            else:
+                                with st.spinner("Comparing samples\u2026"):
+                                    result = comparator.compare_pgprofile(
+                                        sa_begin, sa_end, sb_begin, sb_end
+                                    )
+                                _render_comparison(result)
+
+            else:
+                st.info(
+                    "pg_stat_statements shows cumulative stats since last "
+                    "reset. For snapshot comparison, use pgProfile sample "
+                    "ranges above.\n\n"
+                    "You can view the current pg_stat_statements data in "
+                    "the **Auto Analyse** tab."
+                )
+
 
 # ---- History tab ----------------------------------------------------------
 with tab_history:

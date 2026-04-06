@@ -29,8 +29,13 @@ _ORA_TOP_SQL = """
             executions,
             buffer_gets,
             disk_reads,
-            SUBSTR(sql_text, 1, 200) AS sql_text
+            SUBSTR(sql_fulltext, 1, 500) AS sql_text
         FROM v$sql
+        WHERE parsing_schema_name NOT IN (
+            'SYS','SYSTEM','DBSNMP','OUTLN','XDB','WMSYS',
+            'CTXSYS','MDSYS','ORDSYS','ORDDATA','LBACSYS',
+            'APEX_PUBLIC_USER','FLOWS_FILES','DVSYS','AUDSYS'
+        )
         ORDER BY elapsed_time DESC
     ) WHERE ROWNUM <= 20
 """
@@ -99,13 +104,22 @@ _ORA_FULL_TABLE_SCANS = """
             ROUND(s.elapsed_time / 1e6, 2) AS elapsed_sec,
             s.buffer_gets,
             s.disk_reads,
-            SUBSTR(s.sql_text, 1, 200) AS sql_text
+            SUBSTR(s.sql_fulltext, 1, 500) AS sql_text
         FROM v$sql_plan p
         JOIN v$sql s ON p.sql_id = s.sql_id
             AND p.child_number = s.child_number
         WHERE p.operation = 'TABLE ACCESS'
             AND p.options = 'FULL'
-            AND p.object_owner NOT IN ('SYS', 'SYSTEM', 'DBSNMP', 'OUTLN')
+            AND p.object_owner NOT IN (
+                'SYS','SYSTEM','DBSNMP','OUTLN','XDB','WMSYS',
+                'CTXSYS','MDSYS','ORDSYS','ORDDATA','LBACSYS',
+                'APEX_PUBLIC_USER','FLOWS_FILES','DVSYS','AUDSYS'
+            )
+            AND s.parsing_schema_name NOT IN (
+                'SYS','SYSTEM','DBSNMP','OUTLN','XDB','WMSYS',
+                'CTXSYS','MDSYS','ORDSYS','ORDDATA','LBACSYS',
+                'APEX_PUBLIC_USER','FLOWS_FILES','DVSYS','AUDSYS'
+            )
         ORDER BY s.elapsed_time DESC
     ) WHERE ROWNUM <= 20
 """
@@ -120,9 +134,14 @@ _ORA_TOP_CPU_SQL = """
             executions,
             buffer_gets,
             ROUND(buffer_gets / GREATEST(executions, 1)) AS gets_per_exec,
-            SUBSTR(sql_text, 1, 200) AS sql_text
+            SUBSTR(sql_fulltext, 1, 500) AS sql_text
         FROM v$sql
         WHERE cpu_time > 0
+          AND parsing_schema_name NOT IN (
+              'SYS','SYSTEM','DBSNMP','OUTLN','XDB','WMSYS',
+              'CTXSYS','MDSYS','ORDSYS','ORDDATA','LBACSYS',
+              'APEX_PUBLIC_USER','FLOWS_FILES','DVSYS','AUDSYS'
+          )
         ORDER BY cpu_time DESC
     ) WHERE ROWNUM <= 15
 """
@@ -201,12 +220,17 @@ _ORA_AWR_TOP_SQL = """
             SUM(s.executions_delta) AS executions,
             SUM(s.buffer_gets_delta) AS buffer_gets,
             SUM(s.disk_reads_delta) AS disk_reads,
-            DBMS_LOB.SUBSTR(t.sql_text, 200, 1) AS sql_text
+            DBMS_LOB.SUBSTR(t.sql_text, 500, 1) AS sql_text
         FROM dba_hist_sqlstat s
         JOIN dba_hist_sqltext t ON s.sql_id = t.sql_id AND s.dbid = t.dbid
         WHERE s.snap_id BETWEEN :begin_snap AND :end_snap
+          AND s.parsing_schema_name NOT IN (
+              'SYS','SYSTEM','DBSNMP','OUTLN','XDB','WMSYS',
+              'CTXSYS','MDSYS','ORDSYS','ORDDATA','LBACSYS',
+              'APEX_PUBLIC_USER','FLOWS_FILES','DVSYS','AUDSYS'
+          )
         GROUP BY s.sql_id, s.plan_hash_value,
-                 DBMS_LOB.SUBSTR(t.sql_text, 200, 1)
+                 DBMS_LOB.SUBSTR(t.sql_text, 500, 1)
         ORDER BY elapsed_sec DESC
     ) WHERE ROWNUM <= 20
 """
@@ -299,7 +323,7 @@ _PG_STAT_STATEMENTS_EXISTS = """
 _PG_TOP_QUERIES = """
     SELECT
         queryid,
-        LEFT(query, 200) AS query_text,
+        LEFT(query, 500) AS query_text,
         calls,
         ROUND((total_exec_time / 1000)::numeric, 2) AS total_exec_sec,
         ROUND((mean_exec_time / 1000)::numeric, 4) AS mean_exec_sec,
@@ -314,6 +338,13 @@ _PG_TOP_QUERIES = """
             ELSE 100
         END AS cache_hit_pct
     FROM pg_stat_statements
+    WHERE dbid = (SELECT oid FROM pg_database WHERE datname = current_database())
+      AND queryid IS NOT NULL
+      AND query NOT LIKE 'SET %%'
+      AND query NOT LIKE 'RESET %%'
+      AND query NOT LIKE 'BEGIN%%'
+      AND query NOT LIKE 'COMMIT%%'
+      AND query NOT LIKE 'ROLLBACK%%'
     ORDER BY total_exec_time DESC
     LIMIT 20
 """
@@ -420,7 +451,7 @@ _PG_STALE_STATS = """
 _PG_TOP_CPU_QUERIES = """
     SELECT
         queryid,
-        LEFT(query, 300) AS query_text,
+        LEFT(query, 500) AS query_text,
         calls,
         ROUND((total_exec_time / 1000)::numeric, 2) AS total_exec_sec,
         ROUND((mean_exec_time / 1000)::numeric, 4) AS mean_exec_sec,
@@ -439,6 +470,13 @@ _PG_TOP_CPU_QUERIES = """
         temp_blks_read,
         temp_blks_written
     FROM pg_stat_statements
+    WHERE dbid = (SELECT oid FROM pg_database WHERE datname = current_database())
+      AND queryid IS NOT NULL
+      AND query NOT LIKE 'SET %%'
+      AND query NOT LIKE 'RESET %%'
+      AND query NOT LIKE 'BEGIN%%'
+      AND query NOT LIKE 'COMMIT%%'
+      AND query NOT LIKE 'ROLLBACK%%'
     ORDER BY total_exec_time DESC
     LIMIT 15
 """
@@ -447,7 +485,7 @@ _PG_LOCK_WAITS = """
     SELECT
         pid,
         usename,
-        LEFT(query, 200) AS query,
+        LEFT(query, 500) AS query,
         wait_event_type,
         wait_event,
         state,
@@ -459,41 +497,345 @@ _PG_LOCK_WAITS = """
     LIMIT 20
 """
 
+# ---------------------------------------------------------------------------
+# Oracle best-practice checks
+# ---------------------------------------------------------------------------
+_ORA_ROW_CONTENTION = """
+    SELECT * FROM (
+        SELECT
+            event,
+            total_waits,
+            ROUND(time_waited / 100, 2) AS time_waited_sec,
+            ROUND(average_wait / 100, 4) AS avg_wait_sec
+        FROM v$system_event
+        WHERE event IN (
+            'enq: TX - row lock contention',
+            'enq: TX - index contention',
+            'enq: TX - allocate ITL entry',
+            'enq: TM - contention',
+            'enq: HW - contention',
+            'buffer busy waits',
+            'gc buffer busy acquire',
+            'gc buffer busy release',
+            'row cache lock',
+            'library cache lock',
+            'cursor: pin S wait on X'
+        )
+        ORDER BY time_waited DESC
+    ) WHERE ROWNUM <= 20
+"""
+
+_ORA_SEQUENCE_NO_CACHE = """
+    SELECT
+        sequence_owner,
+        sequence_name,
+        min_value,
+        max_value,
+        increment_by,
+        cache_size,
+        order_flag,
+        cycle_flag,
+        last_number
+    FROM all_sequences
+    WHERE sequence_owner NOT IN (
+        'SYS','SYSTEM','DBSNMP','OUTLN','XDB','WMSYS',
+        'CTXSYS','MDSYS','ORDSYS','ORDDATA','LBACSYS',
+        'APEX_PUBLIC_USER','FLOWS_FILES','DVSYS','AUDSYS'
+    )
+    AND (cache_size = 0 OR cache_size = 1)
+    ORDER BY sequence_owner, sequence_name
+"""
+
+_ORA_HIGH_ELAPSED_PER_EXEC = """
+    SELECT * FROM (
+        SELECT
+            sql_id,
+            plan_hash_value,
+            executions,
+            ROUND(elapsed_time / GREATEST(executions, 1) / 1e6, 4)
+                AS avg_elapsed_sec,
+            ROUND(elapsed_time / 1e6, 2) AS total_elapsed_sec,
+            buffer_gets,
+            ROUND(buffer_gets / GREATEST(executions, 1)) AS gets_per_exec,
+            SUBSTR(sql_fulltext, 1, 500) AS sql_text
+        FROM v$sql
+        WHERE executions > 0
+          AND elapsed_time / GREATEST(executions, 1) / 1e6 > 1
+          AND parsing_schema_name NOT IN (
+              'SYS','SYSTEM','DBSNMP','OUTLN','XDB','WMSYS',
+              'CTXSYS','MDSYS','ORDSYS','ORDDATA','LBACSYS',
+              'APEX_PUBLIC_USER','FLOWS_FILES','DVSYS','AUDSYS'
+          )
+        ORDER BY avg_elapsed_sec DESC
+    ) WHERE ROWNUM <= 15
+"""
+
+_ORA_HIGH_EXEC_COUNT = """
+    SELECT * FROM (
+        SELECT
+            sql_id,
+            plan_hash_value,
+            executions,
+            ROUND(elapsed_time / 1e6, 2) AS total_elapsed_sec,
+            ROUND(cpu_time / 1e6, 2) AS total_cpu_sec,
+            buffer_gets,
+            ROUND(buffer_gets / GREATEST(executions, 1)) AS gets_per_exec,
+            SUBSTR(sql_fulltext, 1, 500) AS sql_text
+        FROM v$sql
+        WHERE executions > 1000
+          AND parsing_schema_name NOT IN (
+              'SYS','SYSTEM','DBSNMP','OUTLN','XDB','WMSYS',
+              'CTXSYS','MDSYS','ORDSYS','ORDDATA','LBACSYS',
+              'APEX_PUBLIC_USER','FLOWS_FILES','DVSYS','AUDSYS'
+          )
+        ORDER BY executions DESC
+    ) WHERE ROWNUM <= 15
+"""
+
+_ORA_REDO_LOG_SWITCHES = """
+    SELECT * FROM (
+        SELECT
+            TO_CHAR(first_time, 'YYYY-MM-DD HH24') AS switch_hour,
+            COUNT(*) AS switches
+        FROM v$log_history
+        WHERE first_time > SYSDATE - 1
+        GROUP BY TO_CHAR(first_time, 'YYYY-MM-DD HH24')
+        ORDER BY switch_hour DESC
+    ) WHERE ROWNUM <= 24
+"""
+
+_ORA_TEMP_USAGE = """
+    SELECT
+        tablespace_name,
+        ROUND(SUM(bytes_used) / 1048576, 2) AS used_mb,
+        ROUND(SUM(bytes_free) / 1048576, 2) AS free_mb,
+        ROUND(SUM(bytes_used) / (SUM(bytes_used) + SUM(bytes_free)) * 100, 2)
+            AS pct_used
+    FROM v$temp_space_header
+    GROUP BY tablespace_name
+    ORDER BY pct_used DESC
+"""
+
+_ORA_PARALLEL_QUERIES = """
+    SELECT * FROM (
+        SELECT
+            sql_id,
+            users_executing,
+            px_servers_executions AS px_servers,
+            ROUND(elapsed_time / 1e6, 2) AS elapsed_sec,
+            SUBSTR(sql_fulltext, 1, 500) AS sql_text
+        FROM v$sql
+        WHERE px_servers_executions > 0
+          AND parsing_schema_name NOT IN (
+              'SYS','SYSTEM','DBSNMP','OUTLN','XDB','WMSYS',
+              'CTXSYS','MDSYS','ORDSYS','ORDDATA','LBACSYS',
+              'APEX_PUBLIC_USER','FLOWS_FILES','DVSYS','AUDSYS'
+          )
+        ORDER BY px_servers_executions DESC
+    ) WHERE ROWNUM <= 10
+"""
+
+# ---------------------------------------------------------------------------
+# PostgreSQL best-practice checks
+# ---------------------------------------------------------------------------
+_PG_HIGH_ELAPSED_PER_EXEC = """
+    SELECT
+        queryid,
+        LEFT(query, 500) AS query_text,
+        calls,
+        ROUND((total_exec_time / calls / 1000)::numeric, 4) AS avg_elapsed_sec,
+        ROUND((total_exec_time / 1000)::numeric, 2) AS total_exec_sec,
+        rows,
+        shared_blks_hit,
+        shared_blks_read,
+        temp_blks_read,
+        temp_blks_written
+    FROM pg_stat_statements
+    WHERE dbid = (SELECT oid FROM pg_database WHERE datname = current_database())
+      AND calls > 0
+      AND total_exec_time / calls / 1000 > 1
+      AND queryid IS NOT NULL
+      AND query NOT LIKE 'SET %%'
+      AND query NOT LIKE 'RESET %%'
+      AND query NOT LIKE 'BEGIN%%'
+      AND query NOT LIKE 'COMMIT%%'
+      AND query NOT LIKE 'ROLLBACK%%'
+    ORDER BY avg_elapsed_sec DESC
+    LIMIT 15
+"""
+
+_PG_HIGH_EXEC_COUNT = """
+    SELECT
+        queryid,
+        LEFT(query, 500) AS query_text,
+        calls,
+        ROUND((total_exec_time / 1000)::numeric, 2) AS total_exec_sec,
+        ROUND((mean_exec_time / 1000)::numeric, 4) AS mean_exec_sec,
+        rows,
+        shared_blks_hit + shared_blks_read AS total_blocks
+    FROM pg_stat_statements
+    WHERE dbid = (SELECT oid FROM pg_database WHERE datname = current_database())
+      AND calls > 1000
+      AND queryid IS NOT NULL
+      AND query NOT LIKE 'SET %%'
+      AND query NOT LIKE 'RESET %%'
+      AND query NOT LIKE 'BEGIN%%'
+      AND query NOT LIKE 'COMMIT%%'
+      AND query NOT LIKE 'ROLLBACK%%'
+    ORDER BY calls DESC
+    LIMIT 15
+"""
+
+_PG_BLOAT_ESTIMATE = """
+    SELECT
+        schemaname, relname,
+        n_live_tup,
+        n_dead_tup,
+        CASE WHEN n_live_tup > 0
+            THEN ROUND(n_dead_tup::numeric / n_live_tup * 100, 2)
+            ELSE 0
+        END AS dead_pct,
+        pg_relation_size(relid) / 1048576 AS table_size_mb,
+        last_autovacuum::text,
+        last_autoanalyze::text
+    FROM pg_stat_user_tables
+    WHERE n_dead_tup > 10000
+      OR (n_live_tup > 0 AND n_dead_tup::numeric / n_live_tup > 0.2)
+    ORDER BY n_dead_tup DESC
+    LIMIT 20
+"""
+
+_PG_SEQUENCE_CACHE = """
+    SELECT
+        schemaname,
+        sequencename,
+        start_value,
+        min_value,
+        max_value,
+        increment_by,
+        cache_size,
+        cycle
+    FROM pg_sequences
+    WHERE schemaname NOT IN ('pg_catalog', 'information_schema')
+      AND (cache_size IS NULL OR cache_size <= 1)
+    ORDER BY schemaname, sequencename
+"""
+
+_PG_TEMP_FILE_USAGE = """
+    SELECT
+        queryid,
+        LEFT(query, 500) AS query_text,
+        calls,
+        temp_blks_read,
+        temp_blks_written,
+        ROUND((temp_blks_read + temp_blks_written) * 8.0 / 1024, 2)
+            AS temp_mb,
+        ROUND((total_exec_time / 1000)::numeric, 2) AS total_exec_sec
+    FROM pg_stat_statements
+    WHERE dbid = (SELECT oid FROM pg_database WHERE datname = current_database())
+      AND (temp_blks_read > 0 OR temp_blks_written > 0)
+      AND queryid IS NOT NULL
+      AND query NOT LIKE 'SET %%'
+      AND query NOT LIKE 'RESET %%'
+      AND query NOT LIKE 'BEGIN%%'
+    ORDER BY temp_blks_read + temp_blks_written DESC
+    LIMIT 15
+"""
+
+_PG_CONNECTION_STATS = """
+    SELECT
+        state,
+        COUNT(*) AS count,
+        COALESCE(wait_event_type, 'None') AS wait_event_type
+    FROM pg_stat_activity
+    WHERE backend_type = 'client backend'
+    GROUP BY state, wait_event_type
+    ORDER BY count DESC
+"""
+
+_PG_CHECKPOINT_STATS = """
+    SELECT
+        checkpoints_timed,
+        checkpoints_req,
+        buffers_checkpoint,
+        buffers_clean,
+        buffers_backend,
+        maxwritten_clean,
+        ROUND(buffers_backend::numeric /
+              GREATEST(buffers_checkpoint + buffers_clean + buffers_backend, 1)
+              * 100, 2) AS backend_write_pct
+    FROM pg_stat_bgwriter
+"""
+
 ANALYSIS_SYSTEM_PROMPT = (
     "You are a senior DBA and database performance engineer performing a deep-dive "
     "analysis. You have been given detailed performance data including SQL IDs/query IDs, "
-    "execution plans, full table scans, existing indexes, and stats freshness.\n\n"
+    "execution plans, full table scans, existing indexes, stats freshness, row contention "
+    "events, sequence caching issues, and other best-practice metrics.\n\n"
     "Produce the following sections:\n\n"
     "## Executive Summary\n"
     "2-3 sentences summarising the overall database health and biggest concern.\n\n"
-    "## High-CPU / Long-Running SQL\n"
-    "For EACH problematic SQL (reference the sql_id or queryid):\n"
-    "- Quote the sql_id / queryid and a snippet of the SQL text\n"
-    "- Explain WHY it is slow (full table scan, missing index, bad stats, etc.)\n"
+    "## High Elapsed Time SQL\n"
+    "For EACH SQL with high average elapsed time per execution (reference sql_id/queryid):\n"
+    "- Quote the sql_id / queryid, avg elapsed, total elapsed, and a snippet\n"
+    "- Explain WHY it is slow (full table scan, missing index, bad join, bad stats)\n"
     "- Provide the EXACT fix SQL (CREATE INDEX, ANALYZE, rewrite, etc.)\n\n"
+    "## High Execution Count SQL\n"
+    "For SQL executed thousands of times:\n"
+    "- Even small per-execution cost adds up; flag these with sql_id/queryid\n"
+    "- Suggest caching, batching, or query consolidation where applicable\n"
+    "- Provide exact fix SQL if index or rewrite would help\n\n"
     "## Full Table Scans\n"
     "List every table being full-scanned with the sql_id causing it.\n"
     "- For each, check the existing indexes section — if an index already exists "
     "that should have been used, suggest gathering fresh stats or checking predicates.\n"
     "- If no suitable index exists, provide the exact CREATE INDEX statement.\n\n"
+    "## Row Contention & Locking Issues\n"
+    "Analyse the row contention / enqueue wait events data:\n"
+    "- Flag 'enq: TX - row lock contention' and similar events with wait times\n"
+    "- Identify the likely cause (hot blocks, ITL contention, poor sequence caching)\n"
+    "- Provide fixes: increase INITRANS, reduce transaction scope, batch commits\n\n"
+    "## Sequence Caching Issues\n"
+    "For sequences with NOCACHE or CACHE 1:\n"
+    "- Explain the performance impact (row cache lock waits, redo contention)\n"
+    "- Provide exact ALTER SEQUENCE ... CACHE 20 (or higher) statements\n"
+    "- Flag ORDER sequences that may need NOORDER for better performance\n\n"
     "## Missing / Recommended Indexes\n"
     "Based on the query patterns (WHERE, JOIN, ORDER BY columns visible in SQL text), "
     "suggest specific CREATE INDEX statements. Reference the sql_id/queryid that "
     "would benefit.\n\n"
-    "## Stale Statistics / Vacuum Issues\n"
+    "## Stale Statistics / Vacuum / Bloat Issues\n"
     "List tables with stale or missing stats. Provide exact ANALYZE / DBMS_STATS "
-    "commands. For PostgreSQL, flag tables with high dead-tuple ratios needing VACUUM.\n\n"
+    "commands. For PostgreSQL, flag tables with high dead-tuple ratios needing VACUUM "
+    "and estimate bloat. For Oracle, flag tables not analysed in 7+ days.\n\n"
+    "## Temp Space / Sort Issues\n"
+    "Flag queries spilling to temp (temp_blks_read/written for PG, sorts (disk) for "
+    "Oracle). Suggest work_mem increase, index to avoid sort, or query rewrite.\n\n"
     "## Unused Indexes\n"
     "List indexes that have never been scanned and recommend dropping them "
     "(provide DROP INDEX statements).\n\n"
+    "## Checkpoint / Redo / WAL Issues\n"
+    "For Oracle: flag excessive redo log switches (>6/hour). "
+    "For PostgreSQL: flag high backend_write_pct (buffers_backend vs checkpoint). "
+    "Suggest redo log sizing or checkpoint_completion_target tuning.\n\n"
     "## Action Plan (Priority Order)\n"
     "Numbered list of actions sorted by impact. Each action must include:\n"
-    "- The specific sql_id / queryid / table affected\n"
+    "- The specific sql_id / queryid / table / sequence affected\n"
     "- The exact SQL command to execute\n"
     "- Expected improvement\n\n"
-    "IMPORTANT: Be SPECIFIC — always reference sql_id, queryid, or table name. "
-    "Never give generic advice like 'add indexes where needed'. "
-    "Use markdown formatting with code blocks for SQL."
+    "IMPORTANT RULES:\n"
+    "1. Be SPECIFIC — always reference sql_id, queryid, or table name.\n"
+    "2. Always QUOTE the full SQL text provided in the data alongside the sql_id/queryid. "
+    "Show the complete query text so the reader can understand exactly which SQL is problematic.\n"
+    "3. Never give generic advice like 'add indexes where needed'.\n"
+    "4. Exclude all system/internal queries — focus only on user application SQL.\n"
+    "5. Use markdown formatting with code blocks for SQL.\n"
+    "6. For each problematic SQL, show it in a code block like:\n"
+    "   ```sql\n"
+    "   -- sql_id: ABC123\n"
+    "   SELECT ... (full query text from the data)\n"
+    "   ```\n"
+    "7. Then explain the issue and provide the fix SQL in another code block."
 )
 
 
@@ -608,13 +950,20 @@ class PerformanceAnalyser:
         queries = {
             "top_cpu_sql": _ORA_TOP_CPU_SQL,
             "top_elapsed_sql": _ORA_TOP_SQL,
+            "high_elapsed_per_exec": _ORA_HIGH_ELAPSED_PER_EXEC,
+            "high_execution_count": _ORA_HIGH_EXEC_COUNT,
             "full_table_scans": _ORA_FULL_TABLE_SCANS,
             "existing_indexes": _ORA_EXISTING_INDEXES,
             "stale_statistics": _ORA_STALE_STATS,
+            "row_contention": _ORA_ROW_CONTENTION,
+            "sequence_no_cache": _ORA_SEQUENCE_NO_CACHE,
             "wait_events": _ORA_WAIT_EVENTS,
             "system_stats": _ORA_SYS_STATS,
             "sga_info": _ORA_SGA,
             "tablespace_io": _ORA_TABLESPACE_IO,
+            "redo_log_switches": _ORA_REDO_LOG_SWITCHES,
+            "temp_usage": _ORA_TEMP_USAGE,
+            "parallel_queries": _ORA_PARALLEL_QUERIES,
         }
         for name, sql in queries.items():
             result = self.db_client.execute_query(sql)
@@ -705,6 +1054,8 @@ class PerformanceAnalyser:
         queries = {
             "top_cpu_queries": _PG_TOP_CPU_QUERIES,
             "top_queries": _PG_TOP_QUERIES,
+            "high_elapsed_per_exec": _PG_HIGH_ELAPSED_PER_EXEC,
+            "high_execution_count": _PG_HIGH_EXEC_COUNT,
             "seq_scan_tables": _PG_SEQ_SCAN_TABLES,
             "existing_indexes": _PG_EXISTING_INDEXES,
             "stale_stats_vacuum": _PG_STALE_STATS,
@@ -713,6 +1064,11 @@ class PerformanceAnalyser:
             "bgwriter_stats": _PG_BGWRITER,
             "unused_indexes": _PG_UNUSED_INDEXES,
             "lock_waits": _PG_LOCK_WAITS,
+            "bloat_estimate": _PG_BLOAT_ESTIMATE,
+            "sequence_cache_issues": _PG_SEQUENCE_CACHE,
+            "temp_file_usage": _PG_TEMP_FILE_USAGE,
+            "connection_stats": _PG_CONNECTION_STATS,
+            "checkpoint_stats": _PG_CHECKPOINT_STATS,
         }
         for name, sql in queries.items():
             result = self.db_client.execute_query(sql)
