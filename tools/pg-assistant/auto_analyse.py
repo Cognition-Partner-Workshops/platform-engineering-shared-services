@@ -380,12 +380,26 @@ _PG_DB_STATS = """
     WHERE datname = current_database()
 """
 
-_PG_BGWRITER = """
+# PostgreSQL < 17: checkpoint columns live in pg_stat_bgwriter.
+# PostgreSQL >= 17: they moved to pg_stat_checkpointer with renamed columns.
+_PG_BGWRITER_LEGACY = """
     SELECT
         checkpoints_timed, checkpoints_req,
         buffers_checkpoint, buffers_clean, buffers_backend,
         maxwritten_clean
     FROM pg_stat_bgwriter
+"""
+
+_PG_BGWRITER_V17 = """
+    SELECT
+        num_timed AS checkpoints_timed,
+        num_requested AS checkpoints_req,
+        buffers_written AS buffers_checkpoint,
+        bg.buffers_clean,
+        bg.buffers_alloc AS buffers_backend,
+        bg.maxwritten_clean
+    FROM pg_stat_checkpointer cp
+    CROSS JOIN pg_stat_bgwriter bg
 """
 
 _PG_UNUSED_INDEXES = """
@@ -753,7 +767,7 @@ _PG_CONNECTION_STATS = """
     ORDER BY count DESC
 """
 
-_PG_CHECKPOINT_STATS = """
+_PG_CHECKPOINT_STATS_LEGACY = """
     SELECT
         checkpoints_timed,
         checkpoints_req,
@@ -765,6 +779,21 @@ _PG_CHECKPOINT_STATS = """
               GREATEST(buffers_checkpoint + buffers_clean + buffers_backend, 1)
               * 100, 2) AS backend_write_pct
     FROM pg_stat_bgwriter
+"""
+
+_PG_CHECKPOINT_STATS_V17 = """
+    SELECT
+        cp.num_timed AS checkpoints_timed,
+        cp.num_requested AS checkpoints_req,
+        cp.buffers_written AS buffers_checkpoint,
+        bg.buffers_clean,
+        bg.buffers_alloc AS buffers_backend,
+        bg.maxwritten_clean,
+        ROUND(bg.buffers_alloc::numeric /
+              GREATEST(cp.buffers_written + bg.buffers_clean + bg.buffers_alloc, 1)
+              * 100, 2) AS backend_write_pct
+    FROM pg_stat_checkpointer cp
+    CROSS JOIN pg_stat_bgwriter bg
 """
 
 ANALYSIS_SYSTEM_PROMPT = (
@@ -1049,8 +1078,26 @@ class PerformanceAnalyser:
 
     # -- PostgreSQL collection -----------------------------------------------
 
+    def _get_pg_major_version(self) -> int:
+        """Return the PostgreSQL major version number (e.g. 14, 15, 16, 17)."""
+        result = self.db_client.execute_query(
+            "SELECT current_setting('server_version_num')::int AS ver"
+        )
+        if "error" in result:
+            return 0
+        rows = result.get("rows", [])
+        if rows:
+            # server_version_num is e.g. 170001 for 17.1, 160004 for 16.4
+            return int(rows[0].get("ver", 0)) // 10000
+        return 0
+
     def _collect_postgresql(self) -> dict[str, Any]:
         sections: dict[str, Any] = {}
+        pg_major = self._get_pg_major_version()
+        bgwriter_sql = _PG_BGWRITER_V17 if pg_major >= 17 else _PG_BGWRITER_LEGACY
+        checkpoint_sql = (
+            _PG_CHECKPOINT_STATS_V17 if pg_major >= 17 else _PG_CHECKPOINT_STATS_LEGACY
+        )
         queries = {
             "top_cpu_queries": _PG_TOP_CPU_QUERIES,
             "top_queries": _PG_TOP_QUERIES,
@@ -1061,14 +1108,14 @@ class PerformanceAnalyser:
             "stale_stats_vacuum": _PG_STALE_STATS,
             "table_stats": _PG_TABLE_STATS,
             "database_stats": _PG_DB_STATS,
-            "bgwriter_stats": _PG_BGWRITER,
+            "bgwriter_stats": bgwriter_sql,
             "unused_indexes": _PG_UNUSED_INDEXES,
             "lock_waits": _PG_LOCK_WAITS,
             "bloat_estimate": _PG_BLOAT_ESTIMATE,
             "sequence_cache_issues": _PG_SEQUENCE_CACHE,
             "temp_file_usage": _PG_TEMP_FILE_USAGE,
             "connection_stats": _PG_CONNECTION_STATS,
-            "checkpoint_stats": _PG_CHECKPOINT_STATS,
+            "checkpoint_stats": checkpoint_sql,
         }
         for name, sql in queries.items():
             result = self.db_client.execute_query(sql)
