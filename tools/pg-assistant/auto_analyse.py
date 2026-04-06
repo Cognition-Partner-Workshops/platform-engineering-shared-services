@@ -796,47 +796,449 @@ _PG_CHECKPOINT_STATS_V17 = """
     CROSS JOIN pg_stat_bgwriter bg
 """
 
-# Instruction block appended AFTER the data in the prompt.
-# codellama is a completion model — it works best when instructions follow
-# the data so it "completes" the report rather than fabricating from the
-# system prompt.
-_ANALYSIS_INSTRUCTION = (
-    "\n\n"
-    "=" * 60 + "\n"
-    "TASK: Analyse the REAL data above. Write a report that ONLY references "
-    "the sql_ids, queryids, table names, and SQL text shown above. "
-    "Do NOT invent any IDs, table names, or queries.\n\n"
-    "For each section below, if the data above has no relevant rows, "
-    "write 'No issues found.' and move on.\n\n"
-    "## Executive Summary\n"
-    "2-3 sentences about the biggest issues found in the data above.\n\n"
-    "## High Elapsed Time SQL\n"
-    "List each sql_id/queryid from the HIGH ELAPSED PER EXEC section above. "
-    "Copy its query_text. Explain why it is slow and give a CREATE INDEX or fix.\n\n"
-    "## High Execution Count SQL\n"
-    "List each sql_id/queryid from the HIGH EXECUTION COUNT section above. "
-    "Copy its query_text. Suggest caching or indexing.\n\n"
-    "## Full Table Scans\n"
-    "List tables from the SEQ SCAN TABLES section above with high seq_scan counts. "
-    "Suggest CREATE INDEX statements using real column names.\n\n"
-    "## Row Contention & Locking\n"
-    "List events from ROW CONTENTION or LOCK WAITS sections above. Suggest fixes.\n\n"
-    "## Sequence Caching Issues\n"
-    "List sequences from SEQUENCE CACHE ISSUES section above. "
-    "Give ALTER SEQUENCE ... CACHE 20 statements.\n\n"
-    "## Missing / Recommended Indexes\n"
-    "Based on query WHERE/JOIN columns visible in the SQL text above, "
-    "suggest specific CREATE INDEX statements.\n\n"
-    "## Stale Statistics / Vacuum / Bloat\n"
-    "List tables from STALE STATS or BLOAT ESTIMATE sections above. "
-    "Give ANALYZE or VACUUM commands.\n\n"
-    "## Unused Indexes\n"
-    "List indexes from UNUSED INDEXES section above. Give DROP INDEX statements.\n\n"
-    "## Checkpoint / WAL Issues\n"
-    "Review CHECKPOINT STATS and BGWRITER STATS sections above. Flag any issues.\n\n"
-    "## Action Plan\n"
-    "Numbered list of fixes sorted by impact, using ONLY data from above.\n"
-)
+# ---------------------------------------------------------------------------
+# Programmatic analysis — Python code does the heavy lifting, not the LLM.
+# ---------------------------------------------------------------------------
+
+
+def _safe_float(val: Any, default: float = 0.0) -> float:
+    """Safely convert a value to float."""
+    try:
+        return float(val)
+    except (TypeError, ValueError):
+        return default
+
+
+def _safe_int(val: Any, default: int = 0) -> int:
+    """Safely convert a value to int."""
+    try:
+        return int(val)
+    except (TypeError, ValueError):
+        return default
+
+
+def _truncate_sql(sql_text: str, length: int = 200) -> str:
+    """Truncate SQL text for display."""
+    if not sql_text:
+        return "(no SQL text)"
+    sql_text = str(sql_text).strip()
+    if len(sql_text) > length:
+        return sql_text[:length] + "..."
+    return sql_text
+
+
+def _build_findings_report(data: dict[str, Any]) -> str:
+    """Analyse collected data programmatically and build a markdown report.
+
+    This function does the actual analysis in Python code — identifying
+    problematic SQL, full table scans, missing indexes, etc. from the
+    real data. No LLM is involved in finding issues.
+    """
+    db_type = data.get("db_type", "unknown")
+    is_oracle = db_type == DB_TYPE_ORACLE
+    parts: list[str] = []
+    action_items: list[str] = []
+    action_idx = 0
+
+    parts.append(f"# Performance Analysis Report ({db_type.upper()})")
+    parts.append("")
+
+    # --- High Elapsed Time SQL ------------------------------------------------
+    section_key = "high_elapsed_per_exec"
+    rows = _get_rows(data, section_key)
+    parts.append("## High Elapsed Time SQL")
+    if not rows:
+        parts.append("No issues found.\n")
+    else:
+        parts.append("")
+        for row in rows:
+            sid = row.get("sql_id") or row.get("queryid") or "?"
+            avg_elapsed = _safe_float(row.get("avg_elapsed_sec", 0))
+            total_elapsed = _safe_float(
+                row.get("total_elapsed_sec") or row.get("total_exec_sec", 0)
+            )
+            execs = _safe_int(row.get("executions") or row.get("calls", 0))
+            sql_text = str(row.get("sql_text") or row.get("query_text") or "")
+            gets = _safe_int(row.get("buffer_gets") or row.get("shared_blks_read", 0))
+            parts.append(
+                f"**{'sql_id' if is_oracle else 'queryid'}: `{sid}`** — "
+                f"avg {avg_elapsed:.4f}s/exec, {execs} executions, "
+                f"total {total_elapsed:.2f}s, buffer gets/reads: {gets}"
+            )
+            if sql_text:
+                parts.append(f"```sql\n{_truncate_sql(sql_text, 300)}\n```")
+            action_idx += 1
+            action_items.append(
+                f"{action_idx}. **[HIGH ELAPSED]** Investigate `{sid}` "
+                f"(avg {avg_elapsed:.4f}s/exec). Consider adding indexes on "
+                f"columns used in WHERE/JOIN clauses."
+            )
+        parts.append("")
+
+    # --- High Execution Count SQL ---------------------------------------------
+    section_key = "high_execution_count"
+    rows = _get_rows(data, section_key)
+    parts.append("## High Execution Count SQL")
+    if not rows:
+        parts.append("No issues found.\n")
+    else:
+        parts.append("")
+        for row in rows:
+            sid = row.get("sql_id") or row.get("queryid") or "?"
+            execs = _safe_int(row.get("executions") or row.get("calls", 0))
+            total_elapsed = _safe_float(
+                row.get("total_elapsed_sec") or row.get("total_exec_sec", 0)
+            )
+            sql_text = str(row.get("sql_text") or row.get("query_text") or "")
+            parts.append(
+                f"**{'sql_id' if is_oracle else 'queryid'}: `{sid}`** — "
+                f"{execs:,} executions, total {total_elapsed:.2f}s"
+            )
+            if sql_text:
+                parts.append(f"```sql\n{_truncate_sql(sql_text, 300)}\n```")
+            if execs > 100000:
+                action_idx += 1
+                action_items.append(
+                    f"{action_idx}. **[HIGH EXEC COUNT]** `{sid}` executed "
+                    f"{execs:,} times. Consider caching results or batching."
+                )
+        parts.append("")
+
+    # --- Full Table Scans -----------------------------------------------------
+    fts_key = "full_table_scans" if is_oracle else "seq_scan_tables"
+    rows = _get_rows(data, fts_key)
+    parts.append("## Full Table Scans")
+    if not rows:
+        parts.append("No issues found.\n")
+    else:
+        parts.append("")
+        for row in rows:
+            if is_oracle:
+                table = row.get("table_name", "?")
+                owner = row.get("object_owner", "")
+                sid = row.get("sql_id", "?")
+                execs = _safe_int(row.get("executions", 0))
+                sql_text = str(row.get("sql_text") or "")
+                parts.append(
+                    f"**Table: `{owner}.{table}`** — sql_id: `{sid}`, "
+                    f"{execs} executions"
+                )
+                if sql_text:
+                    parts.append(f"```sql\n{_truncate_sql(sql_text, 300)}\n```")
+                action_idx += 1
+                action_items.append(
+                    f"{action_idx}. **[FULL TABLE SCAN]** `{owner}.{table}` "
+                    f"via sql_id `{sid}`. Review query and add appropriate index."
+                )
+            else:
+                table = row.get("relname", "?")
+                schema = row.get("schemaname", "public")
+                seq_scans = _safe_int(row.get("seq_scan", 0))
+                seq_reads = _safe_int(row.get("seq_tup_read", 0))
+                idx_scans = _safe_int(row.get("idx_scan", 0))
+                live_tup = _safe_int(row.get("n_live_tup", 0))
+                size_mb = _safe_float(row.get("table_size_mb", 0))
+                parts.append(
+                    f"**Table: `{schema}.{table}`** — "
+                    f"{seq_scans:,} seq scans, {seq_reads:,} rows read, "
+                    f"{idx_scans:,} idx scans, {live_tup:,} live rows, "
+                    f"{size_mb:.1f} MB"
+                )
+                if seq_scans > 100 and live_tup > 10000:
+                    action_idx += 1
+                    action_items.append(
+                        f"{action_idx}. **[SEQ SCAN]** `{schema}.{table}` has "
+                        f"{seq_scans:,} seq scans on {live_tup:,} rows. "
+                        f"Add indexes on frequently filtered columns."
+                    )
+        parts.append("")
+
+    # --- Row Contention & Locking ---------------------------------------------
+    contention_key = "row_contention" if is_oracle else "lock_waits"
+    rows = _get_rows(data, contention_key)
+    parts.append("## Row Contention & Locking")
+    if not rows:
+        parts.append("No issues found.\n")
+    else:
+        parts.append("")
+        for row in rows:
+            if is_oracle:
+                event = row.get("event", "?")
+                waits = _safe_int(row.get("total_waits", 0))
+                waited_sec = _safe_float(row.get("time_waited_sec", 0))
+                parts.append(
+                    f"**Event: `{event}`** — {waits:,} waits, "
+                    f"{waited_sec:.2f}s total wait time"
+                )
+                if waited_sec > 1:
+                    action_idx += 1
+                    action_items.append(
+                        f"{action_idx}. **[CONTENTION]** `{event}` — "
+                        f"{waited_sec:.2f}s total. Reduce hot-row updates, "
+                        f"increase INITRANS, or tune locking strategy."
+                    )
+            else:
+                pid = row.get("pid", "?")
+                user = row.get("usename", "?")
+                event = row.get("wait_event", "?")
+                event_type = row.get("wait_event_type", "")
+                running_sec = _safe_float(row.get("running_sec", 0))
+                query = str(row.get("query") or "")
+                parts.append(
+                    f"**PID {pid}** (user: {user}) — wait: {event_type}/{event}, "
+                    f"running {running_sec:.2f}s"
+                )
+                if query:
+                    parts.append(f"```sql\n{_truncate_sql(query, 200)}\n```")
+        parts.append("")
+
+    # --- Sequence Caching Issues -----------------------------------------------
+    seq_key = "sequence_no_cache" if is_oracle else "sequence_cache_issues"
+    rows = _get_rows(data, seq_key)
+    parts.append("## Sequence Caching Issues")
+    if not rows:
+        parts.append("No issues found.\n")
+    else:
+        parts.append("")
+        for row in rows:
+            if is_oracle:
+                owner = row.get("sequence_owner", "")
+                name = row.get("sequence_name", "?")
+                cache = _safe_int(row.get("cache_size", 0))
+                parts.append(
+                    f"**`{owner}.{name}`** — cache_size={cache} (should be >= 20)"
+                )
+                action_idx += 1
+                action_items.append(
+                    f"{action_idx}. **[SEQUENCE]** "
+                    f"`ALTER SEQUENCE {owner}.{name} CACHE 20;`"
+                )
+            else:
+                schema = row.get("schemaname", "public")
+                name = row.get("sequencename", "?")
+                cache = _safe_int(row.get("cache_size") or 0)
+                parts.append(
+                    f"**`{schema}.{name}`** — cache_size={cache} (should be >= 20)"
+                )
+                action_idx += 1
+                action_items.append(
+                    f"{action_idx}. **[SEQUENCE]** "
+                    f"`ALTER SEQUENCE {schema}.{name} CACHE 20;`"
+                )
+        parts.append("")
+
+    # --- Stale Statistics / Vacuum / Bloat ------------------------------------
+    if is_oracle:
+        rows = _get_rows(data, "stale_statistics")
+    else:
+        rows = _get_rows(data, "stale_stats_vacuum") + _get_rows(data, "bloat_estimate")
+        # Deduplicate by table name
+        seen_tables: set[str] = set()
+        deduped: list[dict[str, Any]] = []
+        for r in rows:
+            key = f"{r.get('schemaname', '')}.{r.get('relname', '')}"
+            if key not in seen_tables:
+                seen_tables.add(key)
+                deduped.append(r)
+        rows = deduped
+
+    parts.append("## Stale Statistics / Vacuum / Bloat")
+    if not rows:
+        parts.append("No issues found.\n")
+    else:
+        parts.append("")
+        for row in rows:
+            if is_oracle:
+                table = row.get("table_name", "?")
+                num_rows = _safe_int(row.get("num_rows", 0))
+                stale = row.get("stale_stats", "?")
+                last_analyzed = row.get("last_analyzed", "never")
+                days = _safe_float(row.get("days_since_analyzed", 0))
+                parts.append(
+                    f"**`{table}`** — {num_rows:,} rows, stale={stale}, "
+                    f"last analyzed: {last_analyzed} ({days:.0f} days ago)"
+                )
+                action_idx += 1
+                action_items.append(
+                    f"{action_idx}. **[STALE STATS]** "
+                    f"`EXEC DBMS_STATS.GATHER_TABLE_STATS"
+                    f"(ownname=>USER, tabname=>'{table}');`"
+                )
+            else:
+                schema = row.get("schemaname", "public")
+                table = row.get("relname", "?")
+                dead = _safe_int(row.get("n_dead_tup", 0))
+                live = _safe_int(row.get("n_live_tup", 0))
+                dead_pct = _safe_float(row.get("dead_pct", 0))
+                last_vac = (
+                    row.get("last_autovacuum") or row.get("last_vacuum") or "never"
+                )
+                last_analyze = (
+                    row.get("last_autoanalyze") or row.get("last_analyze") or "never"
+                )
+                parts.append(
+                    f"**`{schema}.{table}`** — {live:,} live, {dead:,} dead "
+                    f"({dead_pct:.1f}% bloat), last vacuum: {last_vac}, "
+                    f"last analyze: {last_analyze}"
+                )
+                if dead_pct > 20 or dead > 50000:
+                    action_idx += 1
+                    action_items.append(
+                        f"{action_idx}. **[BLOAT]** `VACUUM ANALYZE {schema}.{table};` "
+                        f"— {dead_pct:.1f}% dead tuples"
+                    )
+                elif str(last_analyze) == "never" or str(last_analyze) == "None":
+                    action_idx += 1
+                    action_items.append(
+                        f"{action_idx}. **[STALE STATS]** "
+                        f"`ANALYZE {schema}.{table};` — never analyzed"
+                    )
+        parts.append("")
+
+    # --- Unused Indexes -------------------------------------------------------
+    rows = _get_rows(data, "unused_indexes")
+    parts.append("## Unused Indexes")
+    if not rows:
+        parts.append("No issues found.\n")
+    else:
+        parts.append("")
+        for row in rows:
+            schema = row.get("schemaname", "public")
+            table = row.get("relname", "?")
+            idx_name = row.get("indexrelname", "?")
+            size_mb = _safe_float(row.get("index_size_mb", 0))
+            parts.append(
+                f"**`{schema}.{idx_name}`** on `{table}` — {size_mb:.1f} MB, 0 scans"
+            )
+            if size_mb > 1:
+                action_idx += 1
+                action_items.append(
+                    f"{action_idx}. **[UNUSED INDEX]** "
+                    f"`DROP INDEX {schema}.{idx_name};` — "
+                    f"{size_mb:.1f} MB wasted"
+                )
+        parts.append("")
+
+    # --- Checkpoint / WAL Issues (PostgreSQL) ---------------------------------
+    if not is_oracle:
+        cp_rows = _get_rows(data, "checkpoint_stats")
+        parts.append("## Checkpoint / WAL Issues")
+        has_issue = False
+        if cp_rows:
+            row = cp_rows[0]
+            backend_pct = _safe_float(row.get("backend_write_pct", 0))
+            req = _safe_int(row.get("checkpoints_req", 0))
+            timed = _safe_int(row.get("checkpoints_timed", 0))
+            parts.append(
+                f"Checkpoints: {timed} timed, {req} requested. "
+                f"Backend write %: {backend_pct:.1f}%"
+            )
+            if backend_pct > 10:
+                has_issue = True
+                action_idx += 1
+                action_items.append(
+                    f"{action_idx}. **[CHECKPOINT]** Backend writes are "
+                    f"{backend_pct:.1f}% of total — increase "
+                    f"`shared_buffers` and `checkpoint_completion_target`."
+                )
+            if req > timed and timed > 0:
+                has_issue = True
+                action_idx += 1
+                action_items.append(
+                    f"{action_idx}. **[CHECKPOINT]** More requested ({req}) than "
+                    f"timed ({timed}) checkpoints — increase `max_wal_size`."
+                )
+        if not has_issue:
+            parts.append("No issues found.")
+        parts.append("")
+
+    # --- Wait Events (Oracle) -------------------------------------------------
+    if is_oracle:
+        rows = _get_rows(data, "wait_events")
+        parts.append("## Top Wait Events")
+        if not rows:
+            parts.append("No issues found.\n")
+        else:
+            parts.append("")
+            for row in rows[:10]:
+                event = row.get("event", "?")
+                waits = _safe_int(row.get("total_waits", 0))
+                waited = _safe_float(row.get("time_waited_sec", 0))
+                parts.append(f"- **`{event}`** — {waits:,} waits, {waited:.2f}s")
+            parts.append("")
+
+    # --- Temp File Usage (PostgreSQL) -----------------------------------------
+    if not is_oracle:
+        rows = _get_rows(data, "temp_file_usage")
+        if rows:
+            parts.append("## Temp File Usage")
+            parts.append("")
+            for row in rows[:5]:
+                sid = row.get("queryid", "?")
+                temp_mb = _safe_float(row.get("temp_mb", 0))
+                sql_text = str(row.get("query_text") or "")
+                parts.append(f"**queryid: `{sid}`** — {temp_mb:.1f} MB temp usage")
+                if sql_text:
+                    parts.append(f"```sql\n{_truncate_sql(sql_text, 200)}\n```")
+                if temp_mb > 100:
+                    action_idx += 1
+                    action_items.append(
+                        f"{action_idx}. **[TEMP FILES]** queryid `{sid}` uses "
+                        f"{temp_mb:.1f} MB temp. Increase `work_mem` or optimize "
+                        f"sort/join."
+                    )
+            parts.append("")
+
+    # --- Executive Summary & Action Plan --------------------------------------
+    summary_parts: list[str] = []
+    high_elapsed = _get_rows(data, "high_elapsed_per_exec")
+    high_exec = _get_rows(data, "high_execution_count")
+    fts = _get_rows(data, "full_table_scans" if is_oracle else "seq_scan_tables")
+    contention = _get_rows(data, "row_contention" if is_oracle else "lock_waits")
+    seqs = _get_rows(
+        data, "sequence_no_cache" if is_oracle else "sequence_cache_issues"
+    )
+
+    if high_elapsed:
+        summary_parts.append(
+            f"{len(high_elapsed)} queries with high elapsed time per execution"
+        )
+    if high_exec:
+        summary_parts.append(
+            f"{len(high_exec)} queries with very high execution counts"
+        )
+    if fts:
+        summary_parts.append(
+            f"{len(fts)} {'full table scans' if is_oracle else 'tables with heavy seq scans'}"
+        )
+    if contention:
+        summary_parts.append(f"{len(contention)} contention/lock wait events")
+    if seqs:
+        summary_parts.append(f"{len(seqs)} sequences with no/low caching")
+
+    exec_summary = (
+        "Found: " + "; ".join(summary_parts) + "."
+        if summary_parts
+        else "No significant performance issues detected."
+    )
+
+    # Build final report: summary at top, then sections, then action plan
+    header = [f"## Executive Summary\n{exec_summary}\n"]
+    footer = ["\n## Action Plan (Priority Order)\n"]
+    if action_items:
+        footer.extend(action_items)
+    else:
+        footer.append("No action items — database appears healthy.")
+
+    return "\n".join(header + parts + footer)
+
+
+def _get_rows(data: dict[str, Any], key: str) -> list[dict[str, Any]]:
+    """Safely extract a list of row dicts from collected data."""
+    val = data.get(key, [])
+    if isinstance(val, list):
+        return val
+    return []
 
 
 # ---------------------------------------------------------------------------
@@ -915,24 +1317,45 @@ class PerformanceAnalyser:
     # -- internal helpers ----------------------------------------------------
 
     def _run_llm_analysis(self, raw_data: dict[str, Any]) -> dict[str, Any]:
+        # Programmatic analysis — Python code identifies all issues.
+        findings_report = _build_findings_report(raw_data)
         report_text = self._format_report(raw_data)
-        # Append instructions AFTER the data so codellama "completes" a
-        # real analysis rather than hallucinating from a system prompt.
-        full_prompt = report_text + _ANALYSIS_INSTRUCTION
+
+        # Ask the LLM for a brief supplementary summary only.
+        llm_summary = ""
         try:
-            llm_response = self.llm_client.generate(prompt=full_prompt)
+            llm_prompt = (
+                findings_report + "\n\n---\n"
+                "Based on the findings above, write 3-5 sentences summarising "
+                "the most critical issues and what the DBA should do first. "
+                "Do NOT repeat the full report. Do NOT invent new findings."
+            )
+            llm_summary = self.llm_client.generate(prompt=llm_prompt)
         except (ConnectionError, RuntimeError) as exc:
-            llm_response = f"LLM analysis failed: {exc}"
+            llm_summary = f"(LLM summary unavailable: {exc})"
+
+        # Combine: programmatic findings + optional LLM summary
+        analysis = findings_report
+        if llm_summary:
+            analysis += f"\n\n---\n## LLM Summary\n{llm_summary}"
+
         return {
             "raw_data": raw_data,
             "report_text": report_text,
-            "analysis": llm_response,
+            "analysis": analysis,
         }
 
     def _run_llm_analysis_from_text(self, report_text: str) -> dict[str, Any]:
-        full_prompt = report_text + _ANALYSIS_INSTRUCTION
+        # For uploaded reports, we still need the LLM since we don't
+        # have structured data — but we keep the prompt minimal.
+        llm_prompt = (
+            report_text + "\n\n---\n"
+            "Summarise the key performance issues in the report above. "
+            "Only reference data that actually appears above. "
+            "Do NOT invent sql_ids, table names, or metrics."
+        )
         try:
-            llm_response = self.llm_client.generate(prompt=full_prompt)
+            llm_response = self.llm_client.generate(prompt=llm_prompt)
         except (ConnectionError, RuntimeError) as exc:
             llm_response = f"LLM analysis failed: {exc}"
         return {

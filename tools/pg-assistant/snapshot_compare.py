@@ -281,11 +281,19 @@ class SnapshotComparator:
         # Build delta summary table
         delta_table = self._build_delta_table(data_a, data_b, label_a, label_b)
 
-        # LLM comparison summary
+        # Programmatic comparison — Python code identifies all changes.
+        findings = self._build_programmatic_comparison(
+            data_a, data_b, label_a, label_b, delta_table
+        )
+
+        # Optional LLM summary appended after the real findings.
         comparison_text = self._format_comparison_text(
             data_a, data_b, label_a, label_b, delta_table
         )
-        analysis = self._get_llm_comparison(comparison_text)
+        llm_summary = self._get_llm_comparison(comparison_text)
+        analysis = findings
+        if llm_summary:
+            analysis += f"\n\n---\n## LLM Summary\n{llm_summary}"
 
         return {
             "figures": figures,
@@ -855,28 +863,144 @@ class SnapshotComparator:
         return "\n".join(parts)
 
     def _get_llm_comparison(self, text: str) -> str:
-        # Append instructions AFTER the data so codellama "completes" a
-        # real analysis rather than hallucinating from a system prompt.
-        instruction = (
-            "\n\n" + "=" * 60 + "\n"
-            "TASK: Compare the two snapshots above. Write a report that ONLY "
-            "references sql_ids, queryids, table names, and SQL text shown above. "
-            "Do NOT invent any IDs, table names, or queries.\n\n"
-            "## Executive Summary\n"
-            "What changed between Snapshot A and Snapshot B?\n\n"
-            "## Key Metric Changes\n"
-            "List metrics from the DELTA SUMMARY above that changed >10%.\n\n"
-            "## New or Regressed SQL\n"
-            "SQL that appeared or got worse in Snapshot B. Copy query_text.\n\n"
-            "## Wait Event Changes\n"
-            "Wait events that increased or decreased between snapshots.\n\n"
-            "## Recommendations\n"
-            "Numbered action plan using ONLY data from above.\n"
-        )
+        # Build programmatic comparison findings first, then ask LLM
+        # for a brief summary only.
         try:
-            return self.llm.generate(prompt=text + instruction)
+            llm_prompt = (
+                text + "\n\n---\n"
+                "Based on the snapshot comparison data above, write 3-5 sentences "
+                "summarising what changed and what the DBA should investigate. "
+                "Do NOT invent any sql_ids, table names, or metrics."
+            )
+            return self.llm.generate(prompt=llm_prompt)
         except (ConnectionError, RuntimeError) as exc:
-            return f"LLM comparison analysis failed: {exc}"
+            return f"LLM comparison summary unavailable: {exc}"
+
+    def _build_programmatic_comparison(
+        self,
+        data_a: dict[str, Any],
+        data_b: dict[str, Any],
+        label_a: str,
+        label_b: str,
+        delta_table: list[dict[str, Any]],
+    ) -> str:
+        """Build a programmatic comparison report from real data."""
+        parts: list[str] = []
+        action_items: list[str] = []
+        action_idx = 0
+
+        parts.append("# Snapshot Comparison Analysis")
+        parts.append(f"**{label_a}** vs **{label_b}**\n")
+
+        # --- Key Metric Changes -----------------------------------------------
+        parts.append("## Key Metric Changes")
+        parts.append("")
+        significant = [r for r in delta_table if abs(float(str(r.get("delta", 0)))) > 0]
+        if not significant:
+            parts.append("No significant metric changes.\n")
+        else:
+            for row in significant:
+                metric = row.get("metric", "?")
+                val_a = row.get(label_a, 0)
+                val_b = row.get(label_b, 0)
+                delta = row.get("delta", 0)
+                pct = row.get("change_pct", "0%")
+                parts.append(
+                    f"- **{metric}**: {val_a} → {val_b} (delta: {delta}, {pct})"
+                )
+            parts.append("")
+
+        # --- Regressed / New SQL -----------------------------------------------
+        parts.append("## New or Regressed SQL")
+        sql_a = {
+            str(r.get("sql_id") or r.get("queryid", "")): r
+            for r in data_a.get("top_sql", [])
+        }
+        sql_b = {
+            str(r.get("sql_id") or r.get("queryid", "")): r
+            for r in data_b.get("top_sql", [])
+        }
+        id_key = "sql_id" if self.is_oracle else "queryid"
+        regressed: list[str] = []
+        for sid, row_b in sql_b.items():
+            if not sid:
+                continue
+            elapsed_b = float(row_b.get("elapsed_sec", 0))
+            sql_text = str(row_b.get("sql_text") or row_b.get("query_text") or "")
+            if sid in sql_a:
+                elapsed_a = float(sql_a[sid].get("elapsed_sec", 0))
+                if elapsed_a > 0 and elapsed_b > elapsed_a * 1.2:
+                    pct_change = ((elapsed_b - elapsed_a) / elapsed_a) * 100
+                    parts.append(
+                        f"**{id_key}: `{sid}`** — elapsed "
+                        f"{elapsed_a:.2f}s → {elapsed_b:.2f}s "
+                        f"(+{pct_change:.0f}%)"
+                    )
+                    if sql_text:
+                        parts.append(f"```sql\n{sql_text[:200]}\n```")
+                    regressed.append(sid)
+                    action_idx += 1
+                    action_items.append(
+                        f"{action_idx}. **[REGRESSED]** `{sid}` elapsed time "
+                        f"increased {pct_change:.0f}%. Investigate plan change."
+                    )
+            else:
+                parts.append(
+                    f"**{id_key}: `{sid}`** — NEW in snapshot B, "
+                    f"elapsed {elapsed_b:.2f}s"
+                )
+                if sql_text:
+                    parts.append(f"```sql\n{sql_text[:200]}\n```")
+                regressed.append(sid)
+
+        if not regressed:
+            parts.append("No new or regressed SQL detected.\n")
+        parts.append("")
+
+        # --- Wait Event Changes ------------------------------------------------
+        parts.append("## Wait Event Changes")
+        waits_a = {
+            str(r.get("event", "")): float(r.get("time_waited_sec", 0))
+            for r in data_a.get("wait_events", [])
+        }
+        waits_b = {
+            str(r.get("event", "")): float(r.get("time_waited_sec", 0))
+            for r in data_b.get("wait_events", [])
+        }
+        wait_changes: list[str] = []
+        all_events = set(list(waits_a.keys()) + list(waits_b.keys()))
+        for evt in sorted(all_events):
+            wa = waits_a.get(evt, 0)
+            wb = waits_b.get(evt, 0)
+            if wa == 0 and wb == 0:
+                continue
+            delta = wb - wa
+            if abs(delta) > 1:
+                direction = "↑" if delta > 0 else "↓"
+                parts.append(
+                    f"- **`{evt}`**: {wa:.2f}s → {wb:.2f}s "
+                    f"({direction}{abs(delta):.2f}s)"
+                )
+                wait_changes.append(evt)
+                if delta > 10:
+                    action_idx += 1
+                    action_items.append(
+                        f"{action_idx}. **[WAIT EVENT]** `{evt}` increased "
+                        f"by {delta:.2f}s. Investigate root cause."
+                    )
+
+        if not wait_changes:
+            parts.append("No significant wait event changes.\n")
+        parts.append("")
+
+        # --- Action Plan -------------------------------------------------------
+        parts.append("## Recommendations")
+        if action_items:
+            parts.extend(action_items)
+        else:
+            parts.append("No significant regressions detected between snapshots.")
+
+        return "\n".join(parts)
 
 
 def _fmt(row: dict[str, Any]) -> str:
