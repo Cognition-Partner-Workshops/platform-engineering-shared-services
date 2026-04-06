@@ -10,6 +10,7 @@ import csv
 import io
 import logging
 import re
+from html.parser import HTMLParser
 from typing import Any
 
 from db_client import BaseDBClient, DB_TYPE_ORACLE, DB_TYPE_POSTGRESQL
@@ -2178,9 +2179,8 @@ class PerformanceAnalyser:
     def analyse_uploaded_report(
         self, file_content: str, file_name: str
     ) -> dict[str, Any]:
-        """Parse an uploaded report file and display it."""
-        parsed = parse_uploaded_report(file_content, file_name)
-        return self._run_uploaded_report_analysis(parsed)
+        """Parse an uploaded report file and run programmatic analysis."""
+        return self._run_uploaded_report_analysis(file_content, file_name)
 
     def list_awr_snapshots(self) -> list[dict[str, Any]]:
         """Return available AWR snapshots from DBA_HIST_SNAPSHOT."""
@@ -2230,18 +2230,31 @@ class PerformanceAnalyser:
             "analysis": findings_report,
         }
 
-    def _run_uploaded_report_analysis(self, report_text: str) -> dict[str, Any]:
-        # For uploaded reports we cannot do structured analysis.
-        # Display the parsed text as-is — no LLM involved.
+    def _run_uploaded_report_analysis(
+        self, file_content: str, file_name: str
+    ) -> dict[str, Any]:
+        # Try to parse into structured data for programmatic analysis.
+        structured = parse_uploaded_report_structured(file_content, file_name)
+        if structured:
+            findings_report = _build_findings_report(structured)
+            report_text = self._format_report(structured)
+            return {
+                "raw_data": structured,
+                "report_text": report_text,
+                "analysis": findings_report,
+            }
+        # Fallback: display parsed text as-is
+        parsed_text = parse_uploaded_report(file_content, file_name)
         return {
             "raw_data": {},
-            "report_text": report_text,
+            "report_text": parsed_text,
             "analysis": (
                 "## Uploaded Report\n\n"
+                "Could not extract structured data from this report format. "
                 "The parsed report content is shown below. "
                 "For detailed programmatic analysis, use **Live** mode "
                 "which queries the database directly.\n\n"
-                "---\n\n" + report_text[:8000]
+                "---\n\n" + parsed_text[:8000]
             ),
         }
 
@@ -2576,3 +2589,764 @@ def _parse_text_report(content: str, file_name: str) -> str:
         parts.append(content)
 
     return "\n".join(parts)
+
+
+# ---------------------------------------------------------------------------
+# Structured report parsing — extract data into dict for _build_findings_report
+# ---------------------------------------------------------------------------
+
+
+class _HTMLTableExtractor(HTMLParser):
+    """Extract all HTML tables as list of list-of-dicts (header→value)."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.tables: list[list[dict[str, str]]] = []
+        self._in_table = False
+        self._in_thead = False
+        self._in_row = False
+        self._in_cell = False
+        self._headers: list[str] = []
+        self._current_row: list[str] = []
+        self._current_rows: list[list[str]] = []
+        self._cell_text = ""
+        self._current_headers: list[str] = []
+        # Track section headers (h1-h4, caption) preceding each table
+        self._section_headers: list[str] = []
+        self._last_heading = ""
+        self._in_heading = False
+        self._heading_text = ""
+
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        tag = tag.lower()
+        if tag == "table":
+            self._in_table = True
+            self._headers = []
+            self._current_rows = []
+            self._current_headers = []
+        elif tag == "thead":
+            self._in_thead = True
+        elif tag == "tr":
+            self._in_row = True
+            self._current_row = []
+        elif tag in ("td", "th"):
+            self._in_cell = True
+            self._cell_text = ""
+        elif tag in ("h1", "h2", "h3", "h4", "caption"):
+            self._in_heading = True
+            self._heading_text = ""
+
+    def handle_endtag(self, tag: str) -> None:
+        tag = tag.lower()
+        if tag == "table":
+            self._in_table = False
+            if self._current_headers and self._current_rows:
+                rows = []
+                for raw in self._current_rows:
+                    row_dict: dict[str, str] = {}
+                    for i, hdr in enumerate(self._current_headers):
+                        row_dict[hdr] = raw[i] if i < len(raw) else ""
+                    rows.append(row_dict)
+                self.tables.append(rows)
+                self._section_headers.append(self._last_heading)
+        elif tag == "thead":
+            self._in_thead = False
+        elif tag == "tr":
+            self._in_row = False
+            if self._in_thead or (not self._current_headers and self._current_row):
+                self._current_headers = [c.strip().lower() for c in self._current_row]
+            elif self._current_headers:
+                self._current_rows.append(self._current_row)
+        elif tag in ("td", "th"):
+            self._in_cell = False
+            self._current_row.append(self._cell_text.strip())
+        elif tag in ("h1", "h2", "h3", "h4", "caption"):
+            self._in_heading = False
+            self._last_heading = self._heading_text.strip().lower()
+
+    def handle_data(self, data: str) -> None:
+        if self._in_cell:
+            self._cell_text += data
+        if self._in_heading:
+            self._heading_text += data
+
+
+def _extract_html_tables(
+    html: str,
+) -> list[tuple[str, list[dict[str, str]]]]:
+    """Return list of (section_heading, rows) from HTML tables."""
+    parser = _HTMLTableExtractor()
+    parser.feed(html)
+    result: list[tuple[str, list[dict[str, str]]]] = []
+    for i, table_rows in enumerate(parser.tables):
+        heading = parser._section_headers[i] if i < len(parser._section_headers) else ""
+        result.append((heading, table_rows))
+    return result
+
+
+def _match_heading(heading: str, *keywords: str) -> bool:
+    """Check if heading contains ALL given keywords (case-insensitive)."""
+    h = heading.lower()
+    return all(k in h for k in keywords)
+
+
+def _parse_pgprofile_structured(html: str) -> dict[str, Any] | None:
+    """Parse pgProfile HTML report into structured dict for analysis."""
+    tables = _extract_html_tables(html)
+    if not tables:
+        return None
+
+    sections: dict[str, Any] = {"db_type": DB_TYPE_POSTGRESQL}
+    found_any = False
+
+    for heading, rows in tables:
+        if not rows:
+            continue
+
+        # --- Top SQL by elapsed time ---
+        if _match_heading(heading, "sql", "elapsed") or _match_heading(
+            heading, "top", "elapsed"
+        ):
+            mapped = []
+            for r in rows[:20]:
+                mapped.append(
+                    {
+                        "queryid": r.get("queryid", r.get("query id", "")),
+                        "query_text": r.get(
+                            "query text",
+                            r.get("query", r.get("sql text", "")),
+                        ),
+                        "total_exec_sec": _safe_float(
+                            r.get(
+                                "total elapsed",
+                                r.get(
+                                    "elapsed",
+                                    r.get("total_time", r.get("total time", 0)),
+                                ),
+                            )
+                        ),
+                        "calls": _safe_int(r.get("calls", r.get("executions", 0))),
+                        "mean_exec_sec": _safe_float(
+                            r.get(
+                                "mean elapsed",
+                                r.get("mean_time", r.get("mean time", 0)),
+                            )
+                        ),
+                        "shared_blks_hit": _safe_int(
+                            r.get(
+                                "shared_blks_hit",
+                                r.get("shared blks hit", 0),
+                            )
+                        ),
+                        "shared_blks_read": _safe_int(
+                            r.get(
+                                "shared_blks_read",
+                                r.get("shared blks read", 0),
+                            )
+                        ),
+                    }
+                )
+            if mapped:
+                sections["top_queries"] = mapped
+                found_any = True
+
+        # --- Top SQL by executions ---
+        elif _match_heading(heading, "sql", "execution") or _match_heading(
+            heading, "top", "execution"
+        ):
+            mapped = []
+            for r in rows[:20]:
+                mapped.append(
+                    {
+                        "queryid": r.get("queryid", r.get("query id", "")),
+                        "query_text": r.get(
+                            "query text",
+                            r.get("query", r.get("sql text", "")),
+                        ),
+                        "calls": _safe_int(r.get("calls", r.get("executions", 0))),
+                        "total_exec_sec": _safe_float(
+                            r.get(
+                                "total elapsed",
+                                r.get("total_time", r.get("total time", 0)),
+                            )
+                        ),
+                        "mean_exec_sec": _safe_float(
+                            r.get(
+                                "mean elapsed",
+                                r.get("mean_time", r.get("mean time", 0)),
+                            )
+                        ),
+                    }
+                )
+            if mapped:
+                sections["high_execution_count"] = mapped
+                found_any = True
+
+        # --- Top SQL by I/O / reads ---
+        elif _match_heading(heading, "sql", "read") or _match_heading(
+            heading, "sql", "i/o"
+        ):
+            mapped = []
+            for r in rows[:20]:
+                mapped.append(
+                    {
+                        "queryid": r.get("queryid", r.get("query id", "")),
+                        "query_text": r.get(
+                            "query text",
+                            r.get("query", r.get("sql text", "")),
+                        ),
+                        "total_exec_sec": _safe_float(
+                            r.get(
+                                "total elapsed",
+                                r.get("total_time", r.get("total time", 0)),
+                            )
+                        ),
+                        "calls": _safe_int(r.get("calls", r.get("executions", 0))),
+                        "shared_blks_read": _safe_int(
+                            r.get(
+                                "reads",
+                                r.get(
+                                    "shared_blks_read",
+                                    r.get("shared blks read", 0),
+                                ),
+                            )
+                        ),
+                    }
+                )
+            if mapped:
+                sections["top_cpu_queries"] = mapped
+                found_any = True
+
+        # --- Top SQL by planning time ---
+        elif _match_heading(heading, "sql", "plan"):
+            # Map to high_elapsed_per_exec for analysis
+            mapped = []
+            for r in rows[:20]:
+                avg = _safe_float(
+                    r.get(
+                        "mean plan",
+                        r.get("mean_plan_time", r.get("mean plan time", 0)),
+                    )
+                )
+                if avg > 0.001:
+                    mapped.append(
+                        {
+                            "queryid": r.get("queryid", r.get("query id", "")),
+                            "query_text": r.get(
+                                "query text",
+                                r.get("query", r.get("sql text", "")),
+                            ),
+                            "avg_elapsed_sec": avg,
+                            "total_exec_sec": _safe_float(
+                                r.get(
+                                    "total plan",
+                                    r.get(
+                                        "total_plan_time",
+                                        r.get("total plan time", 0),
+                                    ),
+                                )
+                            ),
+                            "calls": _safe_int(r.get("calls", r.get("executions", 0))),
+                        }
+                    )
+            if mapped:
+                sections.setdefault("high_elapsed_per_exec", mapped)
+                found_any = True
+
+        # --- Top SQL by temp usage ---
+        elif _match_heading(heading, "sql", "temp") or _match_heading(
+            heading, "temp", "file"
+        ):
+            mapped = []
+            for r in rows[:20]:
+                temp = _safe_float(
+                    r.get(
+                        "temp",
+                        r.get("temp_blks_written", r.get("temp blks written", 0)),
+                    )
+                )
+                if temp > 0:
+                    mapped.append(
+                        {
+                            "queryid": r.get("queryid", r.get("query id", "")),
+                            "query_text": r.get(
+                                "query text",
+                                r.get("query", r.get("sql text", "")),
+                            ),
+                            "temp_mb": temp,
+                            "calls": _safe_int(r.get("calls", r.get("executions", 0))),
+                            "total_exec_sec": _safe_float(
+                                r.get(
+                                    "total elapsed",
+                                    r.get(
+                                        "total_time",
+                                        r.get("total time", 0),
+                                    ),
+                                )
+                            ),
+                        }
+                    )
+            if mapped:
+                sections["temp_file_usage"] = mapped
+                found_any = True
+
+        # --- Top tables by sequential scans ---
+        elif _match_heading(heading, "table", "seq") or _match_heading(
+            heading, "sequential scan"
+        ):
+            mapped = []
+            for r in rows[:20]:
+                mapped.append(
+                    {
+                        "schemaname": r.get("schema", r.get("schemaname", "public")),
+                        "relname": r.get(
+                            "table",
+                            r.get("relname", r.get("relation", "")),
+                        ),
+                        "seq_scan": _safe_int(r.get("seq scan", r.get("seq_scan", 0))),
+                        "idx_scan": _safe_int(r.get("idx scan", r.get("idx_scan", 0))),
+                        "n_live_tup": _safe_int(
+                            r.get(
+                                "live",
+                                r.get(
+                                    "n_live_tup",
+                                    r.get("live tuples", 0),
+                                ),
+                            )
+                        ),
+                        "table_size_mb": _safe_float(
+                            r.get("size", r.get("table size", 0))
+                        ),
+                    }
+                )
+            if mapped:
+                sections["seq_scan_tables"] = mapped
+                found_any = True
+
+        # --- Top tables by DML / inserts+updates+deletes ---
+        elif _match_heading(heading, "table", "dml") or _match_heading(
+            heading, "table", "insert"
+        ):
+            mapped = []
+            for r in rows[:20]:
+                mapped.append(
+                    {
+                        "schemaname": r.get("schema", r.get("schemaname", "public")),
+                        "relname": r.get(
+                            "table",
+                            r.get("relname", r.get("relation", "")),
+                        ),
+                        "total_size_mb": _safe_float(
+                            r.get(
+                                "size",
+                                r.get("table size", r.get("total_size_mb", 0)),
+                            )
+                        ),
+                        "table_size_mb": _safe_float(
+                            r.get(
+                                "table size",
+                                r.get("table_size_mb", 0),
+                            )
+                        ),
+                        "n_live_tup": _safe_int(
+                            r.get(
+                                "live",
+                                r.get("n_live_tup", r.get("live tuples", 0)),
+                            )
+                        ),
+                        "n_tup_ins": _safe_int(
+                            r.get("ins", r.get("n_tup_ins", r.get("inserts", 0)))
+                        ),
+                        "n_tup_upd": _safe_int(
+                            r.get("upd", r.get("n_tup_upd", r.get("updates", 0)))
+                        ),
+                        "n_tup_del": _safe_int(
+                            r.get("del", r.get("n_tup_del", r.get("deletes", 0)))
+                        ),
+                        "n_dead_tup": _safe_int(
+                            r.get(
+                                "dead",
+                                r.get("n_dead_tup", r.get("dead tuples", 0)),
+                            )
+                        ),
+                    }
+                )
+            if mapped:
+                sections["table_sizes"] = mapped
+                found_any = True
+
+        # --- Wait events ---
+        elif _match_heading(heading, "wait") and not _match_heading(heading, "sql"):
+            mapped = []
+            for r in rows[:20]:
+                mapped.append(
+                    {
+                        "event": r.get(
+                            "event",
+                            r.get("wait event", r.get("event_name", "")),
+                        ),
+                        "total_waits": _safe_int(
+                            r.get("waits", r.get("total_waits", r.get("count", 0)))
+                        ),
+                        "time_waited_sec": _safe_float(
+                            r.get(
+                                "waited",
+                                r.get(
+                                    "time_waited",
+                                    r.get("time waited", 0),
+                                ),
+                            )
+                        ),
+                    }
+                )
+            if mapped:
+                sections["wait_events"] = mapped
+                found_any = True
+
+        # --- Vacuum / dead tuples ---
+        elif _match_heading(heading, "vacuum") or _match_heading(heading, "dead"):
+            mapped = []
+            for r in rows[:20]:
+                dp = _safe_float(r.get("dead_pct", r.get("dead %", 0)))
+                dead = _safe_int(
+                    r.get(
+                        "dead",
+                        r.get("n_dead_tup", r.get("dead tuples", 0)),
+                    )
+                )
+                if dead > 0 or dp > 0:
+                    mapped.append(
+                        {
+                            "schemaname": r.get(
+                                "schema", r.get("schemaname", "public")
+                            ),
+                            "relname": r.get(
+                                "table",
+                                r.get("relname", r.get("relation", "")),
+                            ),
+                            "dead_pct": dp,
+                            "n_dead_tup": dead,
+                            "table_size_mb": _safe_float(
+                                r.get("size", r.get("table size", 0))
+                            ),
+                            "last_autovacuum": r.get(
+                                "last autovacuum",
+                                r.get("last_autovacuum", ""),
+                            ),
+                        }
+                    )
+            if mapped:
+                sections["bloat_estimate"] = mapped
+                found_any = True
+
+        # --- Database statistics ---
+        elif _match_heading(heading, "database", "stat"):
+            if rows:
+                r = rows[0]
+                sections["database_stats"] = [
+                    {
+                        "cache_hit_pct": _safe_float(
+                            r.get(
+                                "hit ratio",
+                                r.get("cache_hit_pct", r.get("blks_hit_%", 100)),
+                            )
+                        ),
+                        "xact_commit": _safe_int(
+                            r.get(
+                                "commits",
+                                r.get("xact_commit", r.get("xact commit", 0)),
+                            )
+                        ),
+                        "xact_rollback": _safe_int(
+                            r.get(
+                                "rollbacks",
+                                r.get(
+                                    "xact_rollback",
+                                    r.get("xact rollback", 0),
+                                ),
+                            )
+                        ),
+                        "numbackends": _safe_int(
+                            r.get(
+                                "backends",
+                                r.get("numbackends", r.get("connections", 0)),
+                            )
+                        ),
+                        "temp_bytes": _safe_int(
+                            r.get("temp_bytes", r.get("temp bytes", 0))
+                        ),
+                        "temp_files": _safe_int(
+                            r.get("temp_files", r.get("temp files", 0))
+                        ),
+                    }
+                ]
+                found_any = True
+
+    if not found_any:
+        return None
+    return sections
+
+
+def _parse_csv_structured(content: str) -> dict[str, Any] | None:
+    """Parse pg_stat_statements CSV export into structured dict."""
+    reader = csv.DictReader(io.StringIO(content))
+    rows = list(reader)
+    if not rows:
+        return None
+
+    # Normalise headers to lowercase
+    normalised: list[dict[str, str]] = []
+    for row in rows:
+        normalised.append({k.lower().strip(): v for k, v in row.items()})
+    rows = normalised
+
+    sections: dict[str, Any] = {"db_type": DB_TYPE_POSTGRESQL}
+
+    # Map CSV columns to expected structure
+    top_queries: list[dict[str, Any]] = []
+    high_exec: list[dict[str, Any]] = []
+    high_elapsed: list[dict[str, Any]] = []
+    temp_usage: list[dict[str, Any]] = []
+
+    for r in rows:
+        qid = r.get("queryid", r.get("query_id", ""))
+        query_text = r.get("query", r.get("query_text", ""))
+        calls = _safe_int(r.get("calls", r.get("executions", 0)))
+        total_time = _safe_float(
+            r.get(
+                "total_exec_time",
+                r.get("total_time", r.get("total_elapsed", 0)),
+            )
+        )
+        # pg_stat_statements reports time in ms, convert to sec
+        if total_time > 1000:
+            total_time_sec = total_time / 1000
+        else:
+            total_time_sec = total_time
+        mean_time = _safe_float(
+            r.get(
+                "mean_exec_time",
+                r.get("mean_time", r.get("mean_elapsed", 0)),
+            )
+        )
+        if mean_time > 1000:
+            mean_time_sec = mean_time / 1000
+        else:
+            mean_time_sec = mean_time
+        blks_hit = _safe_int(r.get("shared_blks_hit", 0))
+        blks_read = _safe_int(r.get("shared_blks_read", 0))
+        temp_blks = _safe_int(r.get("temp_blks_written", r.get("temp_blks_read", 0)))
+
+        entry = {
+            "queryid": qid,
+            "query_text": query_text,
+            "total_exec_sec": total_time_sec,
+            "calls": calls,
+            "mean_exec_sec": mean_time_sec,
+            "shared_blks_hit": blks_hit,
+            "shared_blks_read": blks_read,
+        }
+        top_queries.append(entry)
+
+        if calls > 1000:
+            high_exec.append(entry)
+        if mean_time_sec > 1:
+            high_elapsed.append({**entry, "avg_elapsed_sec": mean_time_sec})
+        if temp_blks > 0:
+            temp_usage.append(
+                {
+                    **entry,
+                    "temp_mb": temp_blks * 8 / 1024,  # 8KB blocks to MB
+                }
+            )
+
+    if not top_queries:
+        return None
+
+    # Sort by total elapsed desc
+    top_queries.sort(key=lambda x: x["total_exec_sec"], reverse=True)
+    high_exec.sort(key=lambda x: x["calls"], reverse=True)
+    high_elapsed.sort(key=lambda x: x["avg_elapsed_sec"], reverse=True)
+    temp_usage.sort(key=lambda x: x["temp_mb"], reverse=True)
+
+    sections["top_queries"] = top_queries[:20]
+    if high_exec:
+        sections["high_execution_count"] = high_exec[:20]
+    if high_elapsed:
+        sections["high_elapsed_per_exec"] = high_elapsed[:20]
+    if temp_usage:
+        sections["temp_file_usage"] = temp_usage[:20]
+
+    return sections
+
+
+def _parse_awr_html_structured(html: str) -> dict[str, Any] | None:
+    """Parse AWR HTML report into structured dict for Oracle analysis."""
+    tables = _extract_html_tables(html)
+    if not tables:
+        return None
+
+    sections: dict[str, Any] = {"db_type": DB_TYPE_ORACLE}
+    found_any = False
+
+    for heading, rows in tables:
+        if not rows:
+            continue
+
+        # --- Top SQL by elapsed time ---
+        if _match_heading(heading, "sql", "elapsed"):
+            mapped = []
+            for r in rows[:20]:
+                mapped.append(
+                    {
+                        "sql_id": r.get("sql id", r.get("sql_id", "")),
+                        "sql_text": r.get(
+                            "sql text",
+                            r.get("sql_text", r.get("sql module", "")),
+                        ),
+                        "elapsed_sec": _safe_float(
+                            r.get(
+                                "elapsed time (s)",
+                                r.get("elapsed", r.get("elapsed_sec", 0)),
+                            )
+                        ),
+                        "executions": _safe_int(r.get("executions", r.get("execs", 0))),
+                        "buffer_gets": _safe_int(
+                            r.get(
+                                "buffer gets",
+                                r.get("buffer_gets", r.get("gets", 0)),
+                            )
+                        ),
+                    }
+                )
+            if mapped:
+                sections["top_elapsed_sql"] = mapped
+                found_any = True
+
+        # --- Top SQL by CPU ---
+        elif _match_heading(heading, "sql", "cpu"):
+            mapped = []
+            for r in rows[:20]:
+                mapped.append(
+                    {
+                        "sql_id": r.get("sql id", r.get("sql_id", "")),
+                        "sql_text": r.get(
+                            "sql text",
+                            r.get("sql_text", r.get("sql module", "")),
+                        ),
+                        "cpu_sec": _safe_float(
+                            r.get(
+                                "cpu time (s)",
+                                r.get("cpu", r.get("cpu_sec", 0)),
+                            )
+                        ),
+                        "executions": _safe_int(r.get("executions", r.get("execs", 0))),
+                        "buffer_gets": _safe_int(
+                            r.get(
+                                "buffer gets",
+                                r.get("buffer_gets", r.get("gets", 0)),
+                            )
+                        ),
+                    }
+                )
+            if mapped:
+                sections["top_cpu_sql"] = mapped
+                found_any = True
+
+        # --- Wait events ---
+        elif _match_heading(heading, "wait") and _match_heading(heading, "event"):
+            mapped = []
+            for r in rows[:20]:
+                mapped.append(
+                    {
+                        "event": r.get(
+                            "event",
+                            r.get("event name", r.get("wait event", "")),
+                        ),
+                        "total_waits": _safe_int(
+                            r.get("waits", r.get("total waits", 0))
+                        ),
+                        "time_waited_sec": _safe_float(
+                            r.get(
+                                "time (s)",
+                                r.get(
+                                    "total wait time (s)",
+                                    r.get("time waited", 0),
+                                ),
+                            )
+                        ),
+                    }
+                )
+            if mapped:
+                sections["wait_events"] = mapped
+                found_any = True
+
+        # --- System stats / load profile ---
+        elif _match_heading(heading, "system") or _match_heading(
+            heading, "load profile"
+        ):
+            mapped = []
+            for r in rows[:30]:
+                name = r.get(
+                    "statistic name",
+                    r.get("statistic", r.get("name", "")),
+                )
+                val = r.get("value", r.get("total", r.get("per second", "")))
+                if name:
+                    mapped.append({"name": name, "value": _safe_int(val)})
+            if mapped:
+                sections["system_stats"] = mapped
+                found_any = True
+
+        # --- SGA ---
+        elif _match_heading(heading, "sga"):
+            mapped = []
+            for r in rows[:10]:
+                name = r.get("pool", r.get("name", r.get("component", "")))
+                size = r.get("size", r.get("size (mb)", r.get("bytes", "")))
+                if name:
+                    mapped.append({"name": name, "size_mb": _safe_float(size)})
+            if mapped:
+                sections["sga_info"] = mapped
+                found_any = True
+
+    if not found_any:
+        return None
+    return sections
+
+
+def parse_uploaded_report_structured(
+    content: str, file_name: str
+) -> dict[str, Any] | None:
+    """Try to parse an uploaded report into structured dict.
+
+    Returns None if the report cannot be parsed into structured data.
+    """
+    lower = file_name.lower()
+
+    if lower.endswith(".csv"):
+        return _parse_csv_structured(content)
+
+    if lower.endswith((".html", ".htm")):
+        content_lower = content[:3000].lower()
+        if "pgprofile" in content_lower or "pg_profile" in content_lower:
+            return _parse_pgprofile_structured(content)
+        if "awr" in content_lower or "workload repository" in content_lower:
+            return _parse_awr_html_structured(content)
+        # Try pgProfile first (more common), then AWR
+        result = _parse_pgprofile_structured(content)
+        if result:
+            return result
+        return _parse_awr_html_structured(content)
+
+    # Text reports — attempt to detect tabular data
+    content_lower = content[:3000].lower()
+    if "pgprofile" in content_lower or "pg_profile" in content_lower:
+        # pgProfile text reports may contain HTML tables
+        if "<table" in content.lower():
+            return _parse_pgprofile_structured(content)
+    if "awr" in content_lower or "workload repository" in content_lower:
+        if "<table" in content.lower():
+            return _parse_awr_html_structured(content)
+
+    return None
