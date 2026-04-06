@@ -1,4 +1,9 @@
-"""LLM client for the Infosys AI Gateway."""
+"""LLM client — optional integration with an OpenAI-compatible endpoint.
+
+All public functions gracefully return a fallback message when the LLM is not
+configured (i.e. ``LLM_API_KEY`` or ``LLM_API_URL`` is empty).  The rest of the
+application works without any LLM dependency.
+"""
 
 import json
 from typing import Generator, Optional
@@ -6,6 +11,11 @@ from typing import Generator, Optional
 import requests
 
 import config
+
+_NOT_CONFIGURED_MSG = (
+    "LLM is not configured. Set the LLM_API_URL and LLM_API_KEY environment "
+    "variables to enable AI-powered features."
+)
 
 
 SYSTEM_PROMPT = """You are an expert Kubernetes platform engineer specializing in on-premises
@@ -63,6 +73,9 @@ def query_llm(
         "max_tokens": max_tokens if max_tokens is not None else config.LLM_MAX_TOKENS,
     }
 
+    if not config.is_llm_configured():
+        return _NOT_CONFIGURED_MSG
+
     try:
         response = requests.post(
             config.LLM_API_URL,
@@ -116,6 +129,10 @@ def stream_llm(
         "max_tokens": max_tokens if max_tokens is not None else config.LLM_MAX_TOKENS,
         "stream": True,
     }
+
+    if not config.is_llm_configured():
+        yield _NOT_CONFIGURED_MSG
+        return
 
     try:
         response = requests.post(

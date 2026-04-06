@@ -11,6 +11,7 @@ import streamlit as st
 # Navigation uses native st.radio — no third-party component needed.
 
 import config
+from config import is_llm_configured
 from modules.profile_manager import (
     ClusterProfile,
     save_profile,
@@ -32,6 +33,7 @@ from modules.cluster_creator import (
     apply_best_practices,
     get_cluster_status,
     get_llm_cluster_advice,
+    upload_flannel_manifest_to_node,
     ProvisionStep,
     _run_step,
     get_common_setup_steps,
@@ -495,10 +497,11 @@ def page_cluster_creation():
 
     _show_profile_summary(profile)
 
-    tab_preflight, tab_provision, tab_scripts, tab_advice = st.tabs([
+    tab_preflight, tab_provision, tab_scripts, tab_manifests, tab_advice = st.tabs([
         "Pre-flight Checks",
         "Provision Cluster",
         "View Scripts",
+        "Offline Manifests",
         "AI Advice",
     ])
 
@@ -690,17 +693,83 @@ def page_cluster_creation():
         with st.expander("Best Practices Script", expanded=False):
             st.code(generate_best_practices_script(), language="bash")
 
+    # ── Offline Manifests ───────────────────────────────────────────────────
+    with tab_manifests:
+        st.markdown("### Offline / Custom Manifests")
+        st.markdown(
+            "If your environment cannot download manifests directly (air-gapped / proxy-restricted), "
+            "upload them here. They will be used instead of the default download URLs during provisioning."
+        )
+
+        st.markdown("#### Flannel CNI Manifest")
+        flannel_file = st.file_uploader(
+            "Upload kube-flannel.yml",
+            type=["yml", "yaml"],
+            key="flannel_upload",
+            help="Download from: https://github.com/flannel-io/flannel/releases/latest/download/kube-flannel.yml",
+        )
+        if flannel_file is not None:
+            flannel_path = os.path.join(config.UPLOADS_DIR, "kube-flannel.yml")
+            with open(flannel_path, "wb") as f:
+                f.write(flannel_file.getvalue())
+            profile.flannel_manifest_path = flannel_path
+            save_profile(profile)
+            st.success(f"Flannel manifest saved. It will be SCP'd to nodes during provisioning.")
+
+        if profile.flannel_manifest_path:
+            st.info(f"Current Flannel manifest: `{profile.flannel_manifest_path}`")
+            if st.button("Clear Flannel manifest (use default URL)", key="clear_flannel"):
+                profile.flannel_manifest_path = ""
+                save_profile(profile)
+                st.rerun()
+        else:
+            st.info("No custom manifest — Flannel will be downloaded from the official GitHub release URL.")
+
+        st.markdown("---")
+        st.markdown("#### Other Manifests")
+        st.markdown(
+            "You can also upload any additional YAML manifests. They will be stored "
+            "and can be applied manually via the **Custom Command** feature in the Cluster Debugger."
+        )
+        extra_file = st.file_uploader(
+            "Upload additional manifest (YAML)",
+            type=["yml", "yaml"],
+            key="extra_manifest_upload",
+        )
+        if extra_file is not None:
+            extra_path = os.path.join(config.UPLOADS_DIR, extra_file.name)
+            with open(extra_path, "wb") as f:
+                f.write(extra_file.getvalue())
+            st.success(f"Saved `{extra_file.name}` to uploads.")
+
+        # List existing uploaded files
+        if os.path.exists(config.UPLOADS_DIR):
+            uploaded_files = [
+                f for f in os.listdir(config.UPLOADS_DIR)
+                if f.endswith((".yml", ".yaml"))
+            ]
+            if uploaded_files:
+                st.markdown("**Uploaded manifests:**")
+                for fname in sorted(uploaded_files):
+                    st.markdown(f"- `{fname}`")
+
     # ── AI Advice ─────────────────────────────────────────────────────────
     with tab_advice:
         st.markdown("### AI Cluster Setup Advisor")
-        context = st.text_area(
-            "Additional context or questions",
-            placeholder="e.g., We have 3 nodes with 16GB RAM each. Any special considerations?",
-        )
-        if st.button("Get AI Recommendations", type="primary"):
-            with st.spinner("Analyzing your cluster configuration..."):
-                advice = get_llm_cluster_advice(profile, context)
-                st.markdown(advice)
+        if not is_llm_configured():
+            st.info(
+                "LLM is not configured. Set `LLM_API_URL` and `LLM_API_KEY` "
+                "environment variables to enable AI-powered recommendations."
+            )
+        else:
+            context = st.text_area(
+                "Additional context or questions",
+                placeholder="e.g., We have 3 nodes with 16GB RAM each. Any special considerations?",
+            )
+            if st.button("Get AI Recommendations", type="primary"):
+                with st.spinner("Analyzing your cluster configuration..."):
+                    advice = get_llm_cluster_advice(profile, context)
+                    st.markdown(advice)
 
 
 # ══════════════════════════════════════════════════════════════════════════
@@ -709,7 +778,7 @@ def page_cluster_creation():
 
 def page_cluster_debugger():
     st.markdown("## Cluster Debugger")
-    st.markdown("Diagnose issues and get AI-powered recommendations.")
+    st.markdown("Diagnose issues and get recommendations.")
 
     profile = _get_active_profile()
     if not profile:
@@ -758,13 +827,16 @@ def page_cluster_debugger():
                 with st.expander(f"{'✅' if result.success else '❌'} {name}", expanded=not result.success):
                     st.code(result.stdout if result.success else result.stderr, language="text")
 
-        if st.session_state.debug_results and st.button("Analyze with AI", type="secondary"):
-            with st.spinner("AI is analyzing diagnostics..."):
-                analysis = analyze_diagnostics(
-                    st.session_state.debug_results,
-                    profile=profile,
-                )
-                st.markdown(analysis)
+        if st.session_state.debug_results:
+            if not is_llm_configured():
+                st.info("Enable AI analysis by setting `LLM_API_URL` and `LLM_API_KEY` env vars.")
+            elif st.button("Analyze with AI", type="secondary"):
+                with st.spinner("AI is analyzing diagnostics..."):
+                    analysis = analyze_diagnostics(
+                        st.session_state.debug_results,
+                        profile=profile,
+                    )
+                    st.markdown(analysis)
 
     # ── Category Scan ─────────────────────────────────────────────────────
     with tab_category:
@@ -779,10 +851,11 @@ def page_cluster_debugger():
                 with st.expander(f"{'✅' if result.success else '❌'} {name}"):
                     st.code(result.stdout if result.success else result.stderr, language="text")
 
-            if st.button("Analyze Category with AI", key="cat_ai"):
-                with st.spinner("Analyzing..."):
-                    analysis = analyze_diagnostics(results, profile=profile)
-                    st.markdown(analysis)
+            if is_llm_configured():
+                if st.button("Analyze Category with AI", key="cat_ai"):
+                    with st.spinner("Analyzing..."):
+                        analysis = analyze_diagnostics(results, profile=profile)
+                        st.markdown(analysis)
 
     # ── Custom Command ────────────────────────────────────────────────────
     with tab_custom:
@@ -805,43 +878,53 @@ def page_cluster_debugger():
     # ── AI Debug Assistant ────────────────────────────────────────────────
     with tab_ai:
         st.markdown("### AI Debug Assistant")
-        st.markdown("Describe your issue and get AI-powered debugging help.")
+        if not is_llm_configured():
+            st.info(
+                "LLM is not configured. Set `LLM_API_URL` and `LLM_API_KEY` "
+                "environment variables to enable AI-powered debugging."
+            )
+            st.markdown(
+                "You can still use the **Quick Diagnostics**, **Category Scan**, and "
+                "**Custom Command** tabs to collect diagnostic data without an LLM."
+            )
+        else:
+            st.markdown("Describe your issue and get AI-powered debugging help.")
 
-        issue = st.text_area(
-            "Describe the issue",
-            placeholder="e.g., Pods are stuck in CrashLoopBackOff in the default namespace",
-            height=120,
-        )
+            issue = st.text_area(
+                "Describe the issue",
+                placeholder="e.g., Pods are stuck in CrashLoopBackOff in the default namespace",
+                height=120,
+            )
 
-        col1, col2 = st.columns(2)
-        with col1:
-            auto_collect = st.checkbox("Auto-collect relevant diagnostics", value=True)
-        with col2:
-            check_pods = st.checkbox("Check for problematic pods", value=True)
+            col1, col2 = st.columns(2)
+            with col1:
+                auto_collect = st.checkbox("Auto-collect relevant diagnostics", value=True)
+            with col2:
+                check_pods = st.checkbox("Check for problematic pods", value=True)
 
-        if st.button("Debug", type="primary", key="ai_debug") and issue:
-            collected_data = ""
+            if st.button("Debug", type="primary", key="ai_debug") and issue:
+                collected_data = ""
 
-            if check_pods:
-                with st.spinner("Checking pod issues..."):
-                    pod_result = check_pod_issues(cp_node)
-                    if pod_result.success and pod_result.stdout.strip():
-                        collected_data += f"\n\nProblematic Pods:\n{pod_result.stdout}"
-                        with st.expander("Problematic Pods"):
-                            st.code(pod_result.stdout, language="text")
+                if check_pods:
+                    with st.spinner("Checking pod issues..."):
+                        pod_result = check_pod_issues(cp_node)
+                        if pod_result.success and pod_result.stdout.strip():
+                            collected_data += f"\n\nProblematic Pods:\n{pod_result.stdout}"
+                            with st.expander("Problematic Pods"):
+                                st.code(pod_result.stdout, language="text")
 
-            if auto_collect:
-                with st.spinner("Collecting diagnostics..."):
-                    diag_results = run_category_diagnostics(cp_node, "Cluster Overview")
-                    for name, result in diag_results.items():
-                        if result.success:
-                            collected_data += f"\n\n{name}:\n{result.stdout}"
+                if auto_collect:
+                    with st.spinner("Collecting diagnostics..."):
+                        diag_results = run_category_diagnostics(cp_node, "Cluster Overview")
+                        for name, result in diag_results.items():
+                            if result.success:
+                                collected_data += f"\n\n{name}:\n{result.stdout}"
 
-            with st.spinner("AI is analyzing the issue..."):
-                full_context = f"Issue: {issue}\n\nCollected Data:{collected_data}"
-                suggestion = get_debug_suggestion(issue, collected_data)
-                st.markdown("### AI Recommendation")
-                st.markdown(suggestion)
+                with st.spinner("AI is analyzing the issue..."):
+                    full_context = f"Issue: {issue}\n\nCollected Data:{collected_data}"
+                    suggestion = get_debug_suggestion(issue, collected_data)
+                    st.markdown("### AI Recommendation")
+                    st.markdown(suggestion)
 
 
 # ══════════════════════════════════════════════════════════════════════════
@@ -978,15 +1061,21 @@ def page_monitoring_setup():
     # ── AI Advice ─────────────────────────────────────────────────────────
     with tab_advice:
         st.markdown("### AI Monitoring Advisor")
-        if st.button("Get Monitoring Recommendations", type="primary", key="mon_advice"):
-            current_status = ""
-            status_result = get_monitoring_status(cp_node, namespace)
-            if status_result.success:
-                current_status = status_result.stdout
+        if not is_llm_configured():
+            st.info(
+                "LLM is not configured. Set `LLM_API_URL` and `LLM_API_KEY` "
+                "environment variables to enable AI-powered monitoring advice."
+            )
+        else:
+            if st.button("Get Monitoring Recommendations", type="primary", key="mon_advice"):
+                current_status = ""
+                status_result = get_monitoring_status(cp_node, namespace)
+                if status_result.success:
+                    current_status = status_result.stdout
 
-            with st.spinner("Getting AI recommendations..."):
-                advice = get_monitoring_advice(profile, current_status)
-                st.markdown(advice)
+                with st.spinner("Getting AI recommendations..."):
+                    advice = get_monitoring_advice(profile, current_status)
+                    st.markdown(advice)
 
 
 # ══════════════════════════════════════════════════════════════════════════
@@ -1098,12 +1187,13 @@ def page_log_analysis():
 
                     st.code(result.stdout[-5000:], language="text")
 
-                    if analysis.error_count > 0 and st.button("Analyze with AI", key="pod_ai"):
-                        with st.spinner("AI analyzing pod logs..."):
-                            ai_analysis = llm_analyze_logs(
-                                result.stdout, f"{pod_ns}/{pod_name}"
-                            )
-                            st.markdown(ai_analysis)
+                    if analysis.error_count > 0 and is_llm_configured():
+                        if st.button("Analyze with AI", key="pod_ai"):
+                            with st.spinner("AI analyzing pod logs..."):
+                                ai_analysis = llm_analyze_logs(
+                                    result.stdout, f"{pod_ns}/{pod_name}"
+                                )
+                                st.markdown(ai_analysis)
                 else:
                     st.error("Failed to fetch pod logs")
                     st.code(result.stderr, language="text")
@@ -1142,33 +1232,45 @@ def page_log_analysis():
                 st.info("No correlated errors found across sources.")
 
             # LLM correlation analysis
-            if st.button("Deep AI Correlation Analysis", key="deep_corr"):
-                multi_logs = {
-                    src: res.stdout for src, res in results.items() if res.success
-                }
-                with st.spinner("AI is performing deep correlation analysis..."):
-                    analysis = llm_correlate_analysis(multi_logs)
-                    st.markdown(analysis)
+            if is_llm_configured():
+                if st.button("Deep AI Correlation Analysis", key="deep_corr"):
+                    multi_logs = {
+                        src: res.stdout for src, res in results.items() if res.success
+                    }
+                    with st.spinner("AI is performing deep correlation analysis..."):
+                        analysis = llm_correlate_analysis(multi_logs)
+                        st.markdown(analysis)
 
     # ── AI Log Analysis ───────────────────────────────────────────────────
     with tab_ai:
         st.markdown("### AI-Powered Log Analysis")
-        st.markdown("Paste logs or describe an issue for AI analysis.")
+        if not is_llm_configured():
+            st.info(
+                "LLM is not configured. Set `LLM_API_URL` and `LLM_API_KEY` "
+                "environment variables to enable AI-powered log analysis."
+            )
+            st.markdown(
+                "You can still use the **System Logs**, **Pod Logs**, and "
+                "**Error Correlation** tabs — they work without an LLM and provide "
+                "automated pattern matching and error grouping."
+            )
+        else:
+            st.markdown("Paste logs or describe an issue for AI analysis.")
 
-        log_input = st.text_area(
-            "Paste log output",
-            height=200,
-            placeholder="Paste your Kubernetes logs here...",
-        )
-        context_input = st.text_input(
-            "Additional context",
-            placeholder="e.g., This started happening after we upgraded to K8s 1.30",
-        )
+            log_input = st.text_area(
+                "Paste log output",
+                height=200,
+                placeholder="Paste your Kubernetes logs here...",
+            )
+            context_input = st.text_input(
+                "Additional context",
+                placeholder="e.g., This started happening after we upgraded to K8s 1.30",
+            )
 
-        if st.button("Analyze Logs", type="primary", key="ai_log_analyze") and log_input:
-            with st.spinner("AI is analyzing logs..."):
-                analysis = llm_analyze_logs(log_input, context=context_input)
-                st.markdown(analysis)
+            if st.button("Analyze Logs", type="primary", key="ai_log_analyze") and log_input:
+                with st.spinner("AI is analyzing logs..."):
+                    analysis = llm_analyze_logs(log_input, context=context_input)
+                    st.markdown(analysis)
 
 
 # ══════════════════════════════════════════════════════════════════════════
@@ -1177,6 +1279,18 @@ def page_log_analysis():
 
 def page_ai_assistant():
     st.markdown("## AI Kubernetes Assistant")
+
+    if not is_llm_configured():
+        st.info(
+            "LLM is not configured. Set `LLM_API_URL` and `LLM_API_KEY` "
+            "environment variables to enable the AI chat assistant."
+        )
+        st.markdown(
+            "All other features (Cluster Creation, Debugging, Monitoring, Log Analysis) "
+            "work without an LLM. Only the AI-powered analysis and chat features require it."
+        )
+        return
+
     st.markdown("Chat with the AI about any Kubernetes topic.")
 
     # Chat history

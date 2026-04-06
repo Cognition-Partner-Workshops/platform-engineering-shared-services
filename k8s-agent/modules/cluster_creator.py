@@ -5,8 +5,10 @@ import time
 from dataclasses import dataclass, field
 from typing import List, Optional
 
-from modules.llm_client import query_llm
 from modules.profile_manager import ClusterProfile
+
+# Default Flannel manifest URL — can be overridden by user-uploaded file
+FLANNEL_MANIFEST_URL = "https://github.com/flannel-io/flannel/releases/latest/download/kube-flannel.yml"
 
 
 @dataclass
@@ -384,7 +386,12 @@ chown root:root /root/.kube/config
 
 # ── Install Flannel CNI ───────────────────────────────────────────────────
 echo ">> Installing Flannel CNI..."
-kubectl apply -f https://github.com/flannel-io/flannel/releases/latest/download/kube-flannel.yml
+if [ -f /tmp/kube-flannel-custom.yml ]; then
+    echo ">> Using user-provided Flannel manifest..."
+    kubectl apply -f /tmp/kube-flannel-custom.yml
+else
+    kubectl apply -f {FLANNEL_MANIFEST_URL}
+fi
 
 # Wait for Flannel to be ready
 echo ">> Waiting for Flannel pods to be ready..."
@@ -850,12 +857,22 @@ echo 'kubectl configured.'
     ))
 
     # 3. Install Flannel CNI
+    flannel_manifest = profile.flannel_manifest_path or FLANNEL_MANIFEST_URL
+    # If the user uploaded a local file we SCP it first; otherwise download URL
+    if profile.flannel_manifest_path:
+        flannel_apply = (
+            "echo '>> Using user-provided Flannel manifest...'\n"
+            "kubectl apply -f /tmp/kube-flannel-custom.yml"
+        )
+    else:
+        flannel_apply = f"kubectl apply -f {FLANNEL_MANIFEST_URL}"
+
     steps.append(ProvisionStep(
         name="install_flannel",
         title="Install Flannel CNI",
-        script="""set -euo pipefail
+        script=f"""set -euo pipefail
 echo '>> Installing Flannel CNI...'
-kubectl apply -f https://github.com/flannel-io/flannel/releases/latest/download/kube-flannel.yml
+{flannel_apply}
 echo '>> Waiting for Flannel pods to be ready...'
 kubectl -n kube-flannel wait --for=condition=ready pod -l app=flannel --timeout=120s || true
 echo 'Flannel CNI installed.'
@@ -1125,7 +1142,12 @@ def get_cluster_status(control_plane_node: dict) -> SSHResult:
 
 
 def get_llm_cluster_advice(profile: ClusterProfile, context: str = "") -> str:
-    """Ask the LLM for cluster setup advice based on the profile."""
+    """Ask the LLM for cluster setup advice based on the profile.
+
+    Returns a graceful message when the LLM is not configured.
+    """
+    from modules.llm_client import query_llm  # lazy import — LLM is optional
+
     nodes_desc = []
     for n in profile.nodes:
         nodes_desc.append(f"  - {n.get('hostname', 'unknown')} ({n['ip_address']}) — role: {n['role']}")
@@ -1159,3 +1181,49 @@ Please review this configuration and provide:
 4. Network configuration tips for Flannel with CRI-O
 """
     return query_llm(prompt)
+
+
+def upload_flannel_manifest_to_node(node: dict, local_path: str) -> SSHResult:
+    """SCP a user-provided Flannel manifest to a node as /tmp/kube-flannel-custom.yml."""
+    scp_cmd = [
+        "scp",
+        "-o", "StrictHostKeyChecking=no",
+        "-o", "UserKnownHostsFile=/dev/null",
+        "-P", str(node.get("ssh_port", 22)),
+        "-i", node.get("ssh_key_path", "~/.ssh/id_rsa"),
+        local_path,
+        f"{node.get('ssh_user', 'root')}@{node['ip_address']}:/tmp/kube-flannel-custom.yml",
+    ]
+    try:
+        proc = subprocess.run(
+            scp_cmd,
+            capture_output=True,
+            text=True,
+            timeout=60,
+        )
+        return SSHResult(
+            hostname=node["ip_address"],
+            command="scp flannel manifest",
+            return_code=proc.returncode,
+            stdout=proc.stdout,
+            stderr=proc.stderr,
+            success=proc.returncode == 0,
+        )
+    except subprocess.TimeoutExpired:
+        return SSHResult(
+            hostname=node["ip_address"],
+            command="scp flannel manifest",
+            return_code=-1,
+            stdout="",
+            stderr="SCP timed out after 60 seconds",
+            success=False,
+        )
+    except Exception as exc:
+        return SSHResult(
+            hostname=node["ip_address"],
+            command="scp flannel manifest",
+            return_code=-1,
+            stdout="",
+            stderr=str(exc),
+            success=False,
+        )

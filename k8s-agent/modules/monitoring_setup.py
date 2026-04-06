@@ -1,7 +1,6 @@
 """Monitoring Setup — Prometheus, Grafana, and dashboard provisioning via SSH."""
 
 from modules.cluster_creator import run_ssh_command, SSHResult
-from modules.llm_client import query_llm
 from modules.profile_manager import ClusterProfile
 
 
@@ -420,7 +419,12 @@ def get_monitoring_advice(
     profile: ClusterProfile,
     current_status: str = "",
 ) -> str:
-    """Ask the LLM for monitoring setup advice."""
+    """Ask the LLM for monitoring setup advice.
+
+    Returns a graceful message when the LLM is not configured.
+    """
+    from modules.llm_client import query_llm  # lazy import — LLM is optional
+
     prompt = f"""I have a Kubernetes cluster with the following setup:
 - Kubernetes: {profile.kubernetes_version}
 - Runtime: CRI-O {profile.crio_version}

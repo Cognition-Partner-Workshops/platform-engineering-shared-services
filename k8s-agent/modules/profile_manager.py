@@ -51,6 +51,9 @@ class ClusterProfile:
     no_proxy: str = ""
     http_proxy_alt: str = ""  # alternate proxy
     https_proxy_alt: str = ""  # alternate proxy
+    # Offline manifest paths — user-provided files for air-gapped environments
+    flannel_manifest_path: str = ""  # local path to kube-flannel.yml
+    prometheus_manifest_path: str = ""  # local path to prometheus manifest
 
     def get_control_plane_nodes(self) -> list[dict]:
         return [n for n in self.nodes if n.get("role") == "control-plane"]

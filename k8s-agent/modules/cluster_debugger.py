@@ -1,7 +1,6 @@
 """Cluster Debugger — Diagnose K8s issues and provide LLM-powered recommendations."""
 
 from modules.cluster_creator import run_ssh_command, SSHResult
-from modules.llm_client import query_llm, stream_llm
 from modules.profile_manager import ClusterProfile
 
 
@@ -151,7 +150,12 @@ def analyze_diagnostics(
     user_description: str = "",
     profile: ClusterProfile | None = None,
 ) -> str:
-    """Send diagnostic results to the LLM for analysis and recommendations."""
+    """Send diagnostic results to the LLM for analysis and recommendations.
+
+    Returns a graceful message when the LLM is not configured.
+    """
+    from modules.llm_client import query_llm  # lazy import — LLM is optional
+
     diag_text = format_diagnostics_for_llm(results)
 
     cluster_info = ""
@@ -190,7 +194,12 @@ def get_debug_suggestion(
     error_message: str,
     context: str = "",
 ) -> str:
-    """Get a quick debugging suggestion from the LLM for a specific error."""
+    """Get a quick debugging suggestion from the LLM for a specific error.
+
+    Returns a graceful message when the LLM is not configured.
+    """
+    from modules.llm_client import query_llm  # lazy import — LLM is optional
+
     prompt = f"""I encountered the following error in my Kubernetes cluster (CRI-O + Flannel):
 
 Error: {error_message}

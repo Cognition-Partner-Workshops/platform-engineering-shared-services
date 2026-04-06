@@ -6,7 +6,6 @@ from dataclasses import dataclass, field
 from typing import Optional
 
 from modules.cluster_creator import run_ssh_command, SSHResult
-from modules.llm_client import query_llm
 
 
 @dataclass
@@ -274,7 +273,12 @@ def llm_analyze_logs(
     source: str = "",
     context: str = "",
 ) -> str:
-    """Send log output to the LLM for deep analysis."""
+    """Send log output to the LLM for deep analysis.
+
+    Returns a graceful message when the LLM is not configured.
+    """
+    from modules.llm_client import query_llm  # lazy import — LLM is optional
+
     truncated = log_text[-8000:] if len(log_text) > 8000 else log_text
 
     prompt = f"""Analyze the following Kubernetes logs and provide a detailed assessment.
@@ -301,7 +305,12 @@ def llm_correlate_analysis(
     multi_source_logs: dict[str, str],
     issue_description: str = "",
 ) -> str:
-    """Send logs from multiple sources to the LLM for cross-source correlation."""
+    """Send logs from multiple sources to the LLM for cross-source correlation.
+
+    Returns a graceful message when the LLM is not configured.
+    """
+    from modules.llm_client import query_llm  # lazy import — LLM is optional
+
     log_sections = []
     for source, log_text in multi_source_logs.items():
         truncated = log_text[-3000:] if len(log_text) > 3000 else log_text
