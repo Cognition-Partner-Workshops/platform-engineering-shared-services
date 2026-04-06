@@ -8,7 +8,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import json
 import streamlit as st
-from streamlit_option_menu import option_menu
+# Navigation uses native st.radio — no third-party component needed.
 
 import config
 from modules.profile_manager import (
@@ -193,26 +193,20 @@ def render_sidebar():
         st.divider()
 
         # ── Navigation ──
-        selected_page = option_menu(
-            menu_title="Navigation",
-            options=[
-                "Profile Manager",
-                "Cluster Creation",
-                "Cluster Debugger",
-                "Monitoring Setup",
-                "Log Analysis",
-                "AI Assistant",
-            ],
-            icons=[
-                "person-gear",
-                "hdd-rack",
-                "bug",
-                "graph-up",
-                "journal-text",
-                "robot",
-            ],
-            menu_icon="list",
-            default_index=0,
+        st.markdown("### Navigation")
+        nav_options = [
+            "Profile Manager",
+            "Cluster Creation",
+            "Cluster Debugger",
+            "Monitoring Setup",
+            "Log Analysis",
+            "AI Assistant",
+        ]
+        selected_page = st.radio(
+            "Go to",
+            options=nav_options,
+            index=0,
+            label_visibility="collapsed",
         )
 
         st.divider()
