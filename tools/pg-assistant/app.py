@@ -1101,70 +1101,66 @@ with tab_compare:
             analyser_cmp = PerformanceAnalyser(
                 st.session_state.db_client, st.session_state.llm_client
             )
-            snap_result = analyser_cmp.list_awr_snapshots()
-            if "error" in snap_result:
-                st.error(f"Cannot load snapshots: {snap_result['error']}")
+            snaps = analyser_cmp.list_awr_snapshots()
+            if not snaps:
+                st.info("No AWR snapshots found.")
             else:
-                snaps = snap_result.get("rows", [])
-                if not snaps:
-                    st.info("No AWR snapshots found.")
-                else:
-                    snap_ids = sorted(
-                        {int(s["snap_id"]) for s in snaps if s.get("snap_id")}
+                snap_ids = sorted(
+                    {int(s["snap_id"]) for s in snaps if s.get("snap_id")}
+                )
+                snap_labels = {
+                    int(s["snap_id"]): (
+                        f"{s['snap_id']} - {s.get('end_interval_time', '')}"
                     )
-                    snap_labels = {
-                        int(s["snap_id"]): (
-                            f"{s['snap_id']} - {s.get('end_interval_time', '')}"
-                        )
-                        for s in snaps
-                        if s.get("snap_id")
-                    }
+                    for s in snaps
+                    if s.get("snap_id")
+                }
 
-                    col_a, col_b = st.columns(2)
-                    with col_a:
-                        st.markdown("**Snapshot Range A (Baseline)**")
-                        a_begin = st.selectbox(
-                            "A \u2014 Begin Snap",
-                            snap_ids,
-                            index=0,
-                            key="cmp_a_begin",
-                            format_func=lambda x: snap_labels.get(x, str(x)),
-                        )
-                        a_end = st.selectbox(
-                            "A \u2014 End Snap",
-                            snap_ids,
-                            index=min(1, len(snap_ids) - 1),
-                            key="cmp_a_end",
-                            format_func=lambda x: snap_labels.get(x, str(x)),
-                        )
-                    with col_b:
-                        st.markdown("**Snapshot Range B (Current)**")
-                        b_begin = st.selectbox(
-                            "B \u2014 Begin Snap",
-                            snap_ids,
-                            index=max(0, len(snap_ids) - 2),
-                            key="cmp_b_begin",
-                            format_func=lambda x: snap_labels.get(x, str(x)),
-                        )
-                        b_end = st.selectbox(
-                            "B \u2014 End Snap",
-                            snap_ids,
-                            index=len(snap_ids) - 1,
-                            key="cmp_b_end",
-                            format_func=lambda x: snap_labels.get(x, str(x)),
-                        )
+                col_a, col_b = st.columns(2)
+                with col_a:
+                    st.markdown("**Snapshot Range A (Baseline)**")
+                    a_begin = st.selectbox(
+                        "A \u2014 Begin Snap",
+                        snap_ids,
+                        index=0,
+                        key="cmp_a_begin",
+                        format_func=lambda x: snap_labels.get(x, str(x)),
+                    )
+                    a_end = st.selectbox(
+                        "A \u2014 End Snap",
+                        snap_ids,
+                        index=min(1, len(snap_ids) - 1),
+                        key="cmp_a_end",
+                        format_func=lambda x: snap_labels.get(x, str(x)),
+                    )
+                with col_b:
+                    st.markdown("**Snapshot Range B (Current)**")
+                    b_begin = st.selectbox(
+                        "B \u2014 Begin Snap",
+                        snap_ids,
+                        index=max(0, len(snap_ids) - 2),
+                        key="cmp_b_begin",
+                        format_func=lambda x: snap_labels.get(x, str(x)),
+                    )
+                    b_end = st.selectbox(
+                        "B \u2014 End Snap",
+                        snap_ids,
+                        index=len(snap_ids) - 1,
+                        key="cmp_b_end",
+                        format_func=lambda x: snap_labels.get(x, str(x)),
+                    )
 
-                    if st.button("\U0001f50d Compare Snapshots", key="cmp_ora_btn"):
-                        if a_begin >= a_end:
-                            st.error("Range A: Begin snap must be less than End snap.")
-                        elif b_begin >= b_end:
-                            st.error("Range B: Begin snap must be less than End snap.")
-                        else:
-                            with st.spinner("Comparing snapshots\u2026"):
-                                result = comparator.compare_oracle(
-                                    a_begin, a_end, b_begin, b_end
-                                )
-                            _render_comparison(result)
+                if st.button("\U0001f50d Compare Snapshots", key="cmp_ora_btn"):
+                    if a_begin >= a_end:
+                        st.error("Range A: Begin snap must be less than End snap.")
+                    elif b_begin >= b_end:
+                        st.error("Range B: Begin snap must be less than End snap.")
+                    else:
+                        with st.spinner("Comparing snapshots\u2026"):
+                            result = comparator.compare_oracle(
+                                a_begin, a_end, b_begin, b_end
+                            )
+                        _render_comparison(result)
 
         elif db_type == DB_TYPE_POSTGRESQL:
             cmp_mode = st.radio(
@@ -1178,70 +1174,66 @@ with tab_compare:
                 analyser_cmp = PerformanceAnalyser(
                     st.session_state.db_client, st.session_state.llm_client
                 )
-                samp_result = analyser_cmp.list_pgprofile_samples()
-                if "error" in samp_result:
-                    st.error(f"Cannot load pgProfile samples: {samp_result['error']}")
+                samps = analyser_cmp.list_pgprofile_samples()
+                if not samps:
+                    st.info("No pgProfile samples found.")
                 else:
-                    samps = samp_result.get("rows", [])
-                    if not samps:
-                        st.info("No pgProfile samples found.")
-                    else:
-                        samp_ids = sorted(
-                            {int(s["sample_id"]) for s in samps if s.get("sample_id")}
+                    samp_ids = sorted(
+                        {int(s["sample_id"]) for s in samps if s.get("sample_id")}
+                    )
+                    samp_labels = {
+                        int(s["sample_id"]): (
+                            f"{s['sample_id']} - {s.get('sample_time', '')}"
                         )
-                        samp_labels = {
-                            int(s["sample_id"]): (
-                                f"{s['sample_id']} - {s.get('sample_time', '')}"
-                            )
-                            for s in samps
-                            if s.get("sample_id")
-                        }
+                        for s in samps
+                        if s.get("sample_id")
+                    }
 
-                        col_a, col_b = st.columns(2)
-                        with col_a:
-                            st.markdown("**Sample Range A (Baseline)**")
-                            sa_begin = st.selectbox(
-                                "A \u2014 Begin Sample",
-                                samp_ids,
-                                index=0,
-                                key="cmp_sa_begin",
-                                format_func=lambda x: samp_labels.get(x, str(x)),
-                            )
-                            sa_end = st.selectbox(
-                                "A \u2014 End Sample",
-                                samp_ids,
-                                index=min(1, len(samp_ids) - 1),
-                                key="cmp_sa_end",
-                                format_func=lambda x: samp_labels.get(x, str(x)),
-                            )
-                        with col_b:
-                            st.markdown("**Sample Range B (Current)**")
-                            sb_begin = st.selectbox(
-                                "B \u2014 Begin Sample",
-                                samp_ids,
-                                index=max(0, len(samp_ids) - 2),
-                                key="cmp_sb_begin",
-                                format_func=lambda x: samp_labels.get(x, str(x)),
-                            )
-                            sb_end = st.selectbox(
-                                "B \u2014 End Sample",
-                                samp_ids,
-                                index=len(samp_ids) - 1,
-                                key="cmp_sb_end",
-                                format_func=lambda x: samp_labels.get(x, str(x)),
-                            )
+                    col_a, col_b = st.columns(2)
+                    with col_a:
+                        st.markdown("**Sample Range A (Baseline)**")
+                        sa_begin = st.selectbox(
+                            "A \u2014 Begin Sample",
+                            samp_ids,
+                            index=0,
+                            key="cmp_sa_begin",
+                            format_func=lambda x: samp_labels.get(x, str(x)),
+                        )
+                        sa_end = st.selectbox(
+                            "A \u2014 End Sample",
+                            samp_ids,
+                            index=min(1, len(samp_ids) - 1),
+                            key="cmp_sa_end",
+                            format_func=lambda x: samp_labels.get(x, str(x)),
+                        )
+                    with col_b:
+                        st.markdown("**Sample Range B (Current)**")
+                        sb_begin = st.selectbox(
+                            "B \u2014 Begin Sample",
+                            samp_ids,
+                            index=max(0, len(samp_ids) - 2),
+                            key="cmp_sb_begin",
+                            format_func=lambda x: samp_labels.get(x, str(x)),
+                        )
+                        sb_end = st.selectbox(
+                            "B \u2014 End Sample",
+                            samp_ids,
+                            index=len(samp_ids) - 1,
+                            key="cmp_sb_end",
+                            format_func=lambda x: samp_labels.get(x, str(x)),
+                        )
 
-                        if st.button("\U0001f50d Compare Samples", key="cmp_pg_btn"):
-                            if sa_begin >= sa_end:
-                                st.error("Range A: Begin must be less than End.")
-                            elif sb_begin >= sb_end:
-                                st.error("Range B: Begin must be less than End.")
-                            else:
-                                with st.spinner("Comparing samples\u2026"):
-                                    result = comparator.compare_pgprofile(
-                                        sa_begin, sa_end, sb_begin, sb_end
-                                    )
-                                _render_comparison(result)
+                    if st.button("\U0001f50d Compare Samples", key="cmp_pg_btn"):
+                        if sa_begin >= sa_end:
+                            st.error("Range A: Begin must be less than End.")
+                        elif sb_begin >= sb_end:
+                            st.error("Range B: Begin must be less than End.")
+                        else:
+                            with st.spinner("Comparing samples\u2026"):
+                                result = comparator.compare_pgprofile(
+                                    sa_begin, sa_end, sb_begin, sb_end
+                                )
+                            _render_comparison(result)
 
             else:
                 st.info(
