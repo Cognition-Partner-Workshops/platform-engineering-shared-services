@@ -855,21 +855,26 @@ class SnapshotComparator:
         return "\n".join(parts)
 
     def _get_llm_comparison(self, text: str) -> str:
-        system_prompt = (
-            "You are a senior DBA comparing two REAL database snapshots.\n\n"
-            "CRITICAL: ONLY reference sql_ids, queryids, table names, and SQL text "
-            "that appear in the data below. NEVER invent fake IDs or placeholders.\n\n"
-            "Produce these sections (skip sections with no relevant data):\n"
+        # Append instructions AFTER the data so codellama "completes" a
+        # real analysis rather than hallucinating from a system prompt.
+        instruction = (
+            "\n\n" + "=" * 60 + "\n"
+            "TASK: Compare the two snapshots above. Write a report that ONLY "
+            "references sql_ids, queryids, table names, and SQL text shown above. "
+            "Do NOT invent any IDs, table names, or queries.\n\n"
             "## Executive Summary\n"
+            "What changed between Snapshot A and Snapshot B?\n\n"
             "## Key Metric Changes\n"
+            "List metrics from the DELTA SUMMARY above that changed >10%.\n\n"
             "## New or Regressed SQL\n"
+            "SQL that appeared or got worse in Snapshot B. Copy query_text.\n\n"
             "## Wait Event Changes\n"
-            "## Recommendations\n\n"
-            "For each problematic SQL, copy the ACTUAL query text from the data "
-            "into a ```sql code block. Provide exact fix commands."
+            "Wait events that increased or decreased between snapshots.\n\n"
+            "## Recommendations\n"
+            "Numbered action plan using ONLY data from above.\n"
         )
         try:
-            return self.llm.generate(prompt=text, system_prompt=system_prompt)
+            return self.llm.generate(prompt=text + instruction)
         except (ConnectionError, RuntimeError) as exc:
             return f"LLM comparison analysis failed: {exc}"
 

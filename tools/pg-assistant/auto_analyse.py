@@ -796,30 +796,46 @@ _PG_CHECKPOINT_STATS_V17 = """
     CROSS JOIN pg_stat_bgwriter bg
 """
 
-ANALYSIS_SYSTEM_PROMPT = (
-    "You are a senior DBA analysing REAL performance data from a live database.\n\n"
-    "CRITICAL RULES — violating any of these makes your analysis useless:\n"
-    "- ONLY reference sql_ids, queryids, table names, and SQL text that appear "
-    "in the data below. NEVER invent fake IDs or placeholder names.\n"
-    "- If a section has '(no data)', say 'No issues found' and move on.\n"
-    "- For every problematic SQL, copy the ACTUAL query text from the data into "
-    "a ```sql code block.\n"
-    "- Provide EXACT fix commands (CREATE INDEX, ANALYZE, ALTER SEQUENCE, etc.) "
-    "with real table/column names from the data.\n"
-    "- Skip any section where the data shows no problems.\n"
-    "- Never output generic advice or example/template text.\n\n"
-    "Produce these sections (skip sections with no relevant data):\n"
+# Instruction block appended AFTER the data in the prompt.
+# codellama is a completion model — it works best when instructions follow
+# the data so it "completes" the report rather than fabricating from the
+# system prompt.
+_ANALYSIS_INSTRUCTION = (
+    "\n\n"
+    "=" * 60 + "\n"
+    "TASK: Analyse the REAL data above. Write a report that ONLY references "
+    "the sql_ids, queryids, table names, and SQL text shown above. "
+    "Do NOT invent any IDs, table names, or queries.\n\n"
+    "For each section below, if the data above has no relevant rows, "
+    "write 'No issues found.' and move on.\n\n"
     "## Executive Summary\n"
+    "2-3 sentences about the biggest issues found in the data above.\n\n"
     "## High Elapsed Time SQL\n"
+    "List each sql_id/queryid from the HIGH ELAPSED PER EXEC section above. "
+    "Copy its query_text. Explain why it is slow and give a CREATE INDEX or fix.\n\n"
     "## High Execution Count SQL\n"
+    "List each sql_id/queryid from the HIGH EXECUTION COUNT section above. "
+    "Copy its query_text. Suggest caching or indexing.\n\n"
     "## Full Table Scans\n"
+    "List tables from the SEQ SCAN TABLES section above with high seq_scan counts. "
+    "Suggest CREATE INDEX statements using real column names.\n\n"
     "## Row Contention & Locking\n"
+    "List events from ROW CONTENTION or LOCK WAITS sections above. Suggest fixes.\n\n"
     "## Sequence Caching Issues\n"
+    "List sequences from SEQUENCE CACHE ISSUES section above. "
+    "Give ALTER SEQUENCE ... CACHE 20 statements.\n\n"
     "## Missing / Recommended Indexes\n"
+    "Based on query WHERE/JOIN columns visible in the SQL text above, "
+    "suggest specific CREATE INDEX statements.\n\n"
     "## Stale Statistics / Vacuum / Bloat\n"
+    "List tables from STALE STATS or BLOAT ESTIMATE sections above. "
+    "Give ANALYZE or VACUUM commands.\n\n"
     "## Unused Indexes\n"
+    "List indexes from UNUSED INDEXES section above. Give DROP INDEX statements.\n\n"
     "## Checkpoint / WAL Issues\n"
-    "## Action Plan (Priority Order)\n"
+    "Review CHECKPOINT STATS and BGWRITER STATS sections above. Flag any issues.\n\n"
+    "## Action Plan\n"
+    "Numbered list of fixes sorted by impact, using ONLY data from above.\n"
 )
 
 
@@ -900,11 +916,11 @@ class PerformanceAnalyser:
 
     def _run_llm_analysis(self, raw_data: dict[str, Any]) -> dict[str, Any]:
         report_text = self._format_report(raw_data)
+        # Append instructions AFTER the data so codellama "completes" a
+        # real analysis rather than hallucinating from a system prompt.
+        full_prompt = report_text + _ANALYSIS_INSTRUCTION
         try:
-            llm_response = self.llm_client.generate(
-                prompt=report_text,
-                system_prompt=ANALYSIS_SYSTEM_PROMPT,
-            )
+            llm_response = self.llm_client.generate(prompt=full_prompt)
         except (ConnectionError, RuntimeError) as exc:
             llm_response = f"LLM analysis failed: {exc}"
         return {
@@ -914,11 +930,9 @@ class PerformanceAnalyser:
         }
 
     def _run_llm_analysis_from_text(self, report_text: str) -> dict[str, Any]:
+        full_prompt = report_text + _ANALYSIS_INSTRUCTION
         try:
-            llm_response = self.llm_client.generate(
-                prompt=report_text,
-                system_prompt=ANALYSIS_SYSTEM_PROMPT,
-            )
+            llm_response = self.llm_client.generate(prompt=full_prompt)
         except (ConnectionError, RuntimeError) as exc:
             llm_response = f"LLM analysis failed: {exc}"
         return {
