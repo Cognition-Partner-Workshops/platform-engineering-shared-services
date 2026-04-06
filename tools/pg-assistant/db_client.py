@@ -282,7 +282,7 @@ class OracleClient(BaseDBClient):
             with self._conn.cursor() as cur:
                 cur.execute(sql)
                 if cur.description:
-                    columns = [desc[0] for desc in cur.description]
+                    columns = [desc[0].lower() for desc in cur.description]
                     raw_rows = cur.fetchall()
                     elapsed = time.monotonic() - start
                     rows = [dict(zip(columns, r)) for r in raw_rows]
