@@ -12,14 +12,35 @@ import config
 
 
 def _run_local_shell(kubeconfig_content: str, command: str, timeout: int = 120) -> SSHResult:
-    """Run a shell command locally with KUBECONFIG set from profile content."""
-    kubeconfig_path = os.path.join(config.DATA_DIR, "kubeconfigs", "_monitor_temp.kubeconfig")
-    os.makedirs(os.path.dirname(kubeconfig_path), exist_ok=True)
+    """Run a shell command locally with KUBECONFIG set from profile content.
+
+    Replaces bare ``kubectl`` and ``helm`` references with their full paths
+    so the command works even when these binaries are not in $PATH.
+    """
+    kubectl = config.get_kubectl_path()
+    helm = config.get_helm_path()
+    if not kubectl:
+        return SSHResult(
+            hostname="local", command=command, return_code=1,
+            stdout="",
+            stderr=(
+                "kubectl not found on this machine.\n\n"
+                "Install kubectl:\n"
+                "  curl -LO https://dl.k8s.io/release/$(curl -Ls https://dl.k8s.io/release/stable.txt)/bin/linux/amd64/kubectl\n"
+                "  chmod +x kubectl && sudo mv kubectl /usr/local/bin/\n\n"
+                "Or on macOS: brew install kubectl\n"
+                "Or see: https://kubernetes.io/docs/tasks/tools/"
+            ),
+            success=False,
+        )
+    # Replace bare kubectl/helm with full paths
+    resolved_cmd = command.replace("kubectl ", f"{kubectl} ").replace("helm ", f"{helm} " if helm else "helm ")
+    kubeconfig_path = config.get_kubeconfig_path("_monitor_temp")
     with open(kubeconfig_path, "w") as f:
         f.write(kubeconfig_content)
     env = dict(os.environ, KUBECONFIG=kubeconfig_path)
     try:
-        proc = subprocess.run(command, shell=True, capture_output=True, text=True, timeout=timeout, env=env)
+        proc = subprocess.run(resolved_cmd, shell=True, capture_output=True, text=True, timeout=timeout, env=env)
         return SSHResult(
             hostname="local", command=command, return_code=proc.returncode,
             stdout=proc.stdout, stderr=proc.stderr, success=proc.returncode == 0,

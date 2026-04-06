@@ -1,6 +1,9 @@
 """Configuration for the K8s Agent application."""
 
 import os
+import shutil
+import subprocess
+
 
 # LLM Configuration
 LLM_API_URL = os.getenv(
@@ -27,3 +30,77 @@ UPLOADS_DIR = os.path.join(DATA_DIR, "uploads")
 # Ensure directories exist
 os.makedirs(PROFILES_DIR, exist_ok=True)
 os.makedirs(UPLOADS_DIR, exist_ok=True)
+
+
+# ── kubectl / helm path detection ─────────────────────────────────────────
+
+# Common install locations to check when kubectl/helm are not in PATH
+_KUBECTL_SEARCH_PATHS = [
+    "/usr/local/bin/kubectl",
+    "/usr/bin/kubectl",
+    "/snap/bin/kubectl",
+    os.path.expanduser("~/.local/bin/kubectl"),
+    os.path.expanduser("~/bin/kubectl"),
+    "/opt/bin/kubectl",
+]
+
+_HELM_SEARCH_PATHS = [
+    "/usr/local/bin/helm",
+    "/usr/bin/helm",
+    "/snap/bin/helm",
+    os.path.expanduser("~/.local/bin/helm"),
+    os.path.expanduser("~/bin/helm"),
+    "/opt/bin/helm",
+]
+
+
+def _find_binary(name: str, search_paths: list[str]) -> str:
+    """Find a binary by name, checking PATH first then common locations."""
+    found = shutil.which(name)
+    if found:
+        return found
+    for path in search_paths:
+        if os.path.isfile(path) and os.access(path, os.X_OK):
+            return path
+    return ""
+
+
+def get_kubectl_path() -> str:
+    """Return the full path to kubectl, or empty string if not found."""
+    return _find_binary("kubectl", _KUBECTL_SEARCH_PATHS)
+
+
+def get_helm_path() -> str:
+    """Return the full path to helm, or empty string if not found."""
+    return _find_binary("helm", _HELM_SEARCH_PATHS)
+
+
+def get_kubeconfig_path(profile_name: str = "_temp") -> str:
+    """Return the path where a kubeconfig file should be written for local commands."""
+    kc_dir = os.path.join(DATA_DIR, "kubeconfigs")
+    os.makedirs(kc_dir, exist_ok=True)
+    return os.path.join(kc_dir, f"{profile_name}.kubeconfig")
+
+
+def fetch_namespaces(kubeconfig_content: str) -> list[str]:
+    """Fetch all namespaces from a cluster using kubectl with the given kubeconfig.
+
+    Returns a list of namespace names, or an empty list on failure.
+    """
+    kubectl = get_kubectl_path()
+    if not kubectl:
+        return []
+    kc_path = get_kubeconfig_path("_ns_fetch")
+    os.makedirs(os.path.dirname(kc_path), exist_ok=True)
+    with open(kc_path, "w") as f:
+        f.write(kubeconfig_content)
+    try:
+        proc = subprocess.run(
+            f"{kubectl} --kubeconfig={kc_path} get namespaces -o jsonpath='{{.items[*].metadata.name}}'",
+            shell=True, capture_output=True, text=True, timeout=15,
+        )
+        if proc.returncode == 0 and proc.stdout.strip():
+            return sorted(proc.stdout.strip().split())
+        return []
+    except Exception:
+        return []

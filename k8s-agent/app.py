@@ -11,7 +11,7 @@ import streamlit as st
 # Navigation uses native st.radio — no third-party component needed.
 
 import config
-from config import is_llm_configured
+from config import is_llm_configured, get_kubectl_path, fetch_namespaces, get_kubeconfig_path
 from modules.profile_manager import (
     ClusterProfile,
     save_profile,
@@ -899,6 +899,17 @@ def page_cluster_debugger():
             return
         cp_node = cp_nodes[0]
 
+    # kubectl availability check for imported clusters
+    if profile.cluster_source == "imported" and not get_kubectl_path():
+        st.error(
+            "**kubectl not found** on this machine.\n\n"
+            "Install it with:\n```\n"
+            "curl -LO https://dl.k8s.io/release/$(curl -Ls https://dl.k8s.io/release/stable.txt)/bin/linux/amd64/kubectl\n"
+            "chmod +x kubectl && sudo mv kubectl /usr/local/bin/\n```\n"
+            "Or see: https://kubernetes.io/docs/tasks/tools/"
+        )
+        return
+
     available_commands = get_available_commands(profile)
 
     tab_quick, tab_category, tab_custom, tab_ai = st.tabs([
@@ -1062,7 +1073,29 @@ def page_monitoring_setup():
             return
         cp_node = cp_nodes[0]
 
-    namespace = st.text_input("Monitoring Namespace", value="monitoring")
+    # kubectl availability check for imported clusters
+    if profile.cluster_source == "imported" and not get_kubectl_path():
+        st.error(
+            "**kubectl not found** on this machine.\n\n"
+            "Install it with:\n```\n"
+            "curl -LO https://dl.k8s.io/release/$(curl -Ls https://dl.k8s.io/release/stable.txt)/bin/linux/amd64/kubectl\n"
+            "chmod +x kubectl && sudo mv kubectl /usr/local/bin/\n```\n"
+            "Or see: https://kubernetes.io/docs/tasks/tools/"
+        )
+        return
+
+    # Namespace selection — auto-fetch from cluster for imported clusters
+    if profile.cluster_source == "imported" and profile.kubeconfig_content:
+        cluster_ns = fetch_namespaces(profile.kubeconfig_content)
+        if cluster_ns:
+            # Ensure "monitoring" is an option even if it doesn't exist yet
+            ns_options = cluster_ns if "monitoring" in cluster_ns else cluster_ns + ["monitoring"]
+            default_idx = ns_options.index("monitoring") if "monitoring" in ns_options else 0
+            namespace = st.selectbox("Monitoring Namespace", options=ns_options, index=default_idx, key="mon_ns")
+        else:
+            namespace = st.text_input("Monitoring Namespace", value="monitoring", key="mon_ns_txt")
+    else:
+        namespace = st.text_input("Monitoring Namespace", value="monitoring", key="mon_ns_txt")
 
     tab_install, tab_dashboards, tab_alerts, tab_status, tab_scripts, tab_advice = st.tabs([
         "Install Stack",
@@ -1216,6 +1249,22 @@ def page_log_analysis():
             return
         cp_node = cp_nodes[0]
 
+    # kubectl availability check for imported clusters
+    if profile.cluster_source == "imported" and not get_kubectl_path():
+        st.error(
+            "**kubectl not found** on this machine.\n\n"
+            "Install it with:\n```\n"
+            "curl -LO https://dl.k8s.io/release/$(curl -Ls https://dl.k8s.io/release/stable.txt)/bin/linux/amd64/kubectl\n"
+            "chmod +x kubectl && sudo mv kubectl /usr/local/bin/\n```\n"
+            "Or see: https://kubernetes.io/docs/tasks/tools/"
+        )
+        return
+
+    # Pre-fetch namespaces for imported clusters (used by Pod Logs tab)
+    _cluster_namespaces: list[str] = []
+    if profile.cluster_source == "imported" and profile.kubeconfig_content:
+        _cluster_namespaces = fetch_namespaces(profile.kubeconfig_content)
+
     available_log_sources = get_available_log_sources(profile)
 
     tab_system, tab_pod, tab_correlation, tab_ai = st.tabs([
@@ -1285,7 +1334,12 @@ def page_log_analysis():
         st.markdown("### Pod Logs")
         col1, col2 = st.columns(2)
         with col1:
-            pod_ns = st.text_input("Namespace", value="default", key="pod_ns")
+            if _cluster_namespaces:
+                pod_ns = st.selectbox("Namespace", options=_cluster_namespaces,
+                                      index=_cluster_namespaces.index("default") if "default" in _cluster_namespaces else 0,
+                                      key="pod_ns")
+            else:
+                pod_ns = st.text_input("Namespace", value="default", key="pod_ns")
             pod_name = st.text_input("Pod Name", placeholder="my-pod-xyz", key="pod_name_input")
         with col2:
             container = st.text_input("Container (optional)", key="pod_container")
@@ -1452,6 +1506,22 @@ def page_resource_viewer():
         )
         return
 
+    # kubectl availability check for imported clusters
+    if profile.cluster_source == "imported" and not get_kubectl_path():
+        st.error(
+            "**kubectl not found** on this machine.\n\n"
+            "Install it with:\n```\n"
+            "curl -LO https://dl.k8s.io/release/$(curl -Ls https://dl.k8s.io/release/stable.txt)/bin/linux/amd64/kubectl\n"
+            "chmod +x kubectl && sudo mv kubectl /usr/local/bin/\n```\n"
+            "Or see: https://kubernetes.io/docs/tasks/tools/"
+        )
+        return
+
+    # Pre-fetch namespaces for imported clusters
+    _rv_namespaces: list[str] = []
+    if profile.cluster_source == "imported" and profile.kubeconfig_content:
+        _rv_namespaces = fetch_namespaces(profile.kubeconfig_content)
+
     tab_resources, tab_node_health, tab_rbac, tab_helm, tab_events = st.tabs([
         "Cluster Resources",
         "Node Health",
@@ -1481,7 +1551,14 @@ def page_resource_viewer():
                     key="res_ns_choice",
                 )
                 if ns_choice == "Specific":
-                    namespace = st.text_input("Namespace", value="default", key="res_ns")
+                    if _rv_namespaces:
+                        namespace = st.selectbox(
+                            "Namespace", options=_rv_namespaces,
+                            index=_rv_namespaces.index("default") if "default" in _rv_namespaces else 0,
+                            key="res_ns",
+                        )
+                    else:
+                        namespace = st.text_input("Namespace", value="default", key="res_ns")
                 else:
                     namespace = ""
             else:
@@ -1528,11 +1605,19 @@ def page_resource_viewer():
                 key="desc_name",
             )
         with desc_col2:
-            desc_ns = st.text_input(
-                "Namespace (if applicable)",
-                value="default",
-                key="desc_ns",
-            )
+            if _rv_namespaces:
+                desc_ns = st.selectbox(
+                    "Namespace (if applicable)",
+                    options=_rv_namespaces,
+                    index=_rv_namespaces.index("default") if "default" in _rv_namespaces else 0,
+                    key="desc_ns",
+                )
+            else:
+                desc_ns = st.text_input(
+                    "Namespace (if applicable)",
+                    value="default",
+                    key="desc_ns",
+                )
 
         if st.button("Describe", key="describe_res") and desc_name:
             # Determine the singular resource type for describe
@@ -1638,12 +1723,21 @@ def page_resource_viewer():
 
         rbac_ns = ""
         if "(namespaced)" in rbac_type or rbac_type == "ServiceAccounts":
-            rbac_ns = st.text_input(
-                "Namespace",
-                value="default",
-                key="rbac_ns",
-                help="Leave blank for all namespaces",
-            )
+            if _rv_namespaces:
+                rbac_ns = st.selectbox(
+                    "Namespace (blank = all)",
+                    options=[""] + _rv_namespaces,
+                    index=0,
+                    key="rbac_ns",
+                    format_func=lambda x: "All Namespaces" if x == "" else x,
+                )
+            else:
+                rbac_ns = st.text_input(
+                    "Namespace",
+                    value="default",
+                    key="rbac_ns",
+                    help="Leave blank for all namespaces",
+                )
 
         if st.button("Fetch RBAC Resources", type="primary", key="fetch_rbac"):
             cmd_map = {
@@ -1708,7 +1802,12 @@ def page_resource_viewer():
             helm_ns_all = st.checkbox("All namespaces", value=True, key="helm_ns_all")
             helm_ns = ""
             if not helm_ns_all:
-                helm_ns = st.text_input("Namespace", value="default", key="helm_ns")
+                if _rv_namespaces:
+                    helm_ns = st.selectbox("Namespace", options=_rv_namespaces,
+                                           index=_rv_namespaces.index("default") if "default" in _rv_namespaces else 0,
+                                           key="helm_ns")
+                else:
+                    helm_ns = st.text_input("Namespace", value="default", key="helm_ns")
 
             if st.button("List Helm Releases", type="primary", key="helm_list"):
                 helm_cmd = "helm list"
@@ -1733,7 +1832,12 @@ def page_resource_viewer():
                 helm_release_name = st.text_input("Release Name", placeholder="my-release", key="helm_rel")
                 helm_chart = st.text_input("Chart", placeholder="prometheus-community/kube-prometheus-stack", key="helm_chart")
             with hcol2:
-                helm_install_ns = st.text_input("Namespace", value="default", key="helm_install_ns")
+                if _rv_namespaces:
+                    helm_install_ns = st.selectbox("Namespace", options=_rv_namespaces,
+                                                   index=_rv_namespaces.index("default") if "default" in _rv_namespaces else 0,
+                                                   key="helm_install_ns")
+                else:
+                    helm_install_ns = st.text_input("Namespace", value="default", key="helm_install_ns")
                 helm_create_ns = st.checkbox("Create namespace if not exists", value=True, key="helm_create_ns")
             helm_values = st.text_area(
                 "Values (YAML, optional)",

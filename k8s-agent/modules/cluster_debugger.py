@@ -58,11 +58,25 @@ DIAGNOSTIC_COMMANDS = {
 
 def _run_local_kubectl(kubeconfig_content: str, kubectl_args: str, timeout: int = 60) -> SSHResult:
     """Run a kubectl command locally using the given kubeconfig content."""
-    kubeconfig_path = os.path.join(config.DATA_DIR, "kubeconfigs", "_debug_temp.kubeconfig")
-    os.makedirs(os.path.dirname(kubeconfig_path), exist_ok=True)
+    kubectl = config.get_kubectl_path()
+    if not kubectl:
+        return SSHResult(
+            hostname="local", command="kubectl " + kubectl_args, return_code=1,
+            stdout="",
+            stderr=(
+                "kubectl not found on this machine.\n\n"
+                "Install kubectl:\n"
+                "  curl -LO https://dl.k8s.io/release/$(curl -Ls https://dl.k8s.io/release/stable.txt)/bin/linux/amd64/kubectl\n"
+                "  chmod +x kubectl && sudo mv kubectl /usr/local/bin/\n\n"
+                "Or on macOS: brew install kubectl\n"
+                "Or see: https://kubernetes.io/docs/tasks/tools/"
+            ),
+            success=False,
+        )
+    kubeconfig_path = config.get_kubeconfig_path("_debug_temp")
     with open(kubeconfig_path, "w") as f:
         f.write(kubeconfig_content)
-    full_cmd = f"kubectl --kubeconfig={kubeconfig_path} {kubectl_args}"
+    full_cmd = f"{kubectl} --kubeconfig={kubeconfig_path} {kubectl_args}"
     try:
         proc = subprocess.run(full_cmd, shell=True, capture_output=True, text=True, timeout=timeout)
         return SSHResult(
