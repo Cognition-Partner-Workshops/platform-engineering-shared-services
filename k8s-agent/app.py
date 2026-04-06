@@ -464,54 +464,56 @@ def page_profile_manager():
             "without provisioning a new cluster."
         )
 
-        with st.form("import_cluster_form"):
-            import_name = st.text_input(
-                "Profile Name *",
-                placeholder="my-existing-cluster",
-            )
-            import_desc = st.text_area(
-                "Description",
-                placeholder="Production cluster running in datacenter A",
-            )
-            kubeconfig_file = st.file_uploader(
-                "Upload kubeconfig file",
-                type=["yaml", "yml", "conf", "config"],
-                key="kubeconfig_upload",
-                help="Usually found at ~/.kube/config on your cluster's control-plane node.",
-            )
-            k8s_ver = st.text_input(
-                "Kubernetes Version (optional)",
-                placeholder="1.30",
-                value="1.30",
-            )
+        # NOTE: file_uploader is kept OUTSIDE st.form because Streamlit
+        # resets the uploaded file on form submission, causing the import
+        # to silently do nothing.
+        import_name = st.text_input(
+            "Profile Name *",
+            placeholder="my-existing-cluster",
+            key="import_cluster_name",
+        )
+        import_desc = st.text_area(
+            "Description",
+            placeholder="Production cluster running in datacenter A",
+            key="import_cluster_desc",
+        )
+        kubeconfig_file = st.file_uploader(
+            "Upload kubeconfig file",
+            type=["yaml", "yml", "conf", "config", "txt"],
+            key="kubeconfig_upload",
+            help="Usually found at ~/.kube/config on your cluster's control-plane node. "
+                 "If your file has no extension, rename it to config.yaml or config.txt before uploading.",
+        )
+        k8s_ver = st.text_input(
+            "Kubernetes Version (optional)",
+            placeholder="1.30",
+            value="1.30",
+            key="import_cluster_k8s_ver",
+        )
 
-            submitted_import = st.form_submit_button(
-                "Import Cluster", type="primary", use_container_width=True,
-            )
-
-            if submitted_import:
-                if not import_name:
-                    st.error("Profile name is required.")
-                elif not kubeconfig_file:
-                    st.error("Please upload a kubeconfig file.")
-                else:
-                    kubeconfig_content = kubeconfig_file.read().decode("utf-8")
-                    profile = ClusterProfile(
-                        name=import_name,
-                        description=import_desc,
-                        kubernetes_version=k8s_ver or "1.30",
-                        status="active",
-                        cluster_source="imported",
-                        kubeconfig_content=kubeconfig_content,
-                    )
-                    save_profile(profile)
-                    st.session_state.active_profile = import_name
-                    st.success(
-                        f"Cluster '{import_name}' imported! "
-                        "Select it from the sidebar to start using Debugger, Monitoring, "
-                        "Resource Viewer, etc."
-                    )
-                    st.rerun()
+        if st.button("Import Cluster", type="primary", use_container_width=True, key="import_cluster_btn"):
+            if not import_name:
+                st.error("Profile name is required.")
+            elif not kubeconfig_file:
+                st.error("Please upload a kubeconfig file.")
+            else:
+                kubeconfig_content = kubeconfig_file.read().decode("utf-8")
+                profile = ClusterProfile(
+                    name=import_name,
+                    description=import_desc,
+                    kubernetes_version=k8s_ver or "1.30",
+                    status="imported",
+                    cluster_source="imported",
+                    kubeconfig_content=kubeconfig_content,
+                )
+                save_profile(profile)
+                st.session_state.active_profile = import_name
+                st.success(
+                    f"Cluster '{import_name}' imported! "
+                    "Select it from the sidebar to start using Debugger, Monitoring, "
+                    "Resource Viewer, etc."
+                )
+                st.rerun()
 
     # ── Manage Profiles ───────────────────────────────────────────────────
     with tab_list:
