@@ -1,7 +1,58 @@
-"""Monitoring Setup — Prometheus, Grafana, and dashboard provisioning via SSH."""
+"""Monitoring Setup — Prometheus, Grafana, and dashboard provisioning.
+
+Supports both provisioned clusters (SSH-based) and imported clusters (kubeconfig-based).
+"""
+
+import os
+import subprocess
 
 from modules.cluster_creator import run_ssh_command, SSHResult
 from modules.profile_manager import ClusterProfile
+import config
+
+
+def _run_local_shell(kubeconfig_content: str, command: str, timeout: int = 120) -> SSHResult:
+    """Run a shell command locally with KUBECONFIG set from profile content."""
+    kubeconfig_path = os.path.join(config.DATA_DIR, "kubeconfigs", "_monitor_temp.kubeconfig")
+    os.makedirs(os.path.dirname(kubeconfig_path), exist_ok=True)
+    with open(kubeconfig_path, "w") as f:
+        f.write(kubeconfig_content)
+    env = dict(os.environ, KUBECONFIG=kubeconfig_path)
+    try:
+        proc = subprocess.run(command, shell=True, capture_output=True, text=True, timeout=timeout, env=env)
+        return SSHResult(
+            hostname="local", command=command, return_code=proc.returncode,
+            stdout=proc.stdout, stderr=proc.stderr, success=proc.returncode == 0,
+        )
+    except subprocess.TimeoutExpired:
+        return SSHResult(
+            hostname="local", command=command, return_code=-1,
+            stdout="", stderr=f"Command timed out after {timeout}s", success=False,
+        )
+    except Exception as e:
+        return SSHResult(
+            hostname="local", command=command, return_code=-1,
+            stdout="", stderr=str(e), success=False,
+        )
+
+
+def _run_on_cluster(control_plane_node: dict | None, command: str, profile: ClusterProfile | None = None, timeout: int = 120) -> SSHResult:
+    """Route command to local kubectl or SSH based on cluster source."""
+    if profile and profile.cluster_source == "imported" and profile.kubeconfig_content:
+        return _run_local_shell(profile.kubeconfig_content, command, timeout=timeout)
+    if not control_plane_node:
+        return SSHResult(
+            hostname="unknown", command=command, return_code=1,
+            stdout="", stderr="No control-plane node available.", success=False,
+        )
+    return run_ssh_command(
+        ip_address=control_plane_node["ip_address"],
+        command=command,
+        ssh_user=control_plane_node.get("ssh_user", "root"),
+        ssh_port=control_plane_node.get("ssh_port", 22),
+        ssh_key_path=control_plane_node.get("ssh_key_path", "~/.ssh/id_rsa"),
+        timeout=timeout,
+    )
 
 
 def generate_helm_install_script() -> str:
@@ -324,67 +375,44 @@ echo "=== Alert rules installed ==="
 """
 
 
-def install_helm(control_plane_node: dict) -> SSHResult:
-    """Install Helm on the control-plane node."""
-    return run_ssh_command(
-        ip_address=control_plane_node["ip_address"],
-        command=generate_helm_install_script(),
-        ssh_user=control_plane_node.get("ssh_user", "root"),
-        ssh_port=control_plane_node.get("ssh_port", 22),
-        ssh_key_path=control_plane_node.get("ssh_key_path", "~/.ssh/id_rsa"),
-        timeout=120,
-    )
+def install_helm(control_plane_node: dict | None = None, profile: ClusterProfile | None = None) -> SSHResult:
+    """Install Helm on the control-plane node or locally for imported clusters."""
+    return _run_on_cluster(control_plane_node, generate_helm_install_script(), profile=profile, timeout=120)
 
 
 def install_prometheus_stack(
-    control_plane_node: dict,
+    control_plane_node: dict | None = None,
     namespace: str = "monitoring",
+    profile: ClusterProfile | None = None,
 ) -> SSHResult:
     """Install the full kube-prometheus-stack."""
-    return run_ssh_command(
-        ip_address=control_plane_node["ip_address"],
-        command=generate_prometheus_install_script(namespace),
-        ssh_user=control_plane_node.get("ssh_user", "root"),
-        ssh_port=control_plane_node.get("ssh_port", 22),
-        ssh_key_path=control_plane_node.get("ssh_key_path", "~/.ssh/id_rsa"),
-        timeout=900,
-    )
+    return _run_on_cluster(control_plane_node, generate_prometheus_install_script(namespace), profile=profile, timeout=900)
 
 
 def install_dashboards(
-    control_plane_node: dict,
-    dashboard_keys: list[str],
+    control_plane_node: dict | None = None,
+    dashboard_keys: list[str] | None = None,
     namespace: str = "monitoring",
+    profile: ClusterProfile | None = None,
 ) -> SSHResult:
     """Import selected Grafana dashboards."""
-    return run_ssh_command(
-        ip_address=control_plane_node["ip_address"],
-        command=generate_dashboard_import_script(dashboard_keys, namespace),
-        ssh_user=control_plane_node.get("ssh_user", "root"),
-        ssh_port=control_plane_node.get("ssh_port", 22),
-        ssh_key_path=control_plane_node.get("ssh_key_path", "~/.ssh/id_rsa"),
-        timeout=300,
-    )
+    dashboard_keys = dashboard_keys or []
+    return _run_on_cluster(control_plane_node, generate_dashboard_import_script(dashboard_keys, namespace), profile=profile, timeout=300)
 
 
 def install_alert_rules(
-    control_plane_node: dict,
+    control_plane_node: dict | None = None,
     namespace: str = "monitoring",
+    profile: ClusterProfile | None = None,
 ) -> SSHResult:
     """Install Prometheus alerting rules."""
-    return run_ssh_command(
-        ip_address=control_plane_node["ip_address"],
-        command=generate_alerting_rules_script(namespace),
-        ssh_user=control_plane_node.get("ssh_user", "root"),
-        ssh_port=control_plane_node.get("ssh_port", 22),
-        ssh_key_path=control_plane_node.get("ssh_key_path", "~/.ssh/id_rsa"),
-        timeout=60,
-    )
+    return _run_on_cluster(control_plane_node, generate_alerting_rules_script(namespace), profile=profile, timeout=60)
 
 
 def get_monitoring_status(
-    control_plane_node: dict,
+    control_plane_node: dict | None = None,
     namespace: str = "monitoring",
+    profile: ClusterProfile | None = None,
 ) -> SSHResult:
     """Check the status of the monitoring stack."""
     command = f"""
@@ -405,14 +433,7 @@ echo ""
 echo ">> ServiceMonitors:"
 kubectl -n {namespace} get servicemonitors 2>/dev/null || echo "No ServiceMonitors found"
 """
-    return run_ssh_command(
-        ip_address=control_plane_node["ip_address"],
-        command=command,
-        ssh_user=control_plane_node.get("ssh_user", "root"),
-        ssh_port=control_plane_node.get("ssh_port", 22),
-        ssh_key_path=control_plane_node.get("ssh_key_path", "~/.ssh/id_rsa"),
-        timeout=30,
-    )
+    return _run_on_cluster(control_plane_node, command, profile=profile, timeout=30)
 
 
 def get_monitoring_advice(

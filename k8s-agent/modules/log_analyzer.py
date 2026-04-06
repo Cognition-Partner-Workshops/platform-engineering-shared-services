@@ -1,11 +1,62 @@
-"""Log Analyzer — Kubernetes log collection, parsing, error correlation, and analysis."""
+"""Log Analyzer — Kubernetes log collection, parsing, error correlation, and analysis.
 
+Supports both provisioned clusters (SSH-based) and imported clusters (kubeconfig-based).
+"""
+
+import os
 import re
+import subprocess
 from collections import Counter
 from dataclasses import dataclass, field
 from typing import Optional
 
 from modules.cluster_creator import run_ssh_command, SSHResult
+from modules.profile_manager import ClusterProfile
+import config
+
+
+def _run_local_shell(kubeconfig_content: str, command: str, timeout: int = 60) -> SSHResult:
+    """Run a shell command locally with KUBECONFIG set from profile content."""
+    kubeconfig_path = os.path.join(config.DATA_DIR, "kubeconfigs", "_log_temp.kubeconfig")
+    os.makedirs(os.path.dirname(kubeconfig_path), exist_ok=True)
+    with open(kubeconfig_path, "w") as f:
+        f.write(kubeconfig_content)
+    env = dict(os.environ, KUBECONFIG=kubeconfig_path)
+    try:
+        proc = subprocess.run(command, shell=True, capture_output=True, text=True, timeout=timeout, env=env)
+        return SSHResult(
+            hostname="local", command=command, return_code=proc.returncode,
+            stdout=proc.stdout, stderr=proc.stderr, success=proc.returncode == 0,
+        )
+    except subprocess.TimeoutExpired:
+        return SSHResult(
+            hostname="local", command=command, return_code=-1,
+            stdout="", stderr=f"Command timed out after {timeout}s", success=False,
+        )
+    except Exception as e:
+        return SSHResult(
+            hostname="local", command=command, return_code=-1,
+            stdout="", stderr=str(e), success=False,
+        )
+
+
+def _run_on_cluster(control_plane_node: dict | None, command: str, profile: ClusterProfile | None = None, timeout: int = 60) -> SSHResult:
+    """Route command to local shell or SSH based on cluster source."""
+    if profile and profile.cluster_source == "imported" and profile.kubeconfig_content:
+        return _run_local_shell(profile.kubeconfig_content, command, timeout=timeout)
+    if not control_plane_node:
+        return SSHResult(
+            hostname="unknown", command=command, return_code=1,
+            stdout="", stderr="No control-plane node available.", success=False,
+        )
+    return run_ssh_command(
+        ip_address=control_plane_node["ip_address"],
+        command=command,
+        ssh_user=control_plane_node.get("ssh_user", "root"),
+        ssh_port=control_plane_node.get("ssh_port", 22),
+        ssh_key_path=control_plane_node.get("ssh_key_path", "~/.ssh/id_rsa"),
+        timeout=timeout,
+    )
 
 
 @dataclass
@@ -34,6 +85,9 @@ class LogAnalysisResult:
 
 # ── Log collection commands ───────────────────────────────────────────────
 
+# SSH-only sources (journalctl requires node access)
+SSH_ONLY_LOG_SOURCES = {"Kubelet", "CRI-O"}
+
 LOG_SOURCES = {
     "Kubelet": "journalctl -u kubelet --no-pager -n {lines} --since '{since}'",
     "CRI-O": "journalctl -u crio --no-pager -n {lines} --since '{since}'",
@@ -46,22 +100,39 @@ LOG_SOURCES = {
     "Events": "kubectl get events -A --sort-by='.lastTimestamp' | tail -{lines}",
 }
 
+def get_available_log_sources(profile: ClusterProfile | None = None) -> list[str]:
+    """Return log sources available for the given cluster type."""
+    if profile and profile.cluster_source == "imported":
+        return [s for s in LOG_SOURCES if s not in SSH_ONLY_LOG_SOURCES]
+    return list(LOG_SOURCES.keys())
+
+
 POD_LOG_COMMAND = "kubectl logs {pod_ref} --tail={lines} --since={since_k8s} {container_flag}"
 POD_PREVIOUS_LOG_COMMAND = "kubectl logs {pod_ref} --previous --tail={lines} {container_flag} 2>/dev/null || echo 'No previous logs available'"
 
 
 def collect_logs(
-    control_plane_node: dict,
+    control_plane_node: dict | None,
     source: str,
     lines: int = 200,
     since: str = "1 hour ago",
     since_k8s: str = "1h",
+    profile: ClusterProfile | None = None,
 ) -> SSHResult:
     """Collect logs from a specific source on the cluster."""
+    # Block SSH-only sources for imported clusters
+    if profile and profile.cluster_source == "imported" and source in SSH_ONLY_LOG_SOURCES:
+        return SSHResult(
+            hostname="local", command=source, return_code=1,
+            stdout="",
+            stderr=f"'{source}' logs require SSH access (not available for imported clusters).",
+            success=False,
+        )
+
     cmd_template = LOG_SOURCES.get(source)
     if not cmd_template:
         return SSHResult(
-            hostname=control_plane_node["ip_address"],
+            hostname=control_plane_node["ip_address"] if control_plane_node else "local",
             command=source,
             return_code=1,
             stdout="",
@@ -75,24 +146,18 @@ def collect_logs(
         since_k8s=since_k8s,
     )
 
-    return run_ssh_command(
-        ip_address=control_plane_node["ip_address"],
-        command=command,
-        ssh_user=control_plane_node.get("ssh_user", "root"),
-        ssh_port=control_plane_node.get("ssh_port", 22),
-        ssh_key_path=control_plane_node.get("ssh_key_path", "~/.ssh/id_rsa"),
-        timeout=60,
-    )
+    return _run_on_cluster(control_plane_node, command, profile=profile, timeout=60)
 
 
 def collect_pod_logs(
-    control_plane_node: dict,
+    control_plane_node: dict | None,
     namespace: str,
     pod_name: str,
     container: str = "",
     lines: int = 200,
     since_k8s: str = "1h",
     previous: bool = False,
+    profile: ClusterProfile | None = None,
 ) -> SSHResult:
     """Collect logs from a specific pod."""
     pod_ref = f"-n {namespace} {pod_name}"
@@ -112,28 +177,22 @@ def collect_pod_logs(
             container_flag=container_flag,
         )
 
-    return run_ssh_command(
-        ip_address=control_plane_node["ip_address"],
-        command=command,
-        ssh_user=control_plane_node.get("ssh_user", "root"),
-        ssh_port=control_plane_node.get("ssh_port", 22),
-        ssh_key_path=control_plane_node.get("ssh_key_path", "~/.ssh/id_rsa"),
-        timeout=60,
-    )
+    return _run_on_cluster(control_plane_node, command, profile=profile, timeout=60)
 
 
 def collect_multi_source_logs(
-    control_plane_node: dict,
+    control_plane_node: dict | None,
     sources: list[str],
     lines: int = 100,
     since: str = "1 hour ago",
     since_k8s: str = "1h",
+    profile: ClusterProfile | None = None,
 ) -> dict[str, SSHResult]:
     """Collect logs from multiple sources."""
     results = {}
     for source in sources:
         results[source] = collect_logs(
-            control_plane_node, source, lines, since, since_k8s
+            control_plane_node, source, lines, since, since_k8s, profile=profile
         )
     return results
 
@@ -338,17 +397,11 @@ Please provide:
 
 
 def get_pod_list(
-    control_plane_node: dict,
+    control_plane_node: dict | None,
     namespace: str = "",
+    profile: ClusterProfile | None = None,
 ) -> SSHResult:
     """Get list of pods for the log analysis UI."""
     ns_flag = f"-n {namespace}" if namespace else "-A"
     command = f"kubectl get pods {ns_flag} -o custom-columns='NAMESPACE:.metadata.namespace,NAME:.metadata.name,STATUS:.status.phase,CONTAINERS:.spec.containers[*].name' --no-headers"
-    return run_ssh_command(
-        ip_address=control_plane_node["ip_address"],
-        command=command,
-        ssh_user=control_plane_node.get("ssh_user", "root"),
-        ssh_port=control_plane_node.get("ssh_port", 22),
-        ssh_key_path=control_plane_node.get("ssh_key_path", "~/.ssh/id_rsa"),
-        timeout=30,
-    )
+    return _run_on_cluster(control_plane_node, command, profile=profile, timeout=30)

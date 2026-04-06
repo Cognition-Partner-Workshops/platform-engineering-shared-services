@@ -34,6 +34,7 @@ from modules.cluster_creator import (
     get_cluster_status,
     get_llm_cluster_advice,
     upload_flannel_manifest_to_node,
+    run_kubectl,
     ProvisionStep,
     _run_step,
     get_common_setup_steps,
@@ -43,7 +44,9 @@ from modules.cluster_creator import (
 )
 from modules.cluster_debugger import (
     DIAGNOSTIC_COMMANDS,
+    KUBECTL_DIAGNOSTIC_COMMANDS,
     CATEGORY_MAP,
+    get_available_commands,
     run_diagnostic,
     run_category_diagnostics,
     run_all_diagnostics,
@@ -66,6 +69,7 @@ from modules.monitoring_setup import (
 )
 from modules.log_analyzer import (
     LOG_SOURCES,
+    get_available_log_sources,
     collect_logs,
     collect_pod_logs,
     collect_multi_source_logs,
@@ -182,11 +186,16 @@ def render_sidebar():
                         f"**Status:** <span class='{status_class}'>{profile.status.upper()}</span>",
                         unsafe_allow_html=True,
                     )
-                    st.caption(
-                        f"K8s {profile.kubernetes_version} | CRI-O {profile.crio_version} | "
-                        f"{len(profile.get_control_plane_nodes())} CP + "
-                        f"{len(profile.get_worker_nodes())} Workers"
-                    )
+                    if profile.cluster_source == "imported":
+                        st.caption(
+                            f"K8s {profile.kubernetes_version} | Imported Cluster"
+                        )
+                    else:
+                        st.caption(
+                            f"K8s {profile.kubernetes_version} | CRI-O {profile.crio_version} | "
+                            f"{len(profile.get_control_plane_nodes())} CP + "
+                            f"{len(profile.get_worker_nodes())} Workers"
+                        )
             else:
                 st.session_state.active_profile = None
         else:
@@ -199,9 +208,11 @@ def render_sidebar():
         nav_options = [
             "Profile Manager",
             "Cluster Creation",
+            "Resource Viewer",
             "Cluster Debugger",
             "Monitoring Setup",
             "Log Analysis",
+            "Upgrade Planner",
             "AI Assistant",
         ]
         selected_page = st.radio(
@@ -247,7 +258,9 @@ def page_profile_manager():
     st.markdown("## Cluster Profile Manager")
     st.markdown("Create, edit, and manage profiles for your on-prem Kubernetes clusters.")
 
-    tab_create, tab_list, tab_import = st.tabs(["Create Profile", "Manage Profiles", "Import / Export"])
+    tab_create, tab_import_cluster, tab_list, tab_import = st.tabs([
+        "Create Profile", "Import Existing Cluster", "Manage Profiles", "Import / Export",
+    ])
 
     # ── Create Profile ────────────────────────────────────────────────────
     with tab_create:
@@ -258,13 +271,46 @@ def page_profile_manager():
             with col1:
                 name = st.text_input("Profile Name *", placeholder="production-cluster")
                 description = st.text_area("Description", placeholder="Production on-prem cluster")
-                k8s_version = st.selectbox("Kubernetes Version", ["1.30", "1.29", "1.28", "1.27"], index=0)
-                crio_version = st.selectbox("CRI-O Version", ["1.30", "1.29", "1.28", "1.27"], index=0)
+                k8s_version = st.selectbox(
+                    "Kubernetes Version",
+                    ["1.35", "1.34", "1.33", "1.32", "1.31", "1.30", "1.29", "1.28", "1.27"],
+                    index=0,
+                )
+                crio_version = st.selectbox(
+                    "CRI-O Version",
+                    ["1.35", "1.34", "1.33", "1.32", "1.31", "1.30", "1.29", "1.28", "1.27"],
+                    index=0,
+                )
                 pod_security = st.selectbox(
                     "Pod Security Standard",
                     ["restricted", "baseline", "privileged"],
                     index=0,
+                    help="Controls what pods are allowed to run in the cluster.",
                 )
+                # Explain each PSS level
+                with st.expander("What do these Pod Security Standards mean?"):
+                    st.markdown(
+                        "**Restricted** (most secure)\n"
+                        "- Heavily restricted policy following Pod hardening best practices.\n"
+                        "- Disallows privilege escalation, host namespaces, host paths, and most Linux capabilities.\n"
+                        "- Containers must run as non-root with a read-only root filesystem.\n"
+                        "- Only allows seccomp profile RuntimeDefault or Localhost.\n"
+                        "- Best for: production workloads, multi-tenant clusters, security-sensitive environments.\n\n"
+                        "**Baseline** (moderate)\n"
+                        "- Minimally restrictive policy that prevents known privilege escalations.\n"
+                        "- Allows most default Kubernetes configurations but blocks hostNetwork, hostPID, hostIPC.\n"
+                        "- Containers can run as root but cannot use privileged mode.\n"
+                        "- Allows all seccomp profiles.\n"
+                        "- Best for: general workloads, development/staging, teams new to PSS.\n\n"
+                        "**Privileged** (unrestricted)\n"
+                        "- Completely unrestricted policy — no security restrictions enforced.\n"
+                        "- Allows privileged containers, host namespaces, host paths, any capabilities.\n"
+                        "- Containers can run as root with full access to the host.\n"
+                        "- Best for: system-level workloads (monitoring agents, CNI plugins, storage drivers), "
+                        "trusted single-tenant clusters.\n\n"
+                        "**Recommendation:** Start with *Restricted* and relax to *Baseline* only for "
+                        "workloads that require it. Avoid *Privileged* unless absolutely necessary."
+                    )
 
             with col2:
                 pod_cidr = st.text_input("Pod CIDR", value="10.244.0.0/16")
@@ -407,6 +453,64 @@ def page_profile_manager():
                     path = save_profile(profile)
                     st.session_state.active_profile = name
                     st.success(f"Profile '{name}' created successfully!")
+                    st.rerun()
+
+    # ── Import Existing Cluster ──────────────────────────────────────────
+    with tab_import_cluster:
+        st.markdown("### Import Existing Kubernetes Cluster")
+        st.markdown(
+            "Connect to an existing K8s cluster by uploading its **kubeconfig** file. "
+            "This lets you use the Debugger, Monitoring, Log Analysis, and Resource Viewer "
+            "without provisioning a new cluster."
+        )
+
+        with st.form("import_cluster_form"):
+            import_name = st.text_input(
+                "Profile Name *",
+                placeholder="my-existing-cluster",
+            )
+            import_desc = st.text_area(
+                "Description",
+                placeholder="Production cluster running in datacenter A",
+            )
+            kubeconfig_file = st.file_uploader(
+                "Upload kubeconfig file",
+                type=["yaml", "yml", "conf", "config"],
+                key="kubeconfig_upload",
+                help="Usually found at ~/.kube/config on your cluster's control-plane node.",
+            )
+            k8s_ver = st.text_input(
+                "Kubernetes Version (optional)",
+                placeholder="1.30",
+                value="1.30",
+            )
+
+            submitted_import = st.form_submit_button(
+                "Import Cluster", type="primary", use_container_width=True,
+            )
+
+            if submitted_import:
+                if not import_name:
+                    st.error("Profile name is required.")
+                elif not kubeconfig_file:
+                    st.error("Please upload a kubeconfig file.")
+                else:
+                    kubeconfig_content = kubeconfig_file.read().decode("utf-8")
+                    profile = ClusterProfile(
+                        name=import_name,
+                        description=import_desc,
+                        kubernetes_version=k8s_ver or "1.30",
+                        status="active",
+                        cluster_source="imported",
+                        kubeconfig_content=kubeconfig_content,
+                    )
+                    save_profile(profile)
+                    st.session_state.active_profile = import_name
+                    st.success(
+                        f"Cluster '{import_name}' imported! "
+                        "Select it from the sidebar to start using Debugger, Monitoring, "
+                        "Resource Viewer, etc."
+                    )
                     st.rerun()
 
     # ── Manage Profiles ───────────────────────────────────────────────────
@@ -784,11 +888,16 @@ def page_cluster_debugger():
     if not profile:
         return
 
-    cp_nodes = profile.get_control_plane_nodes()
-    if not cp_nodes:
-        st.error("No control-plane node defined in this profile.")
-        return
-    cp_node = cp_nodes[0]
+    # For imported clusters we don't need a CP node — commands run locally via kubeconfig
+    cp_node = None
+    if profile.cluster_source != "imported":
+        cp_nodes = profile.get_control_plane_nodes()
+        if not cp_nodes:
+            st.error("No control-plane node defined in this profile.")
+            return
+        cp_node = cp_nodes[0]
+
+    available_commands = get_available_commands(profile)
 
     tab_quick, tab_category, tab_custom, tab_ai = st.tabs([
         "Quick Diagnostics",
@@ -804,7 +913,7 @@ def page_cluster_debugger():
         with col1:
             selected_checks = st.multiselect(
                 "Select checks to run",
-                options=list(DIAGNOSTIC_COMMANDS.keys()),
+                options=list(available_commands.keys()),
                 default=["Node Status", "Pod Status (All Namespaces)", "Events (Recent)"],
             )
         with col2:
@@ -813,12 +922,12 @@ def page_cluster_debugger():
         if st.button("Run Diagnostics", type="primary"):
             if run_all:
                 with st.spinner("Running all diagnostics..."):
-                    results = run_all_diagnostics(cp_node)
+                    results = run_all_diagnostics(cp_node, profile=profile)
             else:
                 results = {}
                 for check in selected_checks:
                     with st.spinner(f"Running: {check}..."):
-                        results[check] = run_diagnostic(cp_node, check)
+                        results[check] = run_diagnostic(cp_node, check, profile=profile)
 
             st.session_state.debug_results = results
 
@@ -845,7 +954,7 @@ def page_cluster_debugger():
 
         if st.button("Run Category Scan", type="primary", key="cat_scan"):
             with st.spinner(f"Running {category} diagnostics..."):
-                results = run_category_diagnostics(cp_node, category)
+                results = run_category_diagnostics(cp_node, category, profile=profile)
 
             for name, result in results.items():
                 with st.expander(f"{'✅' if result.success else '❌'} {name}"):
@@ -860,7 +969,10 @@ def page_cluster_debugger():
     # ── Custom Command ────────────────────────────────────────────────────
     with tab_custom:
         st.markdown("### Run Custom Command")
-        st.warning("Commands execute on the control-plane node via SSH.")
+        if profile.cluster_source == "imported":
+            st.info("Commands run locally via kubectl using the imported kubeconfig.")
+        else:
+            st.warning("Commands execute on the control-plane node via SSH.")
         custom_cmd = st.text_area(
             "Command",
             placeholder="kubectl get pods -A -o wide",
@@ -868,7 +980,7 @@ def page_cluster_debugger():
         )
         if st.button("Execute", type="primary", key="exec_custom") and custom_cmd:
             with st.spinner("Executing..."):
-                result = run_custom_command(cp_node, custom_cmd)
+                result = run_custom_command(cp_node, custom_cmd, profile=profile)
                 if result.success:
                     st.code(result.stdout, language="text")
                 else:
@@ -907,7 +1019,7 @@ def page_cluster_debugger():
 
                 if check_pods:
                     with st.spinner("Checking pod issues..."):
-                        pod_result = check_pod_issues(cp_node)
+                        pod_result = check_pod_issues(cp_node, profile=profile)
                         if pod_result.success and pod_result.stdout.strip():
                             collected_data += f"\n\nProblematic Pods:\n{pod_result.stdout}"
                             with st.expander("Problematic Pods"):
@@ -915,10 +1027,10 @@ def page_cluster_debugger():
 
                 if auto_collect:
                     with st.spinner("Collecting diagnostics..."):
-                        diag_results = run_category_diagnostics(cp_node, "Cluster Overview")
-                        for name, result in diag_results.items():
-                            if result.success:
-                                collected_data += f"\n\n{name}:\n{result.stdout}"
+                        diag_results = run_category_diagnostics(cp_node, "Cluster Overview", profile=profile)
+                    for name, result in diag_results.items():
+                        if result.success:
+                            collected_data += f"\n\n{name}:\n{result.stdout}"
 
                 with st.spinner("AI is analyzing the issue..."):
                     full_context = f"Issue: {issue}\n\nCollected Data:{collected_data}"
@@ -939,11 +1051,14 @@ def page_monitoring_setup():
     if not profile:
         return
 
-    cp_nodes = profile.get_control_plane_nodes()
-    if not cp_nodes:
-        st.error("No control-plane node defined in this profile.")
-        return
-    cp_node = cp_nodes[0]
+    # For imported clusters we don't need a CP node
+    cp_node = None
+    if profile.cluster_source != "imported":
+        cp_nodes = profile.get_control_plane_nodes()
+        if not cp_nodes:
+            st.error("No control-plane node defined in this profile.")
+            return
+        cp_node = cp_nodes[0]
 
     namespace = st.text_input("Monitoring Namespace", value="monitoring")
 
@@ -970,7 +1085,7 @@ def page_monitoring_setup():
         if st.button("Install Prometheus + Grafana", type="primary", use_container_width=True):
             if install_helm_first:
                 with st.status("Installing Helm...", expanded=True):
-                    result = install_helm(cp_node)
+                    result = install_helm(cp_node, profile=profile)
                     if result.success:
                         st.success("Helm ready!")
                     else:
@@ -978,7 +1093,7 @@ def page_monitoring_setup():
                         st.code(result.stderr, language="text")
 
             with st.status("Installing kube-prometheus-stack (this may take several minutes)...", expanded=True):
-                result = install_prometheus_stack(cp_node, namespace)
+                result = install_prometheus_stack(cp_node, namespace, profile=profile)
                 if result.success:
                     st.success("Prometheus + Grafana installed!")
                     st.code(result.stdout[-2000:], language="text")
@@ -988,7 +1103,7 @@ def page_monitoring_setup():
 
             if install_alerts_too:
                 with st.status("Installing alert rules...", expanded=True):
-                    result = install_alert_rules(cp_node, namespace)
+                    result = install_alert_rules(cp_node, namespace, profile=profile)
                     if result.success:
                         st.success("Alert rules installed!")
                     else:
@@ -1009,7 +1124,7 @@ def page_monitoring_setup():
 
         if st.button("Import Dashboards", type="primary") and selected_dashboards:
             with st.status("Importing dashboards...", expanded=True):
-                result = install_dashboards(cp_node, selected_dashboards, namespace)
+                result = install_dashboards(cp_node, selected_dashboards, namespace, profile=profile)
                 if result.success:
                     st.success(f"Imported {len(selected_dashboards)} dashboards!")
                     st.code(result.stdout, language="text")
@@ -1027,7 +1142,7 @@ def page_monitoring_setup():
 
         if st.button("Install Alert Rules", type="primary", key="install_alerts"):
             with st.spinner("Installing alert rules..."):
-                result = install_alert_rules(cp_node, namespace)
+                result = install_alert_rules(cp_node, namespace, profile=profile)
                 if result.success:
                     st.success("Alert rules installed!")
                     st.code(result.stdout, language="text")
@@ -1040,7 +1155,7 @@ def page_monitoring_setup():
         st.markdown("### Monitoring Stack Status")
         if st.button("Check Status", type="primary", key="mon_status"):
             with st.spinner("Checking monitoring stack..."):
-                result = get_monitoring_status(cp_node, namespace)
+                result = get_monitoring_status(cp_node, namespace, profile=profile)
                 if result.success:
                     st.code(result.stdout, language="text")
                 else:
@@ -1069,7 +1184,7 @@ def page_monitoring_setup():
         else:
             if st.button("Get Monitoring Recommendations", type="primary", key="mon_advice"):
                 current_status = ""
-                status_result = get_monitoring_status(cp_node, namespace)
+                status_result = get_monitoring_status(cp_node, namespace, profile=profile)
                 if status_result.success:
                     current_status = status_result.stdout
 
@@ -1090,11 +1205,16 @@ def page_log_analysis():
     if not profile:
         return
 
-    cp_nodes = profile.get_control_plane_nodes()
-    if not cp_nodes:
-        st.error("No control-plane node defined in this profile.")
-        return
-    cp_node = cp_nodes[0]
+    # For imported clusters we don't need a CP node
+    cp_node = None
+    if profile.cluster_source != "imported":
+        cp_nodes = profile.get_control_plane_nodes()
+        if not cp_nodes:
+            st.error("No control-plane node defined in this profile.")
+            return
+        cp_node = cp_nodes[0]
+
+    available_log_sources = get_available_log_sources(profile)
 
     tab_system, tab_pod, tab_correlation, tab_ai = st.tabs([
         "System Logs",
@@ -1108,10 +1228,13 @@ def page_log_analysis():
         st.markdown("### System Component Logs")
         col1, col2, col3 = st.columns(3)
         with col1:
+            default_sources = [s for s in ["Kubelet", "CRI-O", "Events"] if s in available_log_sources]
+            if not default_sources:
+                default_sources = available_log_sources[:3] if available_log_sources else []
             sources = st.multiselect(
                 "Log Sources",
-                options=list(LOG_SOURCES.keys()),
-                default=["Kubelet", "CRI-O", "Events"],
+                options=available_log_sources,
+                default=default_sources,
             )
         with col2:
             log_lines = st.number_input("Lines to fetch", min_value=50, max_value=1000, value=200)
@@ -1127,7 +1250,7 @@ def page_log_analysis():
             log_data = {}
             for source in sources:
                 with st.spinner(f"Collecting {source} logs..."):
-                    result = collect_logs(cp_node, source, log_lines, since, since_k8s)
+                    result = collect_logs(cp_node, source, log_lines, since, since_k8s, profile=profile)
                     if result.success:
                         log_data[source] = result.stdout
                         analysis = analyze_logs(result.stdout, source)
@@ -1171,7 +1294,7 @@ def page_log_analysis():
             with st.spinner(f"Fetching logs for {pod_ns}/{pod_name}..."):
                 result = collect_pod_logs(
                     cp_node, pod_ns, pod_name, container, pod_lines,
-                    "1h", pod_previous,
+                    "1h", pod_previous, profile=profile,
                 )
                 if result.success:
                     analysis = analyze_logs(result.stdout, f"{pod_ns}/{pod_name}")
@@ -1203,16 +1326,19 @@ def page_log_analysis():
         st.markdown("### Cross-Source Error Correlation")
         st.markdown("Collect logs from multiple sources and correlate errors across them.")
 
+        default_corr = [s for s in ["Kubelet", "CRI-O", "API Server", "Events"] if s in available_log_sources]
+        if not default_corr:
+            default_corr = available_log_sources[:4] if available_log_sources else []
         corr_sources = st.multiselect(
             "Sources to correlate",
-            options=list(LOG_SOURCES.keys()),
-            default=["Kubelet", "CRI-O", "API Server", "Events"],
+            options=available_log_sources,
+            default=default_corr,
             key="corr_sources",
         )
 
         if st.button("Collect & Correlate", type="primary", key="correlate"):
             with st.spinner("Collecting logs from multiple sources..."):
-                results = collect_multi_source_logs(cp_node, corr_sources, lines=150)
+                results = collect_multi_source_logs(cp_node, corr_sources, lines=150, profile=profile)
 
             correlated = correlate_errors(results)
 
@@ -1277,6 +1403,866 @@ def page_log_analysis():
 #  PAGE: AI Assistant
 # ══════════════════════════════════════════════════════════════════════════
 
+# ══════════════════════════════════════════════════════════════════════════
+#  PAGE: Resource Viewer
+# ══════════════════════════════════════════════════════════════════════════
+
+# Resource definitions: (display_name, kubectl_command, supports_namespace)
+_RESOURCE_TYPES = {
+    "Pods": ("get pods", True),
+    "Deployments": ("get deployments", True),
+    "Services": ("get services", True),
+    "ConfigMaps": ("get configmaps", True),
+    "Secrets": ("get secrets", True),
+    "StatefulSets": ("get statefulsets", True),
+    "DaemonSets": ("get daemonsets", True),
+    "ReplicaSets": ("get replicasets", True),
+    "Jobs": ("get jobs", True),
+    "CronJobs": ("get cronjobs", True),
+    "Ingresses": ("get ingress", True),
+    "NetworkPolicies": ("get networkpolicies", True),
+    "PersistentVolumeClaims": ("get pvc", True),
+    "PersistentVolumes": ("get pv", False),
+    "StorageClasses": ("get storageclasses", False),
+    "Namespaces": ("get namespaces", False),
+    "Nodes": ("get nodes", False),
+    "ServiceAccounts": ("get serviceaccounts", True),
+    "DestinationRules": ("get destinationrules", True),
+    "VirtualServices": ("get virtualservices", True),
+    "HorizontalPodAutoscalers": ("get hpa", True),
+    "PodDisruptionBudgets": ("get pdb", True),
+    "Endpoints": ("get endpoints", True),
+}
+
+
+def page_resource_viewer():
+    st.markdown("## Resource Viewer")
+    st.markdown("Browse live Kubernetes resources from your cluster.")
+
+    profile = _get_active_profile()
+    if not profile:
+        return
+
+    if not profile.kubeconfig_content and not profile.get_control_plane_nodes():
+        st.error(
+            "This profile has no kubeconfig and no control-plane node. "
+            "Import a kubeconfig or add nodes in the Profile Manager."
+        )
+        return
+
+    tab_resources, tab_node_health, tab_rbac, tab_helm, tab_events = st.tabs([
+        "Cluster Resources",
+        "Node Health",
+        "RBAC Viewer",
+        "Helm Releases",
+        "Events Timeline",
+    ])
+
+    # ── Cluster Resources ────────────────────────────────────────────────
+    with tab_resources:
+        st.markdown("### Browse Cluster Resources")
+
+        col1, col2, col3 = st.columns([2, 2, 1])
+        with col1:
+            resource_type = st.selectbox(
+                "Resource Type",
+                options=list(_RESOURCE_TYPES.keys()),
+                index=0,
+            )
+        with col2:
+            cmd_base, ns_supported = _RESOURCE_TYPES[resource_type]
+            if ns_supported:
+                ns_choice = st.radio(
+                    "Namespace",
+                    ["All Namespaces", "Specific"],
+                    horizontal=True,
+                    key="res_ns_choice",
+                )
+                if ns_choice == "Specific":
+                    namespace = st.text_input("Namespace", value="default", key="res_ns")
+                else:
+                    namespace = ""
+            else:
+                namespace = ""
+                st.info(f"{resource_type} is a cluster-scoped resource.")
+        with col3:
+            output_format = st.selectbox(
+                "Output",
+                ["wide", "yaml", "json", "name"],
+                index=0,
+                key="res_output",
+            )
+
+        if st.button("Fetch Resources", type="primary", key="fetch_res"):
+            kubectl_cmd = cmd_base
+            if ns_supported and not namespace:
+                kubectl_cmd += " -A"
+            elif ns_supported and namespace:
+                kubectl_cmd += f" -n {namespace}"
+            kubectl_cmd += f" -o {output_format}"
+
+            with st.spinner(f"Fetching {resource_type}..."):
+                result = run_kubectl(profile, kubectl_cmd, timeout=30)
+                if result.success:
+                    st.code(result.stdout or "(no resources found)", language="text")
+                else:
+                    if "the server doesn't have a resource type" in result.stderr:
+                        st.warning(
+                            f"{resource_type} is not available on this cluster "
+                            "(CRD may not be installed)."
+                        )
+                    else:
+                        st.error("Failed to fetch resources")
+                    st.code(result.stderr, language="text")
+
+        # Describe a specific resource
+        st.markdown("---")
+        st.markdown("#### Describe a Resource")
+        desc_col1, desc_col2 = st.columns(2)
+        with desc_col1:
+            desc_name = st.text_input(
+                "Resource name",
+                placeholder="e.g., my-pod-xyz",
+                key="desc_name",
+            )
+        with desc_col2:
+            desc_ns = st.text_input(
+                "Namespace (if applicable)",
+                value="default",
+                key="desc_ns",
+            )
+
+        if st.button("Describe", key="describe_res") and desc_name:
+            # Determine the singular resource type for describe
+            res_singular = resource_type.rstrip("s")
+            if resource_type == "Ingresses":
+                res_singular = "ingress"
+            elif resource_type == "Namespaces":
+                res_singular = "namespace"
+            elif resource_type == "StorageClasses":
+                res_singular = "storageclass"
+            elif resource_type == "Endpoints":
+                res_singular = "endpoints"
+
+            desc_cmd = f"describe {res_singular.lower()} {desc_name}"
+            if ns_supported and desc_ns:
+                desc_cmd += f" -n {desc_ns}"
+
+            with st.spinner(f"Describing {desc_name}..."):
+                result = run_kubectl(profile, desc_cmd, timeout=30)
+                if result.success:
+                    st.code(result.stdout, language="yaml")
+                else:
+                    st.error("Describe failed")
+                    st.code(result.stderr, language="text")
+
+    # ── Node Health ──────────────────────────────────────────────────────
+    with tab_node_health:
+        st.markdown("### Node Health Overview")
+        st.markdown("View node status, resource usage, and conditions.")
+
+        if st.button("Refresh Node Health", type="primary", key="node_health"):
+            col_status, col_top = st.columns(2)
+
+            with col_status:
+                st.markdown("#### Node Status")
+                with st.spinner("Fetching nodes..."):
+                    result = run_kubectl(profile, "get nodes -o wide", timeout=15)
+                    if result.success:
+                        st.code(result.stdout, language="text")
+                    else:
+                        st.error("Failed to get nodes")
+                        st.code(result.stderr, language="text")
+
+            with col_top:
+                st.markdown("#### Resource Usage")
+                with st.spinner("Fetching node metrics..."):
+                    result = run_kubectl(profile, "top nodes", timeout=15)
+                    if result.success:
+                        st.code(result.stdout, language="text")
+                    else:
+                        st.warning("kubectl top requires metrics-server to be installed.")
+                        st.code(result.stderr, language="text")
+
+            st.markdown("---")
+            st.markdown("#### Node Conditions")
+            with st.spinner("Checking node conditions..."):
+                result = run_kubectl(
+                    profile,
+                    'get nodes -o custom-columns='
+                    '"NAME:.metadata.name,'
+                    'READY:.status.conditions[?(@.type==\\"Ready\\")].status,'
+                    'DISK:.status.conditions[?(@.type==\\"DiskPressure\\")].status,'
+                    'MEMORY:.status.conditions[?(@.type==\\"MemoryPressure\\")].status,'
+                    'PID:.status.conditions[?(@.type==\\"PIDPressure\\")].status"',
+                    timeout=15,
+                )
+                if result.success:
+                    st.code(result.stdout, language="text")
+                else:
+                    st.code(result.stderr, language="text")
+
+            st.markdown("#### Pod Distribution per Node")
+            with st.spinner("Fetching pod distribution..."):
+                result = run_kubectl(
+                    profile,
+                    'get pods -A -o custom-columns='
+                    '"NODE:.spec.nodeName,NAMESPACE:.metadata.namespace,'
+                    'POD:.metadata.name,STATUS:.status.phase" '
+                    '--sort-by=.spec.nodeName',
+                    timeout=15,
+                )
+                if result.success:
+                    st.code(result.stdout, language="text")
+                else:
+                    st.code(result.stderr, language="text")
+
+    # ── RBAC Viewer ──────────────────────────────────────────────────────
+    with tab_rbac:
+        st.markdown("### RBAC Viewer")
+        st.markdown("Browse Roles, ClusterRoles, Bindings, and ServiceAccounts.")
+
+        rbac_type = st.selectbox(
+            "RBAC Resource",
+            [
+                "ClusterRoles",
+                "ClusterRoleBindings",
+                "Roles (namespaced)",
+                "RoleBindings (namespaced)",
+                "ServiceAccounts",
+            ],
+            key="rbac_type",
+        )
+
+        rbac_ns = ""
+        if "(namespaced)" in rbac_type or rbac_type == "ServiceAccounts":
+            rbac_ns = st.text_input(
+                "Namespace",
+                value="default",
+                key="rbac_ns",
+                help="Leave blank for all namespaces",
+            )
+
+        if st.button("Fetch RBAC Resources", type="primary", key="fetch_rbac"):
+            cmd_map = {
+                "ClusterRoles": "get clusterroles",
+                "ClusterRoleBindings": "get clusterrolebindings",
+                "Roles (namespaced)": "get roles",
+                "RoleBindings (namespaced)": "get rolebindings",
+                "ServiceAccounts": "get serviceaccounts",
+            }
+            rbac_cmd = cmd_map[rbac_type]
+            if rbac_ns:
+                rbac_cmd += f" -n {rbac_ns}"
+            elif "(namespaced)" in rbac_type or rbac_type == "ServiceAccounts":
+                rbac_cmd += " -A"
+
+            with st.spinner(f"Fetching {rbac_type}..."):
+                result = run_kubectl(profile, rbac_cmd, timeout=15)
+                if result.success:
+                    st.code(result.stdout or "(none found)", language="text")
+                else:
+                    st.error("Failed to fetch RBAC resources")
+                    st.code(result.stderr, language="text")
+
+        # Describe a specific RBAC resource
+        st.markdown("---")
+        st.markdown("#### Inspect RBAC Resource")
+        rbac_name = st.text_input(
+            "Resource name to describe",
+            placeholder="e.g., cluster-admin",
+            key="rbac_desc_name",
+        )
+        if st.button("Describe RBAC", key="desc_rbac") and rbac_name:
+            type_map = {
+                "ClusterRoles": "clusterrole",
+                "ClusterRoleBindings": "clusterrolebinding",
+                "Roles (namespaced)": "role",
+                "RoleBindings (namespaced)": "rolebinding",
+                "ServiceAccounts": "serviceaccount",
+            }
+            desc_cmd = f"describe {type_map[rbac_type]} {rbac_name}"
+            if rbac_ns:
+                desc_cmd += f" -n {rbac_ns}"
+
+            with st.spinner(f"Describing {rbac_name}..."):
+                result = run_kubectl(profile, desc_cmd, timeout=15)
+                if result.success:
+                    st.code(result.stdout, language="yaml")
+                else:
+                    st.error("Describe failed")
+                    st.code(result.stderr, language="text")
+
+    # ── Helm Releases ────────────────────────────────────────────────────
+    with tab_helm:
+        st.markdown("### Helm Release Manager")
+        st.markdown("List, inspect, and manage Helm releases on your cluster.")
+
+        helm_tab_list, helm_tab_install, helm_tab_history = st.tabs([
+            "List Releases", "Install Chart", "Release History",
+        ])
+
+        with helm_tab_list:
+            helm_ns_all = st.checkbox("All namespaces", value=True, key="helm_ns_all")
+            helm_ns = ""
+            if not helm_ns_all:
+                helm_ns = st.text_input("Namespace", value="default", key="helm_ns")
+
+            if st.button("List Helm Releases", type="primary", key="helm_list"):
+                helm_cmd = "helm list"
+                if helm_ns_all:
+                    helm_cmd += " -A"
+                elif helm_ns:
+                    helm_cmd += f" -n {helm_ns}"
+                helm_cmd += " -o table"
+
+                with st.spinner("Fetching Helm releases..."):
+                    result = run_kubectl(profile, helm_cmd.replace("kubectl ", ""), timeout=15)
+                    if result.success:
+                        st.code(result.stdout or "(no releases found)", language="text")
+                    else:
+                        st.warning("Helm may not be installed on this cluster.")
+                        st.code(result.stderr, language="text")
+
+        with helm_tab_install:
+            st.markdown("#### Install a Helm Chart")
+            hcol1, hcol2 = st.columns(2)
+            with hcol1:
+                helm_release_name = st.text_input("Release Name", placeholder="my-release", key="helm_rel")
+                helm_chart = st.text_input("Chart", placeholder="prometheus-community/kube-prometheus-stack", key="helm_chart")
+            with hcol2:
+                helm_install_ns = st.text_input("Namespace", value="default", key="helm_install_ns")
+                helm_create_ns = st.checkbox("Create namespace if not exists", value=True, key="helm_create_ns")
+            helm_values = st.text_area(
+                "Values (YAML, optional)",
+                placeholder="# Custom values.yaml content here",
+                height=150,
+                key="helm_values",
+            )
+
+            if st.button("Install Chart", type="primary", key="helm_install") and helm_release_name and helm_chart:
+                install_cmd = f"helm install {helm_release_name} {helm_chart} -n {helm_install_ns}"
+                if helm_create_ns:
+                    install_cmd += " --create-namespace"
+                # If user provided values, write to temp file
+                if helm_values.strip():
+                    values_path = os.path.join(config.UPLOADS_DIR, f"helm-values-{helm_release_name}.yaml")
+                    with open(values_path, "w") as vf:
+                        vf.write(helm_values)
+                    install_cmd += f" -f {values_path}"
+
+                with st.spinner(f"Installing {helm_chart}..."):
+                    result = run_kubectl(profile, install_cmd.replace("kubectl ", ""), timeout=120)
+                    if result.success:
+                        st.success(f"Release '{helm_release_name}' installed!")
+                        st.code(result.stdout, language="text")
+                    else:
+                        st.error("Helm install failed")
+                        st.code(result.stderr, language="text")
+
+        with helm_tab_history:
+            st.markdown("#### Release History")
+            hist_name = st.text_input("Release name", placeholder="my-release", key="helm_hist_name")
+            hist_ns = st.text_input("Namespace", value="default", key="helm_hist_ns")
+
+            if st.button("Get History", key="helm_hist") and hist_name:
+                hist_cmd = f"helm history {hist_name} -n {hist_ns}"
+                with st.spinner("Fetching history..."):
+                    result = run_kubectl(profile, hist_cmd.replace("kubectl ", ""), timeout=15)
+                    if result.success:
+                        st.code(result.stdout, language="text")
+                    else:
+                        st.error("Could not get release history")
+                        st.code(result.stderr, language="text")
+
+            st.markdown("---")
+            st.markdown("#### Rollback Release")
+            rb_name = st.text_input("Release name", placeholder="my-release", key="helm_rb_name")
+            rb_ns = st.text_input("Namespace", value="default", key="helm_rb_ns")
+            rb_rev = st.number_input("Revision number", min_value=1, value=1, key="helm_rb_rev")
+
+            if st.button("Rollback", key="helm_rollback") and rb_name:
+                rb_cmd = f"helm rollback {rb_name} {rb_rev} -n {rb_ns}"
+                with st.spinner(f"Rolling back {rb_name} to revision {rb_rev}..."):
+                    result = run_kubectl(profile, rb_cmd.replace("kubectl ", ""), timeout=60)
+                    if result.success:
+                        st.success(f"Rolled back '{rb_name}' to revision {rb_rev}")
+                        st.code(result.stdout, language="text")
+                    else:
+                        st.error("Rollback failed")
+                        st.code(result.stderr, language="text")
+
+    # ── Events Timeline ──────────────────────────────────────────────────
+    with tab_events:
+        st.markdown("### Cluster Events Timeline")
+        st.markdown("View recent Kubernetes events with graphical analysis.")
+
+        ev_col1, ev_col2, ev_col3 = st.columns(3)
+        with ev_col1:
+            ev_ns_all = st.checkbox("All namespaces", value=True, key="ev_ns_all")
+            ev_ns = ""
+            if not ev_ns_all:
+                ev_ns = st.text_input("Namespace", value="default", key="ev_ns")
+        with ev_col2:
+            ev_type = st.selectbox(
+                "Event Type",
+                ["All", "Normal", "Warning"],
+                key="ev_type",
+            )
+        with ev_col3:
+            ev_sort = st.selectbox(
+                "Sort by",
+                ["Last Timestamp", "First Timestamp", "Count"],
+                key="ev_sort",
+            )
+
+        if st.button("Fetch Events", type="primary", key="fetch_events"):
+            # Fetch events in JSON for graphical display
+            ev_json_cmd = "get events"
+            if ev_ns_all:
+                ev_json_cmd += " -A"
+            elif ev_ns:
+                ev_json_cmd += f" -n {ev_ns}"
+            if ev_type != "All":
+                ev_json_cmd += f" --field-selector type={ev_type}"
+            ev_json_cmd += " -o json"
+
+            with st.spinner("Fetching events..."):
+                result = run_kubectl(profile, ev_json_cmd, timeout=15)
+
+            if result.success and result.stdout.strip():
+                try:
+                    events_data = json.loads(result.stdout)
+                    items = events_data.get("items", [])
+
+                    if not items:
+                        st.info("No events found.")
+                    else:
+                        # Parse events into structured data
+                        ev_records = []
+                        for item in items:
+                            ev_records.append({
+                                "Namespace": item.get("metadata", {}).get("namespace", ""),
+                                "Type": item.get("type", ""),
+                                "Reason": item.get("reason", ""),
+                                "Object": item.get("involvedObject", {}).get("name", ""),
+                                "Kind": item.get("involvedObject", {}).get("kind", ""),
+                                "Message": (item.get("message", "") or "")[:120],
+                                "Count": item.get("count", 1),
+                                "Last Seen": item.get("lastTimestamp", item.get("eventTime", "")),
+                            })
+
+                        import pandas as pd
+
+                        df = pd.DataFrame(ev_records)
+
+                        # ── Graphical Summary ────────────────────────
+                        st.markdown("#### Event Summary Charts")
+
+                        chart_col1, chart_col2 = st.columns(2)
+
+                        with chart_col1:
+                            st.markdown("**Events by Type**")
+                            type_counts = df["Type"].value_counts().reset_index()
+                            type_counts.columns = ["Type", "Count"]
+                            st.bar_chart(type_counts.set_index("Type"))
+
+                        with chart_col2:
+                            st.markdown("**Events by Reason (Top 10)**")
+                            reason_counts = df["Reason"].value_counts().head(10).reset_index()
+                            reason_counts.columns = ["Reason", "Count"]
+                            st.bar_chart(reason_counts.set_index("Reason"))
+
+                        chart_col3, chart_col4 = st.columns(2)
+
+                        with chart_col3:
+                            st.markdown("**Events by Namespace (Top 10)**")
+                            ns_counts = df["Namespace"].value_counts().head(10).reset_index()
+                            ns_counts.columns = ["Namespace", "Count"]
+                            st.bar_chart(ns_counts.set_index("Namespace"))
+
+                        with chart_col4:
+                            st.markdown("**Events by Object Kind**")
+                            kind_counts = df["Kind"].value_counts().reset_index()
+                            kind_counts.columns = ["Kind", "Count"]
+                            st.bar_chart(kind_counts.set_index("Kind"))
+
+                        # ── Timeline Chart ────────────────────────────
+                        st.markdown("---")
+                        st.markdown("#### Event Timeline")
+                        if df["Last Seen"].notna().any() and df["Last Seen"].str.strip().any():
+                            try:
+                                df["Timestamp"] = pd.to_datetime(
+                                    df["Last Seen"], errors="coerce", utc=True,
+                                )
+                                ts_df = df.dropna(subset=["Timestamp"])
+                                if not ts_df.empty:
+                                    ts_df = ts_df.set_index("Timestamp")
+                                    # Events over time grouped by type
+                                    timeline = ts_df.groupby(
+                                        [pd.Grouper(freq="1min"), "Type"]
+                                    ).size().unstack(fill_value=0)
+                                    if not timeline.empty:
+                                        st.line_chart(timeline)
+                                    else:
+                                        st.info("Not enough timestamp data for timeline chart.")
+                                else:
+                                    st.info("Could not parse event timestamps for timeline.")
+                            except Exception:
+                                st.info("Could not render timeline chart from event data.")
+                        else:
+                            st.info("No timestamp data available for timeline chart.")
+
+                        # ── High-Count Events ─────────────────────────
+                        st.markdown("---")
+                        st.markdown("#### High-Frequency Events")
+                        high_count = df[df["Count"] > 1].sort_values("Count", ascending=False).head(20)
+                        if not high_count.empty:
+                            st.dataframe(
+                                high_count[["Namespace", "Type", "Reason", "Object", "Count", "Message"]],
+                                use_container_width=True,
+                                hide_index=True,
+                            )
+                        else:
+                            st.info("No repeated events found.")
+
+                        # ── Full Events Table ─────────────────────────
+                        st.markdown("---")
+                        st.markdown("#### All Events")
+                        st.dataframe(df, use_container_width=True, hide_index=True)
+
+                except (json.JSONDecodeError, KeyError):
+                    # Fallback to text display
+                    st.code(result.stdout, language="text")
+            elif result.success:
+                st.info("No events found.")
+            else:
+                st.error("Failed to fetch events")
+                st.code(result.stderr, language="text")
+
+        # Warning events summary
+        st.markdown("---")
+        st.markdown("#### Warning Events Summary")
+        if st.button("Show Warning Events", key="warn_events"):
+            warn_cmd = (
+                "get events -A --field-selector type=Warning "
+                "-o custom-columns="
+                "'NAMESPACE:.metadata.namespace,"
+                "LAST_SEEN:.lastTimestamp,"
+                "COUNT:.count,"
+                "REASON:.reason,"
+                "OBJECT:.involvedObject.name,"
+                "MESSAGE:.message' "
+                "--sort-by=.lastTimestamp"
+            )
+            with st.spinner("Fetching warning events..."):
+                result = run_kubectl(profile, warn_cmd, timeout=15)
+                if result.success:
+                    st.code(result.stdout or "(no warning events)", language="text")
+                else:
+                    st.code(result.stderr, language="text")
+
+
+# ══════════════════════════════════════════════════════════════════════════
+#  PAGE: Upgrade Planner
+# ══════════════════════════════════════════════════════════════════════════
+
+_K8S_VERSIONS_DETAIL = [
+    {
+        "version": "1.35",
+        "release": "2026-04",
+        "end_of_life": "2027-08",
+        "highlights": "Sidecar containers GA, improved pod lifecycle management, dynamic resource allocation enhancements.",
+    },
+    {
+        "version": "1.34",
+        "release": "2025-12",
+        "end_of_life": "2027-04",
+        "highlights": "Structured authorization config GA, recursive read-only mounts, traffic distribution improvements.",
+    },
+    {
+        "version": "1.33",
+        "release": "2025-08",
+        "end_of_life": "2027-01",
+        "highlights": "In-place pod resize beta, multi-network pods alpha, nftables kube-proxy backend.",
+    },
+    {
+        "version": "1.32",
+        "release": "2025-04",
+        "end_of_life": "2026-08",
+        "highlights": "Dynamic resource allocation (DRA) beta, auto-remove PV claims, job success policy GA.",
+    },
+    {
+        "version": "1.31",
+        "release": "2024-12",
+        "end_of_life": "2026-04",
+        "highlights": "AppArmor GA, nftables proxy GA, improved ingress connectivity reliability, cgroup v2 enhancements.",
+    },
+    {
+        "version": "1.30",
+        "release": "2024-04",
+        "end_of_life": "2025-08",
+        "highlights": "Contextual logging GA, CEL admission improvements, pod scheduling readiness.",
+    },
+    {
+        "version": "1.29",
+        "release": "2023-12",
+        "end_of_life": "2025-02",
+        "highlights": "KMS v2 GA, ReadWriteOncePod GA, networking improvements, node memory manager.",
+    },
+    {
+        "version": "1.28",
+        "release": "2023-08",
+        "end_of_life": "2024-10",
+        "highlights": "Sidecar containers alpha, recovery from non-graceful node shutdown, mixed version proxy.",
+    },
+    {
+        "version": "1.27",
+        "release": "2023-04",
+        "end_of_life": "2024-06",
+        "highlights": "In-place pod resize alpha, VPA improvements, SeccompDefault GA.",
+    },
+]
+
+
+def page_upgrade_planner():
+    st.markdown("## Upgrade Planner")
+    st.markdown("Plan and prepare Kubernetes version upgrades for your cluster.")
+
+    profile = _get_active_profile()
+    if not profile:
+        return
+
+    current_ver = profile.kubernetes_version
+
+    tab_overview, tab_preflight, tab_plan, tab_changelog = st.tabs([
+        "Version Overview",
+        "Pre-flight Checks",
+        "Upgrade Steps",
+        "Changelog & Compatibility",
+    ])
+
+    # ── Version Overview ─────────────────────────────────────────────────
+    with tab_overview:
+        st.markdown("### Kubernetes Version Matrix")
+        st.info(f"Your current cluster version: **{current_ver}**")
+
+        # Build a table
+        rows = []
+        for v in _K8S_VERSIONS_DETAIL:
+            status = ""
+            if v["version"] == current_ver:
+                status = "CURRENT"
+            elif v["version"] > current_ver:
+                status = "UPGRADE AVAILABLE"
+            else:
+                status = "OLDER"
+            rows.append({
+                "Version": v["version"],
+                "Status": status,
+                "Release Date": v["release"],
+                "End of Life": v["end_of_life"],
+                "Highlights": v["highlights"],
+            })
+
+        st.dataframe(rows, use_container_width=True, hide_index=True)
+
+        # Upgrade target selection
+        st.markdown("---")
+        available_upgrades = [
+            v["version"] for v in _K8S_VERSIONS_DETAIL if v["version"] > current_ver
+        ]
+        if available_upgrades:
+            target_version = st.selectbox(
+                "Select target upgrade version",
+                available_upgrades,
+                key="upgrade_target",
+            )
+            skipped = [
+                v for v in _K8S_VERSIONS_DETAIL
+                if current_ver < v["version"] <= target_version
+            ]
+            if len(skipped) > 1:
+                st.warning(
+                    f"You are skipping {len(skipped) - 1} minor version(s). "
+                    "Kubernetes supports upgrading one minor version at a time. "
+                    "Plan incremental upgrades for production clusters."
+                )
+            st.markdown("#### Upgrade Path")
+            path_versions = [current_ver] + [v["version"] for v in reversed(skipped)]
+            st.markdown(" → ".join([f"**{v}**" for v in path_versions]))
+        else:
+            st.success("You are running the latest version!")
+
+    # ── Pre-flight Checks ────────────────────────────────────────────────
+    with tab_preflight:
+        st.markdown("### Pre-Upgrade Checks")
+        st.markdown("Run these checks before starting the upgrade process.")
+
+        checks = [
+            ("Cluster Health", "get nodes -o wide"),
+            ("All Pods Running", "get pods -A --field-selector 'status.phase!=Running,status.phase!=Succeeded'"),
+            ("etcd Health", "get --raw=/healthz"),
+            ("API Server Version", "version"),
+            ("PodDisruptionBudgets", "get pdb -A"),
+            ("Deprecated APIs", "api-resources --api-group=extensions"),
+            ("Persistent Volumes", "get pv"),
+            ("Component Statuses", "get cs 2>/dev/null || echo 'Deprecated in newer versions'"),
+        ]
+
+        if st.button("Run All Pre-flight Checks", type="primary", key="preflight"):
+            all_ok = True
+            for name, cmd in checks:
+                with st.status(f"Checking: {name}...", expanded=False) as status:
+                    result = run_kubectl(profile, cmd, timeout=15)
+                    if result.success:
+                        st.code(result.stdout or "(no output)", language="text")
+                        status.update(label=f"{name} — OK", state="complete")
+                    else:
+                        st.code(result.stderr, language="text")
+                        status.update(label=f"{name} — ISSUE", state="error")
+                        all_ok = False
+
+            if all_ok:
+                st.success("All pre-flight checks passed! The cluster looks ready for upgrade.")
+            else:
+                st.warning(
+                    "Some checks reported issues. Review the output above before proceeding."
+                )
+
+        st.markdown("---")
+        st.markdown("#### Backup Checklist")
+        st.markdown(
+            "Before upgrading, ensure you have:\n\n"
+            "- [ ] **etcd snapshot backup**: `ETCDCTL_API=3 etcdctl snapshot save /backup/etcd-snapshot.db`\n"
+            "- [ ] **Cluster state export**: `kubectl get all -A -o yaml > cluster-backup.yaml`\n"
+            "- [ ] **PV/PVC data backed up** (if applicable)\n"
+            "- [ ] **CNI configuration backed up**: `/etc/cni/net.d/`\n"
+            "- [ ] **kubeadm config backed up**: `kubeadm config view > kubeadm-config.yaml`\n"
+            "- [ ] **VM/node snapshots taken** (if running on VMs)\n"
+        )
+
+    # ── Upgrade Steps ────────────────────────────────────────────────────
+    with tab_plan:
+        st.markdown("### Step-by-Step Upgrade Plan")
+
+        target = st.selectbox(
+            "Target Version",
+            [v["version"] for v in _K8S_VERSIONS_DETAIL if v["version"] > current_ver] or [current_ver],
+            key="upgrade_plan_target",
+        )
+
+        st.markdown(f"#### Upgrading from {current_ver} → {target}")
+
+        st.markdown(
+            f"""
+**Phase 1: Prepare (Control Plane)**
+```bash
+# 1. Update package repositories
+sudo apt-get update
+
+# 2. Check available kubeadm versions
+apt-cache madison kubeadm | grep {target}
+
+# 3. Upgrade kubeadm
+sudo apt-mark unhold kubeadm
+sudo apt-get install -y kubeadm={target}.*
+sudo apt-mark hold kubeadm
+
+# 4. Verify kubeadm version
+kubeadm version
+
+# 5. Check upgrade plan
+sudo kubeadm upgrade plan
+```
+
+**Phase 2: Upgrade Control Plane**
+```bash
+# 1. Drain the control-plane node
+kubectl drain <cp-node> --ignore-daemonsets --delete-emptydir-data
+
+# 2. Apply the upgrade
+sudo kubeadm upgrade apply v{target}.0
+
+# 3. Upgrade kubelet & kubectl
+sudo apt-mark unhold kubelet kubectl
+sudo apt-get install -y kubelet={target}.* kubectl={target}.*
+sudo apt-mark hold kubelet kubectl
+
+# 4. Restart kubelet
+sudo systemctl daemon-reload
+sudo systemctl restart kubelet
+
+# 5. Uncordon the node
+kubectl uncordon <cp-node>
+```
+
+**Phase 3: Upgrade Worker Nodes** (repeat for each worker)
+```bash
+# On each worker node:
+# 1. Drain the worker
+kubectl drain <worker-node> --ignore-daemonsets --delete-emptydir-data
+
+# 2. Upgrade kubeadm, kubelet, kubectl
+sudo apt-mark unhold kubeadm kubelet kubectl
+sudo apt-get install -y kubeadm={target}.* kubelet={target}.* kubectl={target}.*
+sudo apt-mark hold kubeadm kubelet kubectl
+
+# 3. Upgrade node config
+sudo kubeadm upgrade node
+
+# 4. Restart kubelet
+sudo systemctl daemon-reload
+sudo systemctl restart kubelet
+
+# 5. Uncordon
+kubectl uncordon <worker-node>
+```
+
+**Phase 4: Upgrade CRI-O** (on each node)
+```bash
+# Update CRI-O to match the K8s version
+sudo apt-get install -y cri-o={target}.*
+sudo systemctl restart crio
+sudo systemctl restart kubelet
+```
+
+**Phase 5: Verify**
+```bash
+kubectl get nodes -o wide
+kubectl get pods -A
+kubectl version
+```
+"""
+        )
+
+    # ── Changelog & Compatibility ────────────────────────────────────────
+    with tab_changelog:
+        st.markdown("### Version Changelog & Compatibility Notes")
+
+        for v in _K8S_VERSIONS_DETAIL:
+            marker = " ← CURRENT" if v["version"] == current_ver else ""
+            with st.expander(f"Kubernetes {v['version']}{marker}", expanded=(v["version"] == current_ver)):
+                st.markdown(f"**Release Date:** {v['release']}")
+                st.markdown(f"**End of Life:** {v['end_of_life']}")
+                st.markdown(f"**Key Highlights:** {v['highlights']}")
+                st.markdown("---")
+                st.markdown(
+                    f"**Compatibility:**\n"
+                    f"- CRI-O: {v['version']}.x\n"
+                    f"- Flannel: Compatible (check release notes for CNI spec changes)\n"
+                    f"- etcd: 3.5.x+ recommended\n"
+                    f"- CoreDNS: 1.11.x+ recommended\n"
+                )
+                st.markdown(
+                    f"**Upgrade Notes:**\n"
+                    f"- Always upgrade one minor version at a time\n"
+                    f"- Check deprecated API versions before upgrading\n"
+                    f"- Run `kubeadm upgrade plan` to verify compatibility\n"
+                    f"- Back up etcd before starting\n"
+                )
+
+
 def page_ai_assistant():
     st.markdown("## AI Kubernetes Assistant")
 
@@ -1334,32 +2320,42 @@ def _get_active_profile() -> ClusterProfile | None:
 
 def _show_profile_summary(profile: ClusterProfile):
     """Display a compact profile summary."""
-    cols = st.columns(5)
-    cols[0].metric("Profile", profile.name)
-    cols[1].metric("K8s Version", profile.kubernetes_version)
-    cols[2].metric("Runtime", f"CRI-O {profile.crio_version}")
-    cols[3].metric("CNI", "Flannel")
-    cols[4].metric("Nodes", f"{len(profile.get_control_plane_nodes())} CP + {len(profile.get_worker_nodes())} W")
+    if profile.cluster_source == "imported":
+        cols = st.columns(4)
+        cols[0].metric("Profile", profile.name)
+        cols[1].metric("K8s Version", profile.kubernetes_version)
+        cols[2].metric("Source", "Imported (kubeconfig)")
+        cols[3].metric("Status", profile.status.upper())
+        with st.expander("Cluster Details", expanded=False):
+            st.markdown(f"**Description:** {profile.description or 'N/A'}")
+            st.markdown(f"**Kubeconfig:** {'Loaded' if profile.kubeconfig_content else 'Not loaded'}")
+    else:
+        cols = st.columns(5)
+        cols[0].metric("Profile", profile.name)
+        cols[1].metric("K8s Version", profile.kubernetes_version)
+        cols[2].metric("Runtime", f"CRI-O {profile.crio_version}")
+        cols[3].metric("CNI", "Flannel")
+        cols[4].metric("Nodes", f"{len(profile.get_control_plane_nodes())} CP + {len(profile.get_worker_nodes())} W")
 
-    with st.expander("Storage & Proxy Details", expanded=False):
-        scol1, scol2, scol3 = st.columns(3)
-        with scol1:
-            st.markdown(f"**CRI-O Root:** `{profile.crio_root}`")
-            st.markdown(f"**CRI-O RunRoot:** `{profile.crio_runroot}`")
-        with scol2:
-            st.markdown(f"**Kubelet Dir:** `{profile.kubelet_root}`")
-            st.markdown(f"**Log Root:** `{profile.log_root}`")
-        with scol3:
-            if profile.http_proxy or profile.https_proxy:
-                st.markdown(f"**HTTP Proxy:** `{profile.http_proxy or 'N/A'}`")
-                st.markdown(f"**HTTPS Proxy:** `{profile.https_proxy or 'N/A'}`")
-                if profile.no_proxy:
-                    st.markdown(f"**No Proxy:** `{profile.no_proxy}`")
-            if profile.http_proxy_alt or profile.https_proxy_alt:
-                st.markdown(f"**Alt HTTP Proxy:** `{profile.http_proxy_alt or 'N/A'}`")
-                st.markdown(f"**Alt HTTPS Proxy:** `{profile.https_proxy_alt or 'N/A'}`")
-            if not (profile.http_proxy or profile.https_proxy or profile.http_proxy_alt or profile.https_proxy_alt):
-                st.markdown("**Proxy:** Not configured")
+        with st.expander("Storage & Proxy Details", expanded=False):
+            scol1, scol2, scol3 = st.columns(3)
+            with scol1:
+                st.markdown(f"**CRI-O Root:** `{profile.crio_root}`")
+                st.markdown(f"**CRI-O RunRoot:** `{profile.crio_runroot}`")
+            with scol2:
+                st.markdown(f"**Kubelet Dir:** `{profile.kubelet_root}`")
+                st.markdown(f"**Log Root:** `{profile.log_root}`")
+            with scol3:
+                if profile.http_proxy or profile.https_proxy:
+                    st.markdown(f"**HTTP Proxy:** `{profile.http_proxy or 'N/A'}`")
+                    st.markdown(f"**HTTPS Proxy:** `{profile.https_proxy or 'N/A'}`")
+                    if profile.no_proxy:
+                        st.markdown(f"**No Proxy:** `{profile.no_proxy}`")
+                if profile.http_proxy_alt or profile.https_proxy_alt:
+                    st.markdown(f"**Alt HTTP Proxy:** `{profile.http_proxy_alt or 'N/A'}`")
+                    st.markdown(f"**Alt HTTPS Proxy:** `{profile.https_proxy_alt or 'N/A'}`")
+                if not (profile.http_proxy or profile.https_proxy or profile.http_proxy_alt or profile.https_proxy_alt):
+                    st.markdown("**Proxy:** Not configured")
 
 
 # ── Main Router ───────────────────────────────────────────────────────────
@@ -1371,12 +2367,16 @@ def main():
         page_profile_manager()
     elif page == "Cluster Creation":
         page_cluster_creation()
+    elif page == "Resource Viewer":
+        page_resource_viewer()
     elif page == "Cluster Debugger":
         page_cluster_debugger()
     elif page == "Monitoring Setup":
         page_monitoring_setup()
     elif page == "Log Analysis":
         page_log_analysis()
+    elif page == "Upgrade Planner":
+        page_upgrade_planner()
     elif page == "AI Assistant":
         page_ai_assistant()
 

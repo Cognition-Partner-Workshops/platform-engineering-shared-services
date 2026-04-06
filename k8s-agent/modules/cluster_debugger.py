@@ -1,11 +1,36 @@
-"""Cluster Debugger — Diagnose K8s issues and provide LLM-powered recommendations."""
+"""Cluster Debugger — Diagnose K8s issues and provide LLM-powered recommendations.
+
+Supports both provisioned clusters (SSH-based) and imported clusters (kubeconfig-based).
+"""
+
+import os
+import subprocess
 
 from modules.cluster_creator import run_ssh_command, SSHResult
 from modules.profile_manager import ClusterProfile
+import config
 
 
 # ── Diagnostic command definitions ────────────────────────────────────────
 
+# kubectl-only commands (work for both imported and provisioned clusters)
+KUBECTL_DIAGNOSTIC_COMMANDS = {
+    "Node Status": "get nodes -o wide",
+    "Pod Status (All Namespaces)": "get pods -A -o wide",
+    "Events (Recent)": "get events -A --sort-by=.lastTimestamp",
+    "Component Status": "get componentstatuses",
+    "System Pods": "-n kube-system get pods -o wide",
+    "Node Resources": "top nodes",
+    "Pod Resources": "top pods -A",
+    "Cluster Info": "cluster-info",
+    "Flannel Status": "-n kube-flannel get pods -o wide",
+    "Network Policies": "get networkpolicies -A",
+    "Services": "get svc -A",
+    "PVCs": "get pvc -A",
+    "Ingresses": "get ingress -A",
+}
+
+# Full SSH commands (backward-compat for provisioned clusters)
 DIAGNOSTIC_COMMANDS = {
     "Node Status": "kubectl get nodes -o wide",
     "Pod Status (All Namespaces)": "kubectl get pods -A -o wide",
@@ -29,6 +54,39 @@ DIAGNOSTIC_COMMANDS = {
     "DNS Resolution": "kubectl run dns-test --image=busybox:1.36 --rm -it --restart=Never -- nslookup kubernetes.default 2>/dev/null || echo 'DNS test skipped'",
     "Certificate Expiry": "kubeadm certs check-expiration 2>/dev/null || echo 'Not a kubeadm node or kubeadm not found'",
 }
+
+
+def _run_local_kubectl(kubeconfig_content: str, kubectl_args: str, timeout: int = 60) -> SSHResult:
+    """Run a kubectl command locally using the given kubeconfig content."""
+    kubeconfig_path = os.path.join(config.DATA_DIR, "kubeconfigs", "_debug_temp.kubeconfig")
+    os.makedirs(os.path.dirname(kubeconfig_path), exist_ok=True)
+    with open(kubeconfig_path, "w") as f:
+        f.write(kubeconfig_content)
+    full_cmd = f"kubectl --kubeconfig={kubeconfig_path} {kubectl_args}"
+    try:
+        proc = subprocess.run(full_cmd, shell=True, capture_output=True, text=True, timeout=timeout)
+        return SSHResult(
+            hostname="local", command=full_cmd, return_code=proc.returncode,
+            stdout=proc.stdout, stderr=proc.stderr, success=proc.returncode == 0,
+        )
+    except subprocess.TimeoutExpired:
+        return SSHResult(
+            hostname="local", command=full_cmd, return_code=-1,
+            stdout="", stderr=f"Command timed out after {timeout}s", success=False,
+        )
+    except Exception as e:
+        return SSHResult(
+            hostname="local", command=full_cmd, return_code=-1,
+            stdout="", stderr=str(e), success=False,
+        )
+
+
+def get_available_commands(profile: ClusterProfile) -> dict[str, str]:
+    """Return available diagnostic commands based on cluster source."""
+    if profile.cluster_source == "imported":
+        return dict(KUBECTL_DIAGNOSTIC_COMMANDS)
+    return dict(DIAGNOSTIC_COMMANDS)
+
 
 CATEGORY_MAP = {
     "Cluster Overview": [
@@ -73,10 +131,33 @@ CATEGORY_MAP = {
 
 
 def run_diagnostic(
-    control_plane_node: dict,
+    control_plane_node: dict | None,
     command_name: str,
+    profile: ClusterProfile | None = None,
 ) -> SSHResult:
-    """Run a single diagnostic command on the control-plane node."""
+    """Run a single diagnostic command.
+
+    For imported clusters, uses kubectl locally with kubeconfig.
+    For provisioned clusters, uses SSH to the control-plane node.
+    """
+    # Imported cluster path
+    if profile and profile.cluster_source == "imported" and profile.kubeconfig_content:
+        kubectl_args = KUBECTL_DIAGNOSTIC_COMMANDS.get(command_name)
+        if kubectl_args is None:
+            return SSHResult(
+                hostname="local", command=command_name, return_code=1,
+                stdout="",
+                stderr=f"Command '{command_name}' requires SSH (not available for imported clusters).",
+                success=False,
+            )
+        return _run_local_kubectl(profile.kubeconfig_content, kubectl_args, timeout=60)
+
+    # Provisioned cluster path (SSH)
+    if not control_plane_node:
+        return SSHResult(
+            hostname="unknown", command=command_name, return_code=1,
+            stdout="", stderr="No control-plane node available.", success=False,
+        )
     command = DIAGNOSTIC_COMMANDS.get(command_name)
     if not command:
         return SSHResult(
@@ -98,30 +179,47 @@ def run_diagnostic(
 
 
 def run_category_diagnostics(
-    control_plane_node: dict,
+    control_plane_node: dict | None,
     category: str,
+    profile: ClusterProfile | None = None,
 ) -> dict[str, SSHResult]:
     """Run all diagnostic commands for a given category."""
     results = {}
     command_names = CATEGORY_MAP.get(category, [])
     for name in command_names:
-        results[name] = run_diagnostic(control_plane_node, name)
+        results[name] = run_diagnostic(control_plane_node, name, profile=profile)
     return results
 
 
-def run_all_diagnostics(control_plane_node: dict) -> dict[str, SSHResult]:
+def run_all_diagnostics(
+    control_plane_node: dict | None,
+    profile: ClusterProfile | None = None,
+) -> dict[str, SSHResult]:
     """Run every diagnostic command."""
+    commands = get_available_commands(profile) if profile else DIAGNOSTIC_COMMANDS
     results = {}
-    for name in DIAGNOSTIC_COMMANDS:
-        results[name] = run_diagnostic(control_plane_node, name)
+    for name in commands:
+        results[name] = run_diagnostic(control_plane_node, name, profile=profile)
     return results
 
 
 def run_custom_command(
-    control_plane_node: dict,
+    control_plane_node: dict | None,
     command: str,
+    profile: ClusterProfile | None = None,
 ) -> SSHResult:
-    """Run a custom command on the control-plane node."""
+    """Run a custom command. For imported clusters, runs kubectl locally."""
+    if profile and profile.cluster_source == "imported" and profile.kubeconfig_content:
+        cmd = command.strip()
+        if cmd.startswith("kubectl "):
+            cmd = cmd[len("kubectl "):]
+        return _run_local_kubectl(profile.kubeconfig_content, cmd, timeout=60)
+
+    if not control_plane_node:
+        return SSHResult(
+            hostname="unknown", command=command, return_code=1,
+            stdout="", stderr="No control-plane node available.", success=False,
+        )
     return run_ssh_command(
         ip_address=control_plane_node["ip_address"],
         command=command,
@@ -211,9 +309,27 @@ Provide a concise diagnosis and the exact commands to fix this issue.
     return query_llm(prompt)
 
 
-def check_pod_issues(control_plane_node: dict, namespace: str = "") -> SSHResult:
+def check_pod_issues(
+    control_plane_node: dict | None,
+    namespace: str = "",
+    profile: ClusterProfile | None = None,
+) -> SSHResult:
     """Check for pods in non-running states."""
     ns_flag = f"-n {namespace}" if namespace else "-A"
+
+    if profile and profile.cluster_source == "imported" and profile.kubeconfig_content:
+        kubectl_args = (
+            f"get pods {ns_flag} "
+            "--field-selector=status.phase!=Running,status.phase!=Succeeded -o wide"
+        )
+        return _run_local_kubectl(profile.kubeconfig_content, kubectl_args, timeout=60)
+
+    if not control_plane_node:
+        return SSHResult(
+            hostname="unknown", command="check_pod_issues", return_code=1,
+            stdout="", stderr="No control-plane node available.", success=False,
+        )
+
     command = (
         f"kubectl get pods {ns_flag} --field-selector="
         "'status.phase!=Running,status.phase!=Succeeded' -o wide 2>/dev/null; "

@@ -54,6 +54,9 @@ class ClusterProfile:
     # Offline manifest paths — user-provided files for air-gapped environments
     flannel_manifest_path: str = ""  # local path to kube-flannel.yml
     prometheus_manifest_path: str = ""  # local path to prometheus manifest
+    # Kubeconfig for existing clusters (imported, not provisioned)
+    kubeconfig_content: str = ""  # raw kubeconfig YAML content
+    cluster_source: str = "provisioned"  # "provisioned" or "imported"
 
     def get_control_plane_nodes(self) -> list[dict]:
         return [n for n in self.nodes if n.get("role") == "control-plane"]

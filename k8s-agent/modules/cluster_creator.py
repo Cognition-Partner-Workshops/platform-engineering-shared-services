@@ -1,10 +1,12 @@
 """Cluster Creator — SSH-based K8s cluster provisioning with CRI-O + Flannel."""
 
+import os
 import subprocess
 import time
 from dataclasses import dataclass, field
 from typing import List, Optional
 
+import config
 from modules.profile_manager import ClusterProfile
 
 # Default Flannel manifest URL — can be overridden by user-uploaded file
@@ -1181,6 +1183,88 @@ Please review this configuration and provide:
 4. Network configuration tips for Flannel with CRI-O
 """
     return query_llm(prompt)
+
+
+def run_kubectl(profile: ClusterProfile, command: str, timeout: int = 30) -> SSHResult:
+    """Run a kubectl (or helm) command against the cluster.
+
+    For imported clusters (with kubeconfig), commands run locally.
+    For provisioned clusters, commands run via SSH on the control-plane node.
+
+    If `command` starts with 'helm ', it is treated as a helm command and
+    the KUBECONFIG env var is set instead of prefixing with 'kubectl'.
+    """
+    is_helm = command.strip().startswith("helm ")
+
+    if profile.kubeconfig_content:
+        # Write kubeconfig to a file and run locally
+        kubeconfig_path = os.path.join(
+            config.DATA_DIR, "kubeconfigs", f"{profile.name}.kubeconfig"
+        )
+        os.makedirs(os.path.dirname(kubeconfig_path), exist_ok=True)
+        with open(kubeconfig_path, "w") as f:
+            f.write(profile.kubeconfig_content)
+
+        if is_helm:
+            full_cmd = f"KUBECONFIG={kubeconfig_path} {command}"
+        else:
+            full_cmd = f"kubectl --kubeconfig={kubeconfig_path} {command}"
+        try:
+            proc = subprocess.run(
+                full_cmd,
+                shell=True,
+                capture_output=True,
+                text=True,
+                timeout=timeout,
+            )
+            return SSHResult(
+                hostname="local (kubeconfig)",
+                command=full_cmd,
+                return_code=proc.returncode,
+                stdout=proc.stdout,
+                stderr=proc.stderr,
+                success=proc.returncode == 0,
+            )
+        except subprocess.TimeoutExpired:
+            return SSHResult(
+                hostname="local (kubeconfig)",
+                command=full_cmd,
+                return_code=-1,
+                stdout="",
+                stderr=f"Command timed out after {timeout}s",
+                success=False,
+            )
+        except Exception as exc:
+            return SSHResult(
+                hostname="local (kubeconfig)",
+                command=full_cmd,
+                return_code=-1,
+                stdout="",
+                stderr=str(exc),
+                success=False,
+            )
+    else:
+        # Provisioned cluster — SSH to control-plane
+        cp_nodes = profile.get_control_plane_nodes()
+        if not cp_nodes:
+            return SSHResult(
+                hostname="N/A",
+                command=command,
+                return_code=-1,
+                stdout="",
+                stderr="No control-plane node defined",
+                success=False,
+            )
+        cp = cp_nodes[0]
+        remote_cmd = command if is_helm else f"kubectl {command}"
+        return run_ssh_command(
+            ip_address=cp["ip_address"],
+            command=remote_cmd,
+            ssh_user=cp.get("ssh_user", "root"),
+            ssh_port=cp.get("ssh_port", 22),
+            ssh_key_path=cp.get("ssh_key_path", "~/.ssh/id_rsa"),
+            timeout=timeout,
+        )
 
 
 def upload_flannel_manifest_to_node(node: dict, local_path: str) -> SSHResult:
