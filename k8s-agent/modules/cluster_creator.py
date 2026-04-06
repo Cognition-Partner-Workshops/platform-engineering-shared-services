@@ -2,8 +2,8 @@
 
 import subprocess
 import time
-from dataclasses import dataclass
-from typing import Optional
+from dataclasses import dataclass, field
+from typing import List, Optional
 
 from modules.llm_client import query_llm
 from modules.profile_manager import ClusterProfile
@@ -524,6 +524,525 @@ echo "  - LimitRange with default container limits"
 echo "  - Read-only ClusterRole (cluster-reader)"
 echo "  - Audit logging directory configured"
 """
+
+
+# ══════════════════════════════════════════════════════════════════════════
+#  Step-based provisioning — granular SSH execution with per-step progress
+# ══════════════════════════════════════════════════════════════════════════
+
+
+@dataclass
+class ProvisionStep:
+    """A single discrete provisioning step to be executed over SSH."""
+
+    name: str  # short identifier, e.g. "disable_swap"
+    title: str  # human-readable label for the UI
+    script: str  # shell snippet to execute
+    timeout: int = 300  # per-step timeout in seconds
+    fatal: bool = True  # if True, abort provisioning on failure
+
+
+def _run_step(node: dict, step: ProvisionStep) -> SSHResult:
+    """Execute a single ProvisionStep on a node via SSH."""
+    return run_ssh_command(
+        ip_address=node["ip_address"],
+        command=step.script,
+        ssh_user=node.get("ssh_user", "root"),
+        ssh_port=node.get("ssh_port", 22),
+        ssh_key_path=node.get("ssh_key_path", "~/.ssh/id_rsa"),
+        timeout=step.timeout,
+    )
+
+
+def get_common_setup_steps(profile: ClusterProfile) -> List[ProvisionStep]:
+    """Return the ordered list of discrete steps for common node setup."""
+    proxy_block = _proxy_env_block(profile)
+    steps: List[ProvisionStep] = []
+
+    # 0. Proxy (optional)
+    if proxy_block:
+        steps.append(ProvisionStep(
+            name="configure_proxy",
+            title="Configure Proxy Settings",
+            script=f"""set -euo pipefail
+echo '>> Configuring proxy settings...'
+{proxy_block}
+# Persist proxy in /etc/environment for all users
+cat >> /etc/environment <<'PROXYEOF'
+{proxy_block}
+PROXYEOF
+echo 'Proxy configured.'
+""",
+            timeout=30,
+        ))
+
+    # 1. System prerequisites
+    steps.append(ProvisionStep(
+        name="system_prerequisites",
+        title="System Prerequisites (swap, modules, sysctl, firewall)",
+        script="""set -euo pipefail
+echo '>> Disabling swap...'
+swapoff -a
+sed -i '/\\bswap\\b/d' /etc/fstab
+
+echo '>> Loading kernel modules...'
+cat > /etc/modules-load.d/k8s.conf <<EOF
+overlay
+br_netfilter
+EOF
+modprobe overlay
+modprobe br_netfilter
+
+echo '>> Setting sysctl parameters...'
+cat > /etc/sysctl.d/99-kubernetes.conf <<EOF
+net.bridge.bridge-nf-call-iptables  = 1
+net.bridge.bridge-nf-call-ip6tables = 1
+net.ipv4.ip_forward                 = 1
+EOF
+sysctl --system
+
+echo '>> Disabling SELinux (if present)...'
+if command -v setenforce &>/dev/null; then
+    setenforce 0 || true
+    sed -i 's/^SELINUX=enforcing/SELINUX=permissive/' /etc/selinux/config 2>/dev/null || true
+fi
+
+echo '>> Configuring firewalld (if present)...'
+if systemctl is-active --quiet firewalld; then
+    firewall-cmd --permanent --add-port=6443/tcp
+    firewall-cmd --permanent --add-port=2379-2380/tcp
+    firewall-cmd --permanent --add-port=10250/tcp
+    firewall-cmd --permanent --add-port=10259/tcp
+    firewall-cmd --permanent --add-port=10257/tcp
+    firewall-cmd --permanent --add-port=30000-32767/tcp
+    firewall-cmd --permanent --add-port=8472/udp
+    firewall-cmd --reload
+fi
+echo 'System prerequisites configured.'
+""",
+        timeout=120,
+    ))
+
+    # 2. Custom storage directories (optional)
+    dir_cmds = []
+    if profile.crio_root != "/var/lib/containers/storage":
+        dir_cmds.append(f'mkdir -p "{profile.crio_root}"')
+        dir_cmds.append(f'mkdir -p "{profile.crio_runroot}"')
+    if profile.kubelet_root != "/var/lib/kubelet":
+        dir_cmds.append(f'mkdir -p "{profile.kubelet_root}"')
+    if profile.log_root != "/var/log":
+        dir_cmds.append(f'mkdir -p "{profile.log_root}/pods"')
+        dir_cmds.append(f'mkdir -p "{profile.log_root}/containers"')
+    if dir_cmds:
+        steps.append(ProvisionStep(
+            name="create_custom_dirs",
+            title="Create Custom Storage Directories",
+            script="set -euo pipefail\necho '>> Creating custom storage directories...'\n"
+                   + "\n".join(dir_cmds) + "\necho 'Custom directories created.'",
+            timeout=30,
+        ))
+
+    # 3. Install CRI-O
+    steps.append(ProvisionStep(
+        name="install_crio",
+        title=f"Install CRI-O {profile.crio_version}",
+        script=f"""set -euo pipefail
+echo '>> Installing CRI-O {profile.crio_version}...'
+
+OS="$(. /etc/os-release && echo "$ID")"
+VERSION_ID="$(. /etc/os-release && echo "$VERSION_ID")"
+
+if [[ "$OS" == "ubuntu" || "$OS" == "debian" ]]; then
+    apt-get update -y
+    apt-get install -y software-properties-common curl gnupg2
+    CRIO_VERSION="{profile.crio_version}"
+    curl -fsSL "https://pkgs.k8s.io/addons:/cri-o:/stable:/v$CRIO_VERSION/deb/Release.key" | \\
+        gpg --dearmor -o /etc/apt/keyrings/cri-o-apt-keyring.gpg
+    echo "deb [signed-by=/etc/apt/keyrings/cri-o-apt-keyring.gpg] https://pkgs.k8s.io/addons:/cri-o:/stable:/v$CRIO_VERSION/deb/ /" | \\
+        tee /etc/apt/sources.list.d/cri-o.list
+    apt-get update -y
+    apt-get install -y cri-o
+elif [[ "$OS" == "rhel" || "$OS" == "centos" || "$OS" == "rocky" || "$OS" == "almalinux" ]]; then
+    CRIO_VERSION="{profile.crio_version}"
+    cat > /etc/yum.repos.d/cri-o.repo <<REPO
+[cri-o]
+name=CRI-O
+baseurl=https://pkgs.k8s.io/addons:/cri-o:/stable:/v$CRIO_VERSION/rpm/
+enabled=1
+gpgcheck=1
+gpgkey=https://pkgs.k8s.io/addons:/cri-o:/stable:/v$CRIO_VERSION/rpm/repodata/repomd.xml.key
+REPO
+    dnf install -y cri-o
+fi
+echo 'CRI-O installed.'
+""",
+        timeout=300,
+    ))
+
+    # 4. Configure CRI-O storage
+    steps.append(ProvisionStep(
+        name="configure_crio",
+        title="Configure CRI-O Storage & Start Service",
+        script=f"""set -euo pipefail
+echo '>> Configuring CRI-O storage to {profile.crio_root}...'
+systemctl daemon-reload
+mkdir -p /etc/crio/crio.conf.d
+cat > /etc/crio/crio.conf.d/01-storage.conf <<CRIOCONF
+[crio]
+  root = "{profile.crio_root}"
+  runroot = "{profile.crio_runroot}"
+  log_dir = "{profile.log_root}/crio/pods"
+CRIOCONF
+
+systemctl enable --now crio
+echo 'CRI-O configured and running (storage: {profile.crio_root}).'
+""",
+        timeout=60,
+    ))
+
+    # 5. Install kubeadm, kubelet, kubectl
+    steps.append(ProvisionStep(
+        name="install_k8s",
+        title=f"Install Kubernetes {profile.kubernetes_version} Components",
+        script=f"""set -euo pipefail
+echo '>> Installing Kubernetes {profile.kubernetes_version} components...'
+
+OS="$(. /etc/os-release && echo "$ID")"
+K8S_VERSION="{profile.kubernetes_version}"
+
+if [[ "$OS" == "ubuntu" || "$OS" == "debian" ]]; then
+    curl -fsSL "https://pkgs.k8s.io/core:/stable:/v$K8S_VERSION/deb/Release.key" | \\
+        gpg --dearmor -o /etc/apt/keyrings/kubernetes-apt-keyring.gpg
+    echo "deb [signed-by=/etc/apt/keyrings/kubernetes-apt-keyring.gpg] https://pkgs.k8s.io/core:/stable:/v$K8S_VERSION/deb/ /" | \\
+        tee /etc/apt/sources.list.d/kubernetes.list
+    apt-get update -y
+    apt-get install -y kubelet kubeadm kubectl
+    apt-mark hold kubelet kubeadm kubectl
+elif [[ "$OS" == "rhel" || "$OS" == "centos" || "$OS" == "rocky" || "$OS" == "almalinux" ]]; then
+    cat > /etc/yum.repos.d/kubernetes.repo <<REPO
+[kubernetes]
+name=Kubernetes
+baseurl=https://pkgs.k8s.io/core:/stable:/v$K8S_VERSION/rpm/
+enabled=1
+gpgcheck=1
+gpgkey=https://pkgs.k8s.io/core:/stable:/v$K8S_VERSION/rpm/repodata/repomd.xml.key
+REPO
+    dnf install -y kubelet kubeadm kubectl
+fi
+
+systemctl enable --now kubelet
+echo 'Kubernetes components installed.'
+""",
+        timeout=300,
+    ))
+
+    return steps
+
+
+def get_control_plane_steps(profile: ClusterProfile) -> List[ProvisionStep]:
+    """Return the ordered list of discrete steps for control-plane init."""
+    cp_nodes = profile.get_control_plane_nodes()
+    cp_ip = cp_nodes[0]["ip_address"] if cp_nodes else "CONTROL_PLANE_IP"
+
+    proxy_block = _proxy_env_block(profile)
+    audit_log_dir = f"{profile.log_root}/kubernetes"
+
+    kubelet_extra = '    container-runtime-endpoint: "unix:///var/run/crio/crio.sock"'
+    if profile.kubelet_root != "/var/lib/kubelet":
+        kubelet_extra += f'\n    root-dir: "{profile.kubelet_root}"'
+
+    steps: List[ProvisionStep] = []
+
+    # 0. Proxy on CP (optional)
+    if proxy_block:
+        steps.append(ProvisionStep(
+            name="cp_proxy",
+            title="Set Proxy Environment for kubeadm",
+            script=f"""set -euo pipefail
+echo '>> Setting proxy environment for kubeadm...'
+{proxy_block}
+echo 'Proxy environment set.'
+""",
+            timeout=15,
+        ))
+
+    # 1. kubeadm init
+    steps.append(ProvisionStep(
+        name="kubeadm_init",
+        title="Run kubeadm init",
+        script=f"""set -euo pipefail
+echo '>> Preparing kubeadm config...'
+mkdir -p "{audit_log_dir}"
+cat > /tmp/kubeadm-config.yaml <<EOF
+apiVersion: kubeadm.k8s.io/v1beta3
+kind: InitConfiguration
+localAPIEndpoint:
+  advertiseAddress: "{cp_ip}"
+  bindPort: 6443
+nodeRegistration:
+  criSocket: "unix:///var/run/crio/crio.sock"
+  kubeletExtraArgs:
+{kubelet_extra}
+---
+apiVersion: kubeadm.k8s.io/v1beta3
+kind: ClusterConfiguration
+kubernetesVersion: "v{profile.kubernetes_version}.0"
+networking:
+  podSubnet: "{profile.pod_cidr}"
+  serviceSubnet: "{profile.service_cidr}"
+  dnsDomain: "{profile.dns_domain}"
+controlPlaneEndpoint: "{cp_ip}:6443"
+apiServer:
+  extraArgs:
+    authorization-mode: "Node,RBAC"
+    enable-admission-plugins: "NodeRestriction,PodSecurity"
+    audit-log-path: "{audit_log_dir}/audit.log"
+    audit-log-maxage: "30"
+    audit-log-maxbackup: "10"
+    audit-log-maxsize: "100"
+  extraVolumes:
+  - name: audit-log
+    hostPath: "{audit_log_dir}"
+    mountPath: "{audit_log_dir}"
+    pathType: DirectoryOrCreate
+controllerManager:
+  extraArgs:
+    bind-address: "0.0.0.0"
+    terminated-pod-gc-threshold: "100"
+scheduler:
+  extraArgs:
+    bind-address: "0.0.0.0"
+etcd:
+  local:
+    extraArgs:
+      listen-metrics-urls: "http://0.0.0.0:2381"
+---
+apiVersion: kubelet.config.k8s.io/v1beta1
+kind: KubeletConfiguration
+cgroupDriver: systemd
+containerRuntimeEndpoint: "unix:///var/run/crio/crio.sock"
+evictionHard:
+  memory.available: "100Mi"
+  nodefs.available: "10%"
+  imagefs.available: "15%"
+EOF
+
+echo '>> Running kubeadm init (this may take a few minutes)...'
+kubeadm init --config=/tmp/kubeadm-config.yaml --upload-certs | tee /tmp/kubeadm-init.log
+echo 'kubeadm init complete.'
+""",
+        timeout=600,
+    ))
+
+    # 2. Configure kubectl
+    steps.append(ProvisionStep(
+        name="configure_kubectl",
+        title="Configure kubectl for root user",
+        script="""set -euo pipefail
+echo '>> Configuring kubectl...'
+mkdir -p /root/.kube
+cp /etc/kubernetes/admin.conf /root/.kube/config
+chown root:root /root/.kube/config
+kubectl get nodes
+echo 'kubectl configured.'
+""",
+        timeout=30,
+    ))
+
+    # 3. Install Flannel CNI
+    steps.append(ProvisionStep(
+        name="install_flannel",
+        title="Install Flannel CNI",
+        script="""set -euo pipefail
+echo '>> Installing Flannel CNI...'
+kubectl apply -f https://github.com/flannel-io/flannel/releases/latest/download/kube-flannel.yml
+echo '>> Waiting for Flannel pods to be ready...'
+kubectl -n kube-flannel wait --for=condition=ready pod -l app=flannel --timeout=120s || true
+echo 'Flannel CNI installed.'
+""",
+        timeout=180,
+    ))
+
+    # 4. Pod Security Standards
+    steps.append(ProvisionStep(
+        name="pod_security",
+        title=f"Apply Pod Security Standards ({profile.pod_security_standard})",
+        script=f"""set -euo pipefail
+echo '>> Applying Pod Security Standards ({profile.pod_security_standard})...'
+kubectl label namespace default \\
+    pod-security.kubernetes.io/enforce={profile.pod_security_standard} \\
+    pod-security.kubernetes.io/warn={profile.pod_security_standard} \\
+    pod-security.kubernetes.io/audit={profile.pod_security_standard} \\
+    --overwrite
+echo 'Pod Security Standards applied.'
+""",
+        timeout=30,
+    ))
+
+    # 5. Generate join command
+    steps.append(ProvisionStep(
+        name="generate_join_cmd",
+        title="Generate Worker Join Command",
+        script="""set -euo pipefail
+echo '>> Generating worker join command...'
+kubeadm token create --print-join-command > /tmp/kubeadm-join-command.txt
+echo 'Join command:'
+cat /tmp/kubeadm-join-command.txt
+""",
+        timeout=30,
+    ))
+
+    return steps
+
+
+def get_worker_join_steps(join_command: str) -> List[ProvisionStep]:
+    """Return the step(s) to join a worker node to the cluster."""
+    return [
+        ProvisionStep(
+            name="join_cluster",
+            title="Join Cluster",
+            script=f"""set -euo pipefail
+echo '>> Joining cluster...'
+{join_command} --cri-socket unix:///var/run/crio/crio.sock
+echo 'Successfully joined the cluster.'
+""",
+            timeout=300,
+        ),
+    ]
+
+
+def get_best_practices_steps() -> List[ProvisionStep]:
+    """Return the ordered list of best-practices hardening steps."""
+    return [
+        ProvisionStep(
+            name="network_policy",
+            title="Apply Default-Deny NetworkPolicy",
+            script="""set -euo pipefail
+echo '>> Creating default-deny network policy for default namespace...'
+cat <<EOF | kubectl apply -f -
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: default-deny-all
+  namespace: default
+spec:
+  podSelector: {}
+  policyTypes:
+  - Ingress
+  - Egress
+EOF
+echo 'NetworkPolicy applied.'
+""",
+            timeout=30,
+        ),
+        ProvisionStep(
+            name="resource_quota",
+            title="Set Resource Quotas",
+            script="""set -euo pipefail
+echo '>> Setting resource quotas...'
+cat <<EOF | kubectl apply -f -
+apiVersion: v1
+kind: ResourceQuota
+metadata:
+  name: default-quota
+  namespace: default
+spec:
+  hard:
+    requests.cpu: "4"
+    requests.memory: 8Gi
+    limits.cpu: "8"
+    limits.memory: 16Gi
+    pods: "50"
+    services: "20"
+    persistentvolumeclaims: "10"
+EOF
+echo 'ResourceQuota applied.'
+""",
+            timeout=30,
+        ),
+        ProvisionStep(
+            name="limit_range",
+            title="Set Limit Ranges",
+            script="""set -euo pipefail
+echo '>> Setting limit ranges...'
+cat <<EOF | kubectl apply -f -
+apiVersion: v1
+kind: LimitRange
+metadata:
+  name: default-limits
+  namespace: default
+spec:
+  limits:
+  - default:
+      cpu: "500m"
+      memory: "512Mi"
+    defaultRequest:
+      cpu: "100m"
+      memory: "128Mi"
+    type: Container
+EOF
+echo 'LimitRange applied.'
+""",
+            timeout=30,
+        ),
+        ProvisionStep(
+            name="rbac_reader",
+            title="Create Read-Only ClusterRole",
+            script="""set -euo pipefail
+echo '>> Creating read-only ClusterRole...'
+cat <<EOF | kubectl apply -f -
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: cluster-reader
+rules:
+- apiGroups: [""]
+  resources: ["pods", "services", "namespaces", "nodes", "events", "configmaps"]
+  verbs: ["get", "list", "watch"]
+- apiGroups: ["apps"]
+  resources: ["deployments", "replicasets", "statefulsets", "daemonsets"]
+  verbs: ["get", "list", "watch"]
+- apiGroups: ["networking.k8s.io"]
+  resources: ["networkpolicies", "ingresses"]
+  verbs: ["get", "list", "watch"]
+EOF
+echo 'ClusterRole cluster-reader created.'
+""",
+            timeout=30,
+        ),
+        ProvisionStep(
+            name="audit_log_dir",
+            title="Ensure Audit Log Directory",
+            script="""set -euo pipefail
+echo '>> Ensuring audit log directory exists...'
+mkdir -p /var/log/kubernetes
+echo 'Audit log directory ready.'
+""",
+            timeout=15,
+            fatal=False,
+        ),
+    ]
+
+
+def execute_provision_steps(
+    node: dict,
+    steps: List[ProvisionStep],
+) -> List[tuple]:
+    """Execute a list of provision steps on a node.
+
+    Returns a list of (ProvisionStep, SSHResult) tuples.
+    Stops at the first fatal failure.
+    """
+    results: List[tuple] = []
+    for step in steps:
+        result = _run_step(node, step)
+        results.append((step, result))
+        if not result.success and step.fatal:
+            break
+    return results
+
+
+# ── Legacy wrapper functions (kept for backward compatibility) ────────────
 
 
 def provision_node_common(node: dict, profile: ClusterProfile) -> SSHResult:

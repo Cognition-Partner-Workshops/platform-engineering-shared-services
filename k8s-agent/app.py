@@ -32,6 +32,12 @@ from modules.cluster_creator import (
     apply_best_practices,
     get_cluster_status,
     get_llm_cluster_advice,
+    ProvisionStep,
+    _run_step,
+    get_common_setup_steps,
+    get_control_plane_steps,
+    get_worker_join_steps,
+    get_best_practices_steps,
 )
 from modules.cluster_debugger import (
     DIAGNOSTIC_COMMANDS,
@@ -522,8 +528,8 @@ def page_cluster_creation():
     with tab_provision:
         st.markdown("### Automated Cluster Provisioning")
         st.warning(
-            "This will SSH into each node and install Kubernetes components. "
-            "Ensure all nodes are accessible and you have root/sudo access."
+            "This will SSH into each node and execute every provisioning step "
+            "automatically. Ensure all nodes are accessible and you have root/sudo access."
         )
 
         cp_nodes = profile.get_control_plane_nodes()
@@ -542,80 +548,136 @@ def page_cluster_creation():
 
         if st.button("Start Provisioning", type="primary", use_container_width=True):
             update_profile_status(profile.name, "provisioning")
+            overall_success = True
 
-            # Step 1: Common setup on all nodes
+            # ── Step 1: Common setup on ALL nodes (granular per-step) ────
             if step1:
                 st.markdown("---")
-                st.markdown("### Step 1: Common Setup")
+                st.markdown("### Step 1: Common Node Setup")
+                common_steps = get_common_setup_steps(profile)
                 for node in profile.nodes:
-                    with st.status(
-                        f"Setting up {node.get('hostname', node['ip_address'])} ({node['role']})...",
-                        expanded=True,
-                    ):
-                        result = provision_node_common(node, profile)
-                        if result.success:
-                            st.success(f"Common setup complete on {node['ip_address']}")
-                        else:
-                            st.error(f"Setup failed on {node['ip_address']}")
-                            st.code(result.stderr, language="text")
+                    node_label = f"{node.get('hostname', node['ip_address'])} ({node['role']})"
+                    st.markdown(f"#### Node: {node_label}")
+                    node_ok = True
+                    progress = st.progress(0, text=f"Starting setup on {node_label}...")
+                    for idx, step in enumerate(common_steps):
+                        pct = int((idx / len(common_steps)) * 100)
+                        progress.progress(pct, text=f"[{idx+1}/{len(common_steps)}] {step.title}")
+                        with st.status(f"{step.title}...", expanded=False) as status:
+                            result = _run_step(node, step)
+                            if result.success:
+                                st.code(result.stdout[-1500:] if result.stdout else "(no output)", language="text")
+                                status.update(label=f"{step.title} — done", state="complete")
+                            else:
+                                st.error(f"FAILED: {step.title}")
+                                st.code(result.stderr or result.stdout, language="text")
+                                status.update(label=f"{step.title} — FAILED", state="error")
+                                node_ok = False
+                                if step.fatal:
+                                    overall_success = False
+                                    break
+                    progress.progress(100, text=f"{'Setup complete' if node_ok else 'Setup FAILED'} on {node_label}")
+                    if node_ok:
+                        st.success(f"Common setup complete on {node['ip_address']}")
+                    else:
+                        st.error(f"Common setup failed on {node['ip_address']}")
 
-            # Step 2: Initialize control plane
-            if step2 and cp_nodes:
+            # ── Step 2: Control plane init (granular per-step) ───────────
+            if step2 and cp_nodes and overall_success:
                 st.markdown("---")
                 st.markdown("### Step 2: Control Plane Initialization")
                 cp_node = cp_nodes[0]
-                with st.status(f"Initializing control plane on {cp_node['ip_address']}...", expanded=True):
-                    result = init_control_plane(cp_node, profile)
-                    if result.success:
-                        st.success("Control plane initialized!")
-                        st.code(result.stdout[-2000:], language="text")
-                    else:
-                        st.error("Control plane initialization failed!")
-                        st.code(result.stderr, language="text")
+                cp_steps = get_control_plane_steps(profile)
+                progress = st.progress(0, text="Starting control plane init...")
+                for idx, step in enumerate(cp_steps):
+                    pct = int((idx / len(cp_steps)) * 100)
+                    progress.progress(pct, text=f"[{idx+1}/{len(cp_steps)}] {step.title}")
+                    with st.status(f"{step.title}...", expanded=False) as status:
+                        result = _run_step(cp_node, step)
+                        if result.success:
+                            st.code(result.stdout[-2000:] if result.stdout else "(no output)", language="text")
+                            status.update(label=f"{step.title} — done", state="complete")
+                        else:
+                            st.error(f"FAILED: {step.title}")
+                            st.code(result.stderr or result.stdout, language="text")
+                            status.update(label=f"{step.title} — FAILED", state="error")
+                            overall_success = False
+                            if step.fatal:
+                                break
+                progress.progress(100, text="Control plane initialization complete" if overall_success else "Control plane init FAILED")
+                if overall_success:
+                    st.success("Control plane initialized!")
+                else:
+                    st.error("Control plane initialization failed!")
 
-            # Step 3: Join worker nodes
-            if step3 and worker_nodes and cp_nodes:
+            # ── Step 3: Join workers (granular per-step) ─────────────────
+            if step3 and worker_nodes and cp_nodes and overall_success:
                 st.markdown("---")
                 st.markdown("### Step 3: Join Worker Nodes")
                 join_cmd = retrieve_join_command(cp_nodes[0])
                 if join_cmd:
+                    worker_join_steps = get_worker_join_steps(join_cmd)
                     for node in worker_nodes:
-                        with st.status(f"Joining {node.get('hostname', node['ip_address'])}...", expanded=True):
-                            result = join_worker_node(node, join_cmd)
-                            if result.success:
-                                st.success(f"Worker {node['ip_address']} joined!")
-                            else:
-                                st.error(f"Failed to join {node['ip_address']}")
-                                st.code(result.stderr, language="text")
+                        node_label = f"{node.get('hostname', node['ip_address'])}"
+                        st.markdown(f"#### Worker: {node_label}")
+                        for step in worker_join_steps:
+                            with st.status(f"{step.title} on {node_label}...", expanded=False) as status:
+                                result = _run_step(node, step)
+                                if result.success:
+                                    st.code(result.stdout[-1500:] if result.stdout else "(no output)", language="text")
+                                    status.update(label=f"{step.title} — done", state="complete")
+                                    st.success(f"Worker {node['ip_address']} joined!")
+                                else:
+                                    st.error(f"FAILED to join {node['ip_address']}")
+                                    st.code(result.stderr or result.stdout, language="text")
+                                    status.update(label=f"{step.title} — FAILED", state="error")
                 else:
                     st.error("Could not retrieve join command from control plane.")
 
-            # Step 4: Best practices
-            if step4 and cp_nodes:
+            # ── Step 4: Best practices (granular per-step) ───────────────
+            if step4 and cp_nodes and overall_success:
                 st.markdown("---")
-                st.markdown("### Step 4: Best Practices")
-                with st.status("Applying security and resource best practices...", expanded=True):
-                    result = apply_best_practices(cp_nodes[0])
-                    if result.success:
-                        st.success("Best practices applied!")
-                        st.code(result.stdout, language="text")
-                    else:
-                        st.error("Failed to apply best practices")
-                        st.code(result.stderr, language="text")
+                st.markdown("### Step 4: Apply Best Practices")
+                bp_steps = get_best_practices_steps()
+                progress = st.progress(0, text="Applying best practices...")
+                for idx, step in enumerate(bp_steps):
+                    pct = int((idx / len(bp_steps)) * 100)
+                    progress.progress(pct, text=f"[{idx+1}/{len(bp_steps)}] {step.title}")
+                    with st.status(f"{step.title}...", expanded=False) as status:
+                        result = _run_step(cp_nodes[0], step)
+                        if result.success:
+                            st.code(result.stdout[-1000:] if result.stdout else "(no output)", language="text")
+                            status.update(label=f"{step.title} — done", state="complete")
+                        else:
+                            st.error(f"FAILED: {step.title}")
+                            st.code(result.stderr or result.stdout, language="text")
+                            status.update(label=f"{step.title} — FAILED", state="error")
+                            if step.fatal:
+                                overall_success = False
+                                break
+                progress.progress(100, text="Best practices applied" if overall_success else "Best practices FAILED")
+                if overall_success:
+                    st.success("Best practices applied!")
 
-            # Final status
+            # ── Final cluster status ─────────────────────────────────────
             st.markdown("---")
             st.markdown("### Cluster Status")
-            if cp_nodes:
-                result = get_cluster_status(cp_nodes[0])
-                if result.success:
-                    update_profile_status(profile.name, "active")
-                    st.success("Cluster is active!")
-                    st.code(result.stdout, language="text")
-                else:
-                    update_profile_status(profile.name, "error")
-                    st.error("Could not verify cluster status")
-                    st.code(result.stderr, language="text")
+            if cp_nodes and overall_success:
+                with st.status("Checking cluster status...", expanded=True) as status:
+                    result = get_cluster_status(cp_nodes[0])
+                    if result.success:
+                        update_profile_status(profile.name, "active")
+                        st.success("Cluster is active!")
+                        st.code(result.stdout, language="text")
+                        status.update(label="Cluster is active", state="complete")
+                    else:
+                        update_profile_status(profile.name, "error")
+                        st.error("Could not verify cluster status")
+                        st.code(result.stderr, language="text")
+                        status.update(label="Status check failed", state="error")
+            elif not overall_success:
+                update_profile_status(profile.name, "error")
+                st.error("Provisioning did not complete successfully. Check the errors above.")
 
     # ── View Scripts ──────────────────────────────────────────────────────
     with tab_scripts:
