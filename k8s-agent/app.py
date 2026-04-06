@@ -270,6 +270,76 @@ def page_profile_manager():
                 dns_domain = st.text_input("DNS Domain", value="cluster.local")
 
             st.divider()
+            st.markdown("### Storage Paths")
+            st.markdown(
+                "Configure where CRI-O stores container images, pods, and logs. "
+                "Change these to use a dedicated disk instead of the default `/var/lib`."
+            )
+            scol1, scol2 = st.columns(2)
+            with scol1:
+                crio_root = st.text_input(
+                    "CRI-O Storage Root",
+                    value="/var/lib/containers/storage",
+                    help="Root directory for CRI-O container/image storage (default: /var/lib/containers/storage)",
+                )
+                crio_runroot = st.text_input(
+                    "CRI-O Run Root",
+                    value="/run/containers/storage",
+                    help="Runtime root for CRI-O (default: /run/containers/storage)",
+                )
+            with scol2:
+                kubelet_root = st.text_input(
+                    "Kubelet Data Directory",
+                    value="/var/lib/kubelet",
+                    help="Kubelet data directory for pods, volumes, etc. (default: /var/lib/kubelet)",
+                )
+                log_root = st.text_input(
+                    "Log Root Directory",
+                    value="/var/log",
+                    help="Base directory for all logs — CRI-O pod logs, kubernetes audit logs, etc. (default: /var/log)",
+                )
+
+            st.divider()
+            st.markdown("### Proxy Settings (Master Node)")
+            st.markdown(
+                "Configure HTTP/HTTPS proxy for the master/control-plane node. "
+                "These are used during package installation and cluster initialization."
+            )
+            pcol1, pcol2 = st.columns(2)
+            with pcol1:
+                http_proxy = st.text_input(
+                    "HTTP Proxy",
+                    value="",
+                    placeholder="http://proxy.example.com:8080",
+                    help="Primary HTTP proxy for outbound connections",
+                )
+                https_proxy = st.text_input(
+                    "HTTPS Proxy",
+                    value="",
+                    placeholder="http://proxy.example.com:8443",
+                    help="Primary HTTPS proxy for outbound connections",
+                )
+                no_proxy = st.text_input(
+                    "No Proxy",
+                    value="",
+                    placeholder="localhost,127.0.0.1,10.96.0.0/12,10.244.0.0/16",
+                    help="Comma-separated list of hosts/CIDRs to bypass proxy",
+                )
+            with pcol2:
+                http_proxy_alt = st.text_input(
+                    "Alternate HTTP Proxy",
+                    value="",
+                    placeholder="http://backup-proxy.example.com:8080",
+                    help="Fallback HTTP proxy if the primary is unavailable",
+                )
+                https_proxy_alt = st.text_input(
+                    "Alternate HTTPS Proxy",
+                    value="",
+                    placeholder="http://backup-proxy.example.com:8443",
+                    help="Fallback HTTPS proxy if the primary is unavailable",
+                )
+
+            st.divider()
             st.markdown("### Nodes")
             st.markdown("Define your control-plane and worker nodes.")
 
@@ -322,6 +392,15 @@ def page_profile_manager():
                         dns_domain=dns_domain,
                         nodes=valid_nodes,
                         pod_security_standard=pod_security,
+                        crio_root=crio_root,
+                        crio_runroot=crio_runroot,
+                        kubelet_root=kubelet_root,
+                        log_root=log_root,
+                        http_proxy=http_proxy,
+                        https_proxy=https_proxy,
+                        no_proxy=no_proxy,
+                        http_proxy_alt=http_proxy_alt,
+                        https_proxy_alt=https_proxy_alt,
                     )
                     path = save_profile(profile)
                     st.session_state.active_profile = name
@@ -343,6 +422,12 @@ def page_profile_manager():
                     st.markdown(f"**Kubernetes:** {profile.kubernetes_version} | **CRI-O:** {profile.crio_version}")
                     st.markdown(f"**Pod CIDR:** {profile.pod_cidr} | **Service CIDR:** {profile.service_cidr}")
                     st.markdown(f"**Pod Security:** {profile.pod_security_standard}")
+                    st.markdown(f"**CRI-O Root:** `{profile.crio_root}` | **Kubelet Dir:** `{profile.kubelet_root}`")
+                    st.markdown(f"**Log Root:** `{profile.log_root}`")
+                    if profile.http_proxy or profile.https_proxy:
+                        st.markdown(f"**Proxy:** `{profile.http_proxy or profile.https_proxy}`")
+                    if profile.http_proxy_alt or profile.https_proxy_alt:
+                        st.markdown(f"**Alt Proxy:** `{profile.http_proxy_alt or profile.https_proxy_alt}`")
                 with col2:
                     st.markdown("**Nodes:**")
                     for node in profile.nodes:
@@ -1085,6 +1170,26 @@ def _show_profile_summary(profile: ClusterProfile):
     cols[2].metric("Runtime", f"CRI-O {profile.crio_version}")
     cols[3].metric("CNI", "Flannel")
     cols[4].metric("Nodes", f"{len(profile.get_control_plane_nodes())} CP + {len(profile.get_worker_nodes())} W")
+
+    with st.expander("Storage & Proxy Details", expanded=False):
+        scol1, scol2, scol3 = st.columns(3)
+        with scol1:
+            st.markdown(f"**CRI-O Root:** `{profile.crio_root}`")
+            st.markdown(f"**CRI-O RunRoot:** `{profile.crio_runroot}`")
+        with scol2:
+            st.markdown(f"**Kubelet Dir:** `{profile.kubelet_root}`")
+            st.markdown(f"**Log Root:** `{profile.log_root}`")
+        with scol3:
+            if profile.http_proxy or profile.https_proxy:
+                st.markdown(f"**HTTP Proxy:** `{profile.http_proxy or 'N/A'}`")
+                st.markdown(f"**HTTPS Proxy:** `{profile.https_proxy or 'N/A'}`")
+                if profile.no_proxy:
+                    st.markdown(f"**No Proxy:** `{profile.no_proxy}`")
+            if profile.http_proxy_alt or profile.https_proxy_alt:
+                st.markdown(f"**Alt HTTP Proxy:** `{profile.http_proxy_alt or 'N/A'}`")
+                st.markdown(f"**Alt HTTPS Proxy:** `{profile.https_proxy_alt or 'N/A'}`")
+            if not (profile.http_proxy or profile.https_proxy or profile.http_proxy_alt or profile.https_proxy_alt):
+                st.markdown("**Proxy:** Not configured")
 
 
 # ── Main Router ───────────────────────────────────────────────────────────

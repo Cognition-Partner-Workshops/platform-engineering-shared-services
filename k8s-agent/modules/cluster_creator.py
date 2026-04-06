@@ -101,16 +101,76 @@ def test_ssh_connectivity(node: dict) -> SSHResult:
     )
 
 
+def _proxy_env_block(profile: ClusterProfile) -> str:
+    """Generate shell export lines for proxy environment variables."""
+    lines = []
+    proxy = profile.http_proxy or profile.http_proxy_alt
+    proxys = profile.https_proxy or profile.https_proxy_alt
+    if proxy:
+        lines.append(f'export http_proxy="{proxy}"')
+        lines.append(f'export HTTP_PROXY="{proxy}"')
+    if proxys:
+        lines.append(f'export https_proxy="{proxys}"')
+        lines.append(f'export HTTPS_PROXY="{proxys}"')
+    if profile.no_proxy:
+        lines.append(f'export no_proxy="{profile.no_proxy}"')
+        lines.append(f'export NO_PROXY="{profile.no_proxy}"')
+    return "\n".join(lines)
+
+
 def generate_common_setup_script(profile: ClusterProfile) -> str:
     """Generate the common setup script that runs on ALL nodes (control-plane + workers)."""
+    proxy_block = _proxy_env_block(profile)
+    proxy_section = ""
+    if proxy_block:
+        proxy_section = f"""
+# ── 0. Proxy configuration ───────────────────────────────────────────────
+echo ">> Configuring proxy settings..."
+{proxy_block}
+
+# Persist proxy in /etc/environment for all users
+cat >> /etc/environment <<PROXYEOF
+{proxy_block}
+PROXYEOF
+"""
+
+    crio_storage_section = ""
+    if profile.crio_root != "/var/lib/containers/storage":
+        crio_storage_section = f"""
+# ── Custom CRI-O storage paths ───────────────────────────────────────────
+echo ">> Configuring CRI-O custom storage root: {profile.crio_root}"
+mkdir -p "{profile.crio_root}"
+mkdir -p "{profile.crio_runroot}"
+"""
+
+    kubelet_section = ""
+    if profile.kubelet_root != "/var/lib/kubelet":
+        kubelet_section = f"""
+# ── Custom kubelet data directory ────────────────────────────────────────
+echo ">> Configuring kubelet data directory: {profile.kubelet_root}"
+mkdir -p "{profile.kubelet_root}"
+"""
+
+    log_section = ""
+    if profile.log_root != "/var/log":
+        log_section = f"""
+# ── Custom log directory ─────────────────────────────────────────────────
+echo ">> Configuring custom log root: {profile.log_root}"
+mkdir -p "{profile.log_root}/pods"
+mkdir -p "{profile.log_root}/containers"
+"""
+
     return f"""#!/bin/bash
 set -euo pipefail
 
 echo "=== K8s Node Common Setup ==="
 echo "Kubernetes Version: {profile.kubernetes_version}"
 echo "CRI-O Version: {profile.crio_version}"
+echo "CRI-O Storage Root: {profile.crio_root}"
+echo "Kubelet Data Dir: {profile.kubelet_root}"
+echo "Log Root: {profile.log_root}"
 echo "Timestamp: $(date -u)"
-
+{proxy_section}{crio_storage_section}{kubelet_section}{log_section}
 # ── 1. System prerequisites ──────────────────────────────────────────────
 echo ">> Disabling swap..."
 swapoff -a
@@ -182,8 +242,19 @@ REPO
 fi
 
 systemctl daemon-reload
+
+# ── Configure CRI-O storage paths ────────────────────────────────────────
+echo ">> Configuring CRI-O storage to {profile.crio_root}..."
+mkdir -p /etc/crio/crio.conf.d
+cat > /etc/crio/crio.conf.d/01-storage.conf <<CRIOCONF
+[crio]
+  root = "{profile.crio_root}"
+  runroot = "{profile.crio_runroot}"
+  log_dir = "{profile.log_root}/crio/pods"
+CRIOCONF
+
 systemctl enable --now crio
-echo ">> CRI-O installed and running."
+echo ">> CRI-O installed and configured (storage: {profile.crio_root})."
 
 # ── 3. Install kubeadm, kubelet, kubectl ──────────────────────────────────
 echo ">> Installing Kubernetes {profile.kubernetes_version} components..."
@@ -223,12 +294,31 @@ def generate_control_plane_init_script(profile: ClusterProfile) -> str:
     cp_nodes = profile.get_control_plane_nodes()
     cp_ip = cp_nodes[0]["ip_address"] if cp_nodes else "CONTROL_PLANE_IP"
 
+    # Build proxy environment block for the control-plane
+    proxy_block = _proxy_env_block(profile)
+    proxy_section = ""
+    if proxy_block:
+        proxy_section = f"""
+# ── Proxy configuration (master node) ───────────────────────────────────
+echo ">> Setting proxy environment for kubeadm..."
+{proxy_block}
+"""
+
+    # Audit log path respects custom log_root
+    audit_log_dir = f"{profile.log_root}/kubernetes"
+
+    # Extra kubelet args for custom root dir
+    kubelet_extra = '    container-runtime-endpoint: "unix:///var/run/crio/crio.sock"'
+    if profile.kubelet_root != "/var/lib/kubelet":
+        kubelet_extra += f'\n    root-dir: "{profile.kubelet_root}"'
+
     return f"""#!/bin/bash
 set -euo pipefail
 
 echo "=== Initializing Kubernetes Control Plane ==="
-
+{proxy_section}
 # ── kubeadm init ──────────────────────────────────────────────────────────
+mkdir -p "{audit_log_dir}"
 cat > /tmp/kubeadm-config.yaml <<EOF
 apiVersion: kubeadm.k8s.io/v1beta3
 kind: InitConfiguration
@@ -238,7 +328,7 @@ localAPIEndpoint:
 nodeRegistration:
   criSocket: "unix:///var/run/crio/crio.sock"
   kubeletExtraArgs:
-    container-runtime-endpoint: "unix:///var/run/crio/crio.sock"
+{kubelet_extra}
 ---
 apiVersion: kubeadm.k8s.io/v1beta3
 kind: ClusterConfiguration
@@ -252,14 +342,14 @@ apiServer:
   extraArgs:
     authorization-mode: "Node,RBAC"
     enable-admission-plugins: "NodeRestriction,PodSecurity"
-    audit-log-path: "/var/log/kubernetes/audit.log"
+    audit-log-path: "{audit_log_dir}/audit.log"
     audit-log-maxage: "30"
     audit-log-maxbackup: "10"
     audit-log-maxsize: "100"
   extraVolumes:
   - name: audit-log
-    hostPath: "/var/log/kubernetes"
-    mountPath: "/var/log/kubernetes"
+    hostPath: "{audit_log_dir}"
+    mountPath: "{audit_log_dir}"
     pathType: DirectoryOrCreate
 controllerManager:
   extraArgs:
@@ -530,6 +620,13 @@ def get_llm_cluster_advice(profile: ClusterProfile, context: str = "") -> str:
 - Pod CIDR: {profile.pod_cidr}
 - Service CIDR: {profile.service_cidr}
 - Pod Security Standard: {profile.pod_security_standard}
+- CRI-O Storage Root: {profile.crio_root}
+- Kubelet Data Dir: {profile.kubelet_root}
+- Log Root: {profile.log_root}
+- HTTP Proxy: {profile.http_proxy or 'none'}
+- HTTPS Proxy: {profile.https_proxy or 'none'}
+- Alternate HTTP Proxy: {profile.http_proxy_alt or 'none'}
+- Alternate HTTPS Proxy: {profile.https_proxy_alt or 'none'}
 
 Nodes:
 {nodes_str}

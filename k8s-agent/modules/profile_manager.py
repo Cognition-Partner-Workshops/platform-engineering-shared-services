@@ -40,6 +40,17 @@ class ClusterProfile:
     kubeconfig_path: str = ""
     monitoring_enabled: bool = False
     pod_security_standard: str = "restricted"  # privileged, baseline, restricted
+    # CRI-O storage paths (override defaults in /var/lib)
+    crio_root: str = "/var/lib/containers/storage"  # container storage root
+    crio_runroot: str = "/run/containers/storage"  # runtime root
+    kubelet_root: str = "/var/lib/kubelet"  # kubelet data dir
+    log_root: str = "/var/log"  # base log directory
+    # Proxy settings for master node
+    http_proxy: str = ""
+    https_proxy: str = ""
+    no_proxy: str = ""
+    http_proxy_alt: str = ""  # alternate proxy
+    https_proxy_alt: str = ""  # alternate proxy
 
     def get_control_plane_nodes(self) -> list[dict]:
         return [n for n in self.nodes if n.get("role") == "control-plane"]
