@@ -55,13 +55,37 @@ _HELM_SEARCH_PATHS = [
 
 
 def _find_binary(name: str, search_paths: list[str]) -> str:
-    """Find a binary by name, checking PATH first then common locations."""
+    """Find a binary by name, checking PATH first then common locations.
+
+    Strategy:
+      1. ``shutil.which`` — honours $PATH as seen by the Python process.
+      2. Probe well-known install directories with ``os.path.isfile``.
+         (Skip the ``os.access`` X_OK check because some SELinux / mount
+         configurations report False even though the file *is* executable.)
+      3. Last resort: ask the OS via ``/usr/bin/which`` in a subprocess,
+         which may see a different PATH than the Python process (e.g. when
+         Streamlit is started through systemd or a virtualenv wrapper).
+    """
+    # 1. shutil.which
     found = shutil.which(name)
     if found:
         return found
+    # 2. well-known paths — only check existence (skip os.access)
     for path in search_paths:
-        if os.path.isfile(path) and os.access(path, os.X_OK):
+        if os.path.isfile(path):
             return path
+    # 3. subprocess fallback — works when shell PATH differs from Python PATH
+    for which_cmd in ("which", "/usr/bin/which", "/bin/which"):
+        try:
+            proc = subprocess.run(
+                f"{which_cmd} {name}",
+                shell=True, capture_output=True, text=True, timeout=5,
+            )
+            result = proc.stdout.strip()
+            if proc.returncode == 0 and result and os.path.isfile(result):
+                return result
+        except Exception:
+            continue
     return ""
 
 
