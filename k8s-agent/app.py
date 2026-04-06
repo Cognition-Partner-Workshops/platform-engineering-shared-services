@@ -13,7 +13,6 @@ from streamlit_option_menu import option_menu
 import config
 from modules.profile_manager import (
     ClusterProfile,
-    NodeInfo,
     save_profile,
     load_profile,
     list_profiles,
