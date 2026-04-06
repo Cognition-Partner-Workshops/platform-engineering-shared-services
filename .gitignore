@@ -22,3 +22,4 @@ charts/*/charts/
 *.pem
 *.key
 kubeconfig*
+k8s-agent/__pycache__/
