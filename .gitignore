@@ -23,3 +23,5 @@ charts/*/charts/
 *.key
 kubeconfig*
 k8s-agent/__pycache__/
+k8s-agent/data/profiles/*.json
+k8s-agent/modules/__pycache__/
