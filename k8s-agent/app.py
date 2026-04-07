@@ -22,6 +22,7 @@ from modules.profile_manager import (
 )
 from modules.cluster_creator import (
     test_ssh_connectivity,
+    run_ssh_command,
     generate_common_setup_script,
     generate_control_plane_init_script,
     generate_worker_join_script,
@@ -1622,10 +1623,11 @@ def page_resource_viewer():
     if profile.cluster_source == "imported" and profile.kubeconfig_content:
         _rv_namespaces = fetch_namespaces(profile.kubeconfig_content)
 
-    tab_resources, tab_scaling, tab_shell, tab_node_health, tab_rbac, tab_helm, tab_events = st.tabs([
+    tab_resources, tab_scaling, tab_shell, tab_crictl, tab_node_health, tab_rbac, tab_helm, tab_events = st.tabs([
         "Cluster Resources",
         "Scaling",
         "Pod Shell",
+        "Node Containers",
         "Node Health",
         "RBAC Viewer",
         "Helm Releases",
@@ -2032,6 +2034,120 @@ def page_resource_viewer():
                         st.code(result.stderr, language="text")
         elif not sh_load:
             st.info("Click **Load Pods** to see running pods in the selected namespace.")
+
+    # ── Node Containers (crictl) ────────────────────────────────────────
+    with tab_crictl:
+        st.markdown("### Node Containers (crictl)")
+        st.markdown("View containers running on each node using `crictl ps -a`.")
+
+        if profile.cluster_source == "imported":
+            # Imported clusters — no SSH, but we can still get node list and show
+            # container info via kubectl debug or just list pods per node
+            st.info(
+                "**crictl** requires SSH access to each node and is available for "
+                "provisioned clusters. For imported clusters, container-level "
+                "information is shown via kubectl below."
+            )
+            if st.button("Show containers per node (kubectl)", type="primary", key="crictl_kubectl"):
+                with st.spinner("Fetching node list..."):
+                    node_result = run_kubectl(
+                        profile,
+                        "get nodes -o jsonpath='{range .items[*]}{.metadata.name}{\"\\n\"}{end}'",
+                        timeout=15,
+                    )
+                if node_result.success and node_result.stdout.strip():
+                    node_names = [n.strip() for n in node_result.stdout.strip().split("\n") if n.strip()]
+                    for node_name in node_names:
+                        with st.expander(f"Node: **{node_name}**", expanded=True):
+                            with st.spinner(f"Fetching containers on {node_name}..."):
+                                pod_result = run_kubectl(
+                                    profile,
+                                    f"get pods -A --field-selector spec.nodeName={node_name} "
+                                    "-o custom-columns="
+                                    "'NAMESPACE:.metadata.namespace,"
+                                    "POD:.metadata.name,"
+                                    "CONTAINERS:.spec.containers[*].name,"
+                                    "STATUS:.status.phase,"
+                                    "RESTARTS:.status.containerStatuses[0].restartCount,"
+                                    "NODE:.spec.nodeName'",
+                                    timeout=15,
+                                )
+                                if pod_result.success:
+                                    st.code(pod_result.stdout or "(no pods on this node)", language="text")
+                                else:
+                                    st.error(f"Failed to get pods on {node_name}")
+                                    st.code(pod_result.stderr, language="text")
+                else:
+                    st.error("Failed to list nodes")
+                    if node_result.stderr:
+                        st.code(node_result.stderr, language="text")
+        else:
+            # Provisioned clusters — SSH into each node and run crictl
+            all_nodes = profile.nodes
+            if not all_nodes:
+                st.warning("No nodes defined in this profile.")
+            else:
+                crictl_cmd = st.text_input(
+                    "CRI command",
+                    value="crictl ps -a",
+                    key="crictl_cmd",
+                    help="Command to run on each node (e.g. crictl ps -a, crictl images, crictl stats)",
+                )
+
+                crictl_presets = st.columns(5)
+                with crictl_presets[0]:
+                    if st.button("crictl ps -a", key="cp_ps"):
+                        crictl_cmd = "crictl ps -a"
+                with crictl_presets[1]:
+                    if st.button("crictl images", key="cp_img"):
+                        crictl_cmd = "crictl images"
+                with crictl_presets[2]:
+                    if st.button("crictl stats", key="cp_stats"):
+                        crictl_cmd = "crictl stats"
+                with crictl_presets[3]:
+                    if st.button("crictl pods", key="cp_pods"):
+                        crictl_cmd = "crictl pods"
+                with crictl_presets[4]:
+                    if st.button("crictl info", key="cp_info"):
+                        crictl_cmd = "crictl info"
+
+                # Node selection
+                node_labels = [
+                    f"{n.get('hostname', n.get('ip_address', '?'))} ({n.get('ip_address', '?')}) [{n.get('role', '?')}]"
+                    for n in all_nodes
+                ]
+                cr_select_all = st.checkbox("Run on all nodes", value=True, key="cr_all")
+
+                if not cr_select_all:
+                    selected_nodes_idx = st.multiselect(
+                        "Select nodes",
+                        options=list(range(len(all_nodes))),
+                        format_func=lambda i: node_labels[i],
+                        default=list(range(len(all_nodes))),
+                        key="cr_nodes",
+                    )
+                    selected_nodes = [all_nodes[i] for i in selected_nodes_idx]
+                else:
+                    selected_nodes = all_nodes
+
+                if st.button("Run on selected nodes", type="primary", key="crictl_run"):
+                    for node in selected_nodes:
+                        node_label = f"{node.get('hostname', node.get('ip_address', '?'))} ({node.get('ip_address', '')})"
+                        with st.expander(f"Node: **{node_label}** [{node.get('role', '')}]", expanded=True):
+                            with st.spinner(f"Running `{crictl_cmd}` on {node_label}..."):
+                                result = run_ssh_command(
+                                    ip_address=node["ip_address"],
+                                    command=crictl_cmd,
+                                    ssh_user=node.get("ssh_user", "root"),
+                                    ssh_port=node.get("ssh_port", 22),
+                                    ssh_key_path=node.get("ssh_key_path", "~/.ssh/id_rsa"),
+                                    timeout=30,
+                                )
+                                if result.success:
+                                    st.code(result.stdout or "(no output)", language="text")
+                                else:
+                                    st.error(f"Command failed on {node_label}")
+                                    st.code(result.stderr, language="text")
 
     # ── Node Health ──────────────────────────────────────────────────────
     with tab_node_health:
