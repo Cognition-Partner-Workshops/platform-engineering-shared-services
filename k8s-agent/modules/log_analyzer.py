@@ -319,22 +319,49 @@ def correlate_errors(
 
     all_errors.sort(key=lambda e: e.get("timestamp", ""))
 
+    def _parse_ts(ts_str: str):
+        """Try to parse a timestamp string into a datetime object."""
+        from datetime import datetime
+        for fmt in (
+            "%Y-%m-%dT%H:%M:%S",
+            "%Y-%m-%dT%H:%M:%S.%f",
+            "%Y-%m-%dT%H:%M:%SZ",
+            "%Y-%m-%dT%H:%M:%S.%fZ",
+            "%b %d %H:%M:%S",
+            "%Y-%m-%d %H:%M:%S",
+            "%Y-%m-%d %H:%M:%S.%f",
+        ):
+            try:
+                return datetime.strptime(ts_str.strip(), fmt)
+            except (ValueError, AttributeError):
+                continue
+        return None
+
     correlated = []
     window_seconds = 30
-    used = set()
+    used: set[int] = set()
 
     for i, err in enumerate(all_errors):
         if i in used:
             continue
         group = [err]
         used.add(i)
+        err_ts = _parse_ts(err.get("timestamp", ""))
 
         for j in range(i + 1, len(all_errors)):
             if j in used:
                 continue
-            if all_errors[j].get("source") != err.get("source"):
-                group.append(all_errors[j])
-                used.add(j)
+            other = all_errors[j]
+            if other.get("source") == err.get("source"):
+                continue
+            # If both timestamps are parseable, enforce the time window
+            other_ts = _parse_ts(other.get("timestamp", ""))
+            if err_ts and other_ts:
+                diff = abs((other_ts - err_ts).total_seconds())
+                if diff > window_seconds:
+                    continue
+            group.append(other)
+            used.add(j)
 
         if len(group) > 1:
             correlated.append({
