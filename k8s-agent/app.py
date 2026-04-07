@@ -209,6 +209,7 @@ def render_sidebar():
         # ── Navigation ──
         st.markdown("### Navigation")
         nav_options = [
+            "Multi-Cluster Dashboard",
             "Profile Manager",
             "Cluster Creation",
             "Resource Viewer",
@@ -216,6 +217,8 @@ def render_sidebar():
             "Monitoring Setup",
             "Log Analysis",
             "Upgrade Planner",
+            "Certificate Manager",
+            "Cost Optimizer",
             "AI Assistant",
         ]
         selected_page = st.radio(
@@ -1816,7 +1819,9 @@ def page_resource_viewer():
     if profile.cluster_source == "imported" and profile.kubeconfig_content:
         _rv_namespaces = fetch_namespaces(profile.kubeconfig_content)
 
-    tab_resources, tab_scaling, tab_shell, tab_res_limits, tab_crictl, tab_node_health, tab_rbac, tab_helm, tab_events = st.tabs([
+    (tab_resources, tab_scaling, tab_shell, tab_res_limits, tab_crictl,
+     tab_node_health, tab_rbac, tab_helm, tab_events,
+     tab_restart_tracker, tab_netpol, tab_pvc) = st.tabs([
         "Cluster Resources",
         "Scaling",
         "Pod Shell",
@@ -1826,6 +1831,9 @@ def page_resource_viewer():
         "RBAC Viewer",
         "Helm Releases",
         "Events Timeline",
+        "Pod Restart Tracker",
+        "Network Policies",
+        "PVC / Storage",
     ])
 
     # ── Cluster Resources ────────────────────────────────────────────────
@@ -2960,6 +2968,429 @@ def page_resource_viewer():
                 else:
                     st.code(result.stderr, language="text")
 
+    # ── Pod Restart Tracker ───────────────────────────────────────────────
+    with tab_restart_tracker:
+        st.markdown("### Pod Restart Tracker")
+        st.markdown("Identify pods with frequent restarts, OOMKilled containers, and CrashLoopBackOff issues.")
+
+        rcol1, rcol2 = st.columns([2, 1])
+        with rcol1:
+            if _rv_namespaces:
+                restart_ns = st.selectbox("Namespace", ["All Namespaces"] + _rv_namespaces, key="restart_ns")
+            else:
+                restart_ns = st.text_input("Namespace (blank = all)", value="", key="restart_ns_text")
+                if not restart_ns:
+                    restart_ns = "All Namespaces"
+        with rcol2:
+            min_restarts = st.number_input("Min restarts to show", min_value=0, value=1, key="min_restarts")
+
+        if st.button("Load Pod Restarts", type="primary", key="load_restarts"):
+            ns_flag = "-A" if restart_ns == "All Namespaces" else f"-n {restart_ns}"
+            cmd = f"get pods {ns_flag} -o json"
+            with st.spinner("Fetching pod data..."):
+                result = run_kubectl(profile, cmd, timeout=30)
+            if result.success and result.stdout.strip():
+                try:
+                    import pandas as pd
+                    pods_json = json.loads(result.stdout)
+                    restart_data = []
+                    for pod in pods_json.get("items", []):
+                        pod_name = pod.get("metadata", {}).get("name", "?")
+                        pod_ns = pod.get("metadata", {}).get("namespace", "?")
+                        for cs in pod.get("status", {}).get("containerStatuses", []):
+                            restarts = cs.get("restartCount", 0)
+                            if restarts < min_restarts:
+                                continue
+                            container_name = cs.get("name", "?")
+                            ready = cs.get("ready", False)
+                            # Detect OOMKilled
+                            last_state = cs.get("lastState", {})
+                            terminated = last_state.get("terminated", {})
+                            reason = terminated.get("reason", "")
+                            exit_code = terminated.get("exitCode", "")
+                            # Current state
+                            state = cs.get("state", {})
+                            if "running" in state:
+                                current_state = "Running"
+                            elif "waiting" in state:
+                                current_state = state["waiting"].get("reason", "Waiting")
+                            elif "terminated" in state:
+                                current_state = state["terminated"].get("reason", "Terminated")
+                            else:
+                                current_state = "Unknown"
+                            restart_data.append({
+                                "Namespace": pod_ns,
+                                "Pod": pod_name,
+                                "Container": container_name,
+                                "Restarts": restarts,
+                                "Ready": ready,
+                                "State": current_state,
+                                "Last Termination": reason or "N/A",
+                                "Exit Code": str(exit_code) if exit_code != "" else "N/A",
+                            })
+                    if restart_data:
+                        df = pd.DataFrame(restart_data).sort_values("Restarts", ascending=False)
+                        # Summary metrics
+                        total_restarts = df["Restarts"].sum()
+                        oom_count = len(df[df["Last Termination"] == "OOMKilled"])
+                        crash_count = len(df[df["State"] == "CrashLoopBackOff"])
+                        mcol1, mcol2, mcol3, mcol4 = st.columns(4)
+                        mcol1.metric("Containers with Restarts", len(df))
+                        mcol2.metric("Total Restarts", int(total_restarts))
+                        mcol3.metric("OOMKilled", oom_count)
+                        mcol4.metric("CrashLoopBackOff", crash_count)
+                        st.dataframe(df, use_container_width=True, hide_index=True)
+                        # Highlight problematic pods
+                        if oom_count > 0:
+                            st.warning(
+                                f"{oom_count} container(s) were terminated due to **OOMKilled** — "
+                                "consider increasing memory limits for those workloads."
+                            )
+                        if crash_count > 0:
+                            st.error(
+                                f"{crash_count} container(s) are in **CrashLoopBackOff** — "
+                                "check logs with `kubectl logs <pod> -c <container> --previous`."
+                            )
+                    else:
+                        st.success(f"No containers found with {min_restarts}+ restarts. Cluster looks healthy!")
+                except (json.JSONDecodeError, KeyError) as e:
+                    st.error(f"Failed to parse pod data: {e}")
+                    st.code(result.stdout[:2000], language="text")
+            elif result.success:
+                st.info("No pods found.")
+            else:
+                st.error("Failed to fetch pods")
+                st.code(result.stderr, language="text")
+
+    # ── Network Policy Visualizer ─────────────────────────────────────────
+    with tab_netpol:
+        st.markdown("### Network Policy Visualizer")
+        st.markdown("View and analyze NetworkPolicies to understand pod-to-pod communication rules.")
+
+        npcol1, npcol2 = st.columns([2, 1])
+        with npcol1:
+            if _rv_namespaces:
+                np_ns = st.selectbox("Namespace", ["All Namespaces"] + _rv_namespaces, key="netpol_ns")
+            else:
+                np_ns = st.text_input("Namespace (blank = all)", value="", key="netpol_ns_text")
+                if not np_ns:
+                    np_ns = "All Namespaces"
+
+        if st.button("Load Network Policies", type="primary", key="load_netpol"):
+            ns_flag = "-A" if np_ns == "All Namespaces" else f"-n {np_ns}"
+            cmd = f"get networkpolicies {ns_flag} -o json"
+            with st.spinner("Fetching network policies..."):
+                result = run_kubectl(profile, cmd, timeout=15)
+            if result.success and result.stdout.strip():
+                try:
+                    import pandas as pd
+                    np_json = json.loads(result.stdout)
+                    policies = np_json.get("items", [])
+                    if not policies:
+                        st.info("No NetworkPolicies found. All pod-to-pod traffic is allowed by default.")
+                    else:
+                        st.markdown(f"**Found {len(policies)} NetworkPolicies**")
+
+                        policy_summary = []
+                        for pol in policies:
+                            meta = pol.get("metadata", {})
+                            spec = pol.get("spec", {})
+                            pol_name = meta.get("name", "?")
+                            pol_ns = meta.get("namespace", "?")
+                            # Pod selector
+                            pod_sel = spec.get("podSelector", {})
+                            match_labels = pod_sel.get("matchLabels", {})
+                            selector_str = ", ".join(f"{k}={v}" for k, v in match_labels.items()) if match_labels else "(all pods)"
+                            # Policy types
+                            policy_types = spec.get("policyTypes", [])
+                            # Ingress rules count
+                            ingress_rules = spec.get("ingress", [])
+                            egress_rules = spec.get("egress", [])
+
+                            policy_summary.append({
+                                "Namespace": pol_ns,
+                                "Policy": pol_name,
+                                "Pod Selector": selector_str,
+                                "Types": ", ".join(policy_types) if policy_types else "N/A",
+                                "Ingress Rules": len(ingress_rules),
+                                "Egress Rules": len(egress_rules),
+                            })
+
+                        st.dataframe(pd.DataFrame(policy_summary), use_container_width=True, hide_index=True)
+
+                        # Detailed view per policy
+                        for pol in policies:
+                            meta = pol.get("metadata", {})
+                            spec = pol.get("spec", {})
+                            pol_name = meta.get("name", "?")
+                            pol_ns = meta.get("namespace", "?")
+                            with st.expander(f"{pol_ns}/{pol_name}", expanded=False):
+                                # Pod selector
+                                pod_sel = spec.get("podSelector", {})
+                                match_labels = pod_sel.get("matchLabels", {})
+                                if match_labels:
+                                    st.markdown("**Applies to pods matching:** " + ", ".join(f"`{k}={v}`" for k, v in match_labels.items()))
+                                else:
+                                    st.markdown("**Applies to:** All pods in namespace")
+
+                                # Ingress
+                                ingress_rules = spec.get("ingress", [])
+                                if ingress_rules:
+                                    st.markdown("**Ingress Rules:**")
+                                    for i, rule in enumerate(ingress_rules):
+                                        sources = []
+                                        for fr in rule.get("from", []):
+                                            if "podSelector" in fr:
+                                                labels = fr["podSelector"].get("matchLabels", {})
+                                                sources.append("Pods: " + (", ".join(f"{k}={v}" for k, v in labels.items()) if labels else "all"))
+                                            if "namespaceSelector" in fr:
+                                                labels = fr["namespaceSelector"].get("matchLabels", {})
+                                                sources.append("Namespaces: " + (", ".join(f"{k}={v}" for k, v in labels.items()) if labels else "all"))
+                                            if "ipBlock" in fr:
+                                                sources.append(f"CIDR: {fr['ipBlock'].get('cidr', '?')}")
+                                        ports = []
+                                        for p in rule.get("ports", []):
+                                            ports.append(f"{p.get('protocol', 'TCP')}/{p.get('port', '*')}")
+                                        src_str = ", ".join(sources) if sources else "any"
+                                        port_str = ", ".join(ports) if ports else "all ports"
+                                        st.markdown(f"  - Rule {i+1}: Allow from **{src_str}** on **{port_str}**")
+                                elif "Ingress" in spec.get("policyTypes", []):
+                                    st.warning("Ingress type declared but no rules — all ingress traffic is **denied**.")
+
+                                # Egress
+                                egress_rules = spec.get("egress", [])
+                                if egress_rules:
+                                    st.markdown("**Egress Rules:**")
+                                    for i, rule in enumerate(egress_rules):
+                                        destinations = []
+                                        for to in rule.get("to", []):
+                                            if "podSelector" in to:
+                                                labels = to["podSelector"].get("matchLabels", {})
+                                                destinations.append("Pods: " + (", ".join(f"{k}={v}" for k, v in labels.items()) if labels else "all"))
+                                            if "namespaceSelector" in to:
+                                                labels = to["namespaceSelector"].get("matchLabels", {})
+                                                destinations.append("Namespaces: " + (", ".join(f"{k}={v}" for k, v in labels.items()) if labels else "all"))
+                                            if "ipBlock" in to:
+                                                destinations.append(f"CIDR: {to['ipBlock'].get('cidr', '?')}")
+                                        ports = []
+                                        for p in rule.get("ports", []):
+                                            ports.append(f"{p.get('protocol', 'TCP')}/{p.get('port', '*')}")
+                                        dest_str = ", ".join(destinations) if destinations else "any"
+                                        port_str = ", ".join(ports) if ports else "all ports"
+                                        st.markdown(f"  - Rule {i+1}: Allow to **{dest_str}** on **{port_str}**")
+                                elif "Egress" in spec.get("policyTypes", []):
+                                    st.warning("Egress type declared but no rules — all egress traffic is **denied**.")
+
+                                st.markdown("---")
+                                st.markdown("**Raw YAML:**")
+                                import yaml
+                                st.code(yaml.dump(pol, default_flow_style=False), language="yaml")
+
+                        # Coverage check
+                        st.markdown("---")
+                        st.markdown("#### Coverage Analysis")
+                        if st.button("Check Unprotected Pods", key="netpol_coverage"):
+                            # Get all pods and check which are selected by a policy
+                            pod_ns_flag = f"-n {np_ns}" if np_ns != "All Namespaces" else "-A"
+                            pod_cmd = f"get pods {pod_ns_flag} -o json"
+                            with st.spinner("Analyzing coverage..."):
+                                pod_result = run_kubectl(profile, pod_cmd, timeout=15)
+                            if pod_result.success and pod_result.stdout.strip():
+                                try:
+                                    all_pods = json.loads(pod_result.stdout).get("items", [])
+                                    protected_pods = set()
+                                    for pol in policies:
+                                        pol_ns_name = pol.get("metadata", {}).get("namespace", "")
+                                        pod_sel = pol.get("spec", {}).get("podSelector", {})
+                                        match_labels = pod_sel.get("matchLabels", {})
+                                        for p in all_pods:
+                                            p_ns = p.get("metadata", {}).get("namespace", "")
+                                            p_name = p.get("metadata", {}).get("name", "")
+                                            p_labels = p.get("metadata", {}).get("labels", {})
+                                            if p_ns != pol_ns_name:
+                                                continue
+                                            if not match_labels or all(p_labels.get(k) == v for k, v in match_labels.items()):
+                                                protected_pods.add(f"{p_ns}/{p_name}")
+                                    unprotected = []
+                                    for p in all_pods:
+                                        p_ns = p.get("metadata", {}).get("namespace", "")
+                                        p_name = p.get("metadata", {}).get("name", "")
+                                        if f"{p_ns}/{p_name}" not in protected_pods:
+                                            unprotected.append({"Namespace": p_ns, "Pod": p_name})
+                                    if unprotected:
+                                        st.warning(f"{len(unprotected)} pod(s) are **not covered** by any NetworkPolicy (all traffic allowed):")
+                                        st.dataframe(pd.DataFrame(unprotected), use_container_width=True, hide_index=True)
+                                    else:
+                                        st.success("All pods are covered by at least one NetworkPolicy.")
+                                except (json.JSONDecodeError, KeyError):
+                                    st.error("Failed to parse pod data for coverage analysis.")
+
+                except (json.JSONDecodeError, KeyError) as e:
+                    st.error(f"Failed to parse network policy data: {e}")
+            elif result.success:
+                st.info("No NetworkPolicies found. All pod-to-pod traffic is allowed by default.")
+            else:
+                st.error("Failed to fetch network policies")
+                st.code(result.stderr, language="text")
+
+    # ── PVC / Storage Dashboard ───────────────────────────────────────────
+    with tab_pvc:
+        st.markdown("### PVC / Storage Dashboard")
+        st.markdown("View PersistentVolumeClaims, PersistentVolumes, and StorageClasses.")
+
+        pvc_sub = st.radio(
+            "View",
+            ["PVCs", "PersistentVolumes", "StorageClasses"],
+            horizontal=True,
+            key="pvc_view",
+        )
+
+        if pvc_sub == "PVCs":
+            pcol1, pcol2 = st.columns([2, 1])
+            with pcol1:
+                if _rv_namespaces:
+                    pvc_ns = st.selectbox("Namespace", ["All Namespaces"] + _rv_namespaces, key="pvc_ns")
+                else:
+                    pvc_ns = st.text_input("Namespace (blank = all)", value="", key="pvc_ns_text")
+                    if not pvc_ns:
+                        pvc_ns = "All Namespaces"
+
+            if st.button("Load PVCs", type="primary", key="load_pvcs"):
+                ns_flag = "-A" if pvc_ns == "All Namespaces" else f"-n {pvc_ns}"
+                cmd = f"get pvc {ns_flag} -o json"
+                with st.spinner("Fetching PVCs..."):
+                    result = run_kubectl(profile, cmd, timeout=15)
+                if result.success and result.stdout.strip():
+                    try:
+                        import pandas as pd
+                        pvc_json = json.loads(result.stdout)
+                        pvcs = pvc_json.get("items", [])
+                        if not pvcs:
+                            st.info("No PVCs found.")
+                        else:
+                            pvc_data = []
+                            for pvc in pvcs:
+                                meta = pvc.get("metadata", {})
+                                spec = pvc.get("spec", {})
+                                status = pvc.get("status", {})
+                                capacity = status.get("capacity", {}).get("storage", "N/A")
+                                requested = spec.get("resources", {}).get("requests", {}).get("storage", "N/A")
+                                pvc_data.append({
+                                    "Namespace": meta.get("namespace", "?"),
+                                    "Name": meta.get("name", "?"),
+                                    "Status": status.get("phase", "?"),
+                                    "Volume": spec.get("volumeName", "N/A"),
+                                    "Capacity": capacity,
+                                    "Requested": requested,
+                                    "Access Modes": ", ".join(spec.get("accessModes", [])),
+                                    "Storage Class": spec.get("storageClassName", "N/A"),
+                                })
+                            df = pd.DataFrame(pvc_data)
+                            # Summary
+                            bound = len(df[df["Status"] == "Bound"])
+                            pending = len(df[df["Status"] == "Pending"])
+                            lost = len(df[df["Status"] == "Lost"])
+                            scol1, scol2, scol3, scol4 = st.columns(4)
+                            scol1.metric("Total PVCs", len(df))
+                            scol2.metric("Bound", bound)
+                            scol3.metric("Pending", pending)
+                            scol4.metric("Lost", lost)
+                            if pending > 0:
+                                st.warning(f"{pending} PVC(s) are **Pending** — check StorageClass availability and provisioner status.")
+                            if lost > 0:
+                                st.error(f"{lost} PVC(s) are **Lost** — the bound PV has been deleted. Data may be lost.")
+                            st.dataframe(df, use_container_width=True, hide_index=True)
+                    except (json.JSONDecodeError, KeyError) as e:
+                        st.error(f"Failed to parse PVC data: {e}")
+                elif result.success:
+                    st.info("No PVCs found.")
+                else:
+                    st.error("Failed to fetch PVCs")
+                    st.code(result.stderr, language="text")
+
+        elif pvc_sub == "PersistentVolumes":
+            if st.button("Load PVs", type="primary", key="load_pvs"):
+                cmd = "get pv -o json"
+                with st.spinner("Fetching PersistentVolumes..."):
+                    result = run_kubectl(profile, cmd, timeout=15)
+                if result.success and result.stdout.strip():
+                    try:
+                        import pandas as pd
+                        pv_json = json.loads(result.stdout)
+                        pvs = pv_json.get("items", [])
+                        if not pvs:
+                            st.info("No PersistentVolumes found.")
+                        else:
+                            pv_data = []
+                            for pv in pvs:
+                                meta = pv.get("metadata", {})
+                                spec = pv.get("spec", {})
+                                status = pv.get("status", {})
+                                claim_ref = spec.get("claimRef", {})
+                                claim = f"{claim_ref.get('namespace', '')}/{claim_ref.get('name', '')}" if claim_ref else "Unbound"
+                                pv_data.append({
+                                    "Name": meta.get("name", "?"),
+                                    "Capacity": spec.get("capacity", {}).get("storage", "N/A"),
+                                    "Access Modes": ", ".join(spec.get("accessModes", [])),
+                                    "Reclaim Policy": spec.get("persistentVolumeReclaimPolicy", "N/A"),
+                                    "Status": status.get("phase", "?"),
+                                    "Claim": claim,
+                                    "Storage Class": spec.get("storageClassName", "N/A"),
+                                    "Volume Mode": spec.get("volumeMode", "N/A"),
+                                })
+                            df = pd.DataFrame(pv_data)
+                            avail = len(df[df["Status"] == "Available"])
+                            bound = len(df[df["Status"] == "Bound"])
+                            released = len(df[df["Status"] == "Released"])
+                            scol1, scol2, scol3, scol4 = st.columns(4)
+                            scol1.metric("Total PVs", len(df))
+                            scol2.metric("Bound", bound)
+                            scol3.metric("Available", avail)
+                            scol4.metric("Released", released)
+                            st.dataframe(df, use_container_width=True, hide_index=True)
+                    except (json.JSONDecodeError, KeyError) as e:
+                        st.error(f"Failed to parse PV data: {e}")
+                elif result.success:
+                    st.info("No PersistentVolumes found.")
+                else:
+                    st.error("Failed to fetch PVs")
+                    st.code(result.stderr, language="text")
+
+        elif pvc_sub == "StorageClasses":
+            if st.button("Load Storage Classes", type="primary", key="load_sc"):
+                cmd = "get storageclasses -o json"
+                with st.spinner("Fetching StorageClasses..."):
+                    result = run_kubectl(profile, cmd, timeout=15)
+                if result.success and result.stdout.strip():
+                    try:
+                        import pandas as pd
+                        sc_json = json.loads(result.stdout)
+                        scs = sc_json.get("items", [])
+                        if not scs:
+                            st.info("No StorageClasses found.")
+                        else:
+                            sc_data = []
+                            for sc in scs:
+                                meta = sc.get("metadata", {})
+                                annotations = meta.get("annotations", {})
+                                is_default = annotations.get("storageclass.kubernetes.io/is-default-class", "false") == "true"
+                                sc_data.append({
+                                    "Name": meta.get("name", "?"),
+                                    "Provisioner": sc.get("provisioner", "N/A"),
+                                    "Reclaim Policy": sc.get("reclaimPolicy", "N/A"),
+                                    "Volume Binding": sc.get("volumeBindingMode", "N/A"),
+                                    "Allow Expansion": sc.get("allowVolumeExpansion", False),
+                                    "Default": is_default,
+                                })
+                            st.dataframe(pd.DataFrame(sc_data), use_container_width=True, hide_index=True)
+                    except (json.JSONDecodeError, KeyError) as e:
+                        st.error(f"Failed to parse StorageClass data: {e}")
+                elif result.success:
+                    st.info("No StorageClasses found.")
+                else:
+                    st.error("Failed to fetch StorageClasses")
+                    st.code(result.stderr, language="text")
+
 
 # ══════════════════════════════════════════════════════════════════════════
 #  PAGE: Upgrade Planner
@@ -3302,6 +3733,650 @@ def page_ai_assistant():
         st.session_state.chat_history.append({"role": "assistant", "content": full_response})
 
 
+# ══════════════════════════════════════════════════════════════════════════
+#  PAGE: Multi-Cluster Dashboard
+# ══════════════════════════════════════════════════════════════════════════
+
+def page_multi_cluster_dashboard():
+    st.markdown("## Multi-Cluster Dashboard")
+    st.markdown("Overview of all registered cluster profiles at a glance.")
+
+    profiles = list_profiles()
+    if not profiles:
+        st.info("No cluster profiles yet. Create one in the **Profile Manager** or import a cluster via kubeconfig.")
+        return
+
+    # Summary metrics
+    total = len(profiles)
+    imported = sum(1 for p in profiles if p.cluster_source == "imported")
+    provisioned = total - imported
+    active_count = sum(1 for p in profiles if p.status == "active")
+    draft_count = sum(1 for p in profiles if p.status == "draft")
+    error_count = sum(1 for p in profiles if p.status == "error")
+
+    mcol1, mcol2, mcol3, mcol4, mcol5 = st.columns(5)
+    mcol1.metric("Total Clusters", total)
+    mcol2.metric("Provisioned", provisioned)
+    mcol3.metric("Imported", imported)
+    mcol4.metric("Active", active_count)
+    mcol5.metric("Errors", error_count)
+
+    st.markdown("---")
+
+    # Cluster cards
+    for profile in profiles:
+        status_icon = {"active": "🟢", "error": "🔴", "draft": "⚪", "provisioning": "🟡"}.get(profile.status, "⚪")
+        source_label = "Imported" if profile.cluster_source == "imported" else "Provisioned"
+
+        with st.expander(
+            f"{status_icon} **{profile.name}** — {source_label} | {profile.status.upper()}",
+            expanded=(profile.status == "error"),
+        ):
+            col1, col2, col3 = st.columns(3)
+            with col1:
+                st.markdown(f"**K8s Version:** {profile.kubernetes_version}")
+                st.markdown(f"**Source:** {source_label}")
+                st.markdown(f"**Status:** {profile.status.upper()}")
+            with col2:
+                if profile.cluster_source == "imported":
+                    st.markdown(f"**Kubeconfig:** {'Loaded' if profile.kubeconfig_content else 'Not loaded'}")
+                else:
+                    cp = len(profile.get_control_plane_nodes())
+                    wk = len(profile.get_worker_nodes())
+                    st.markdown(f"**Nodes:** {cp} control-plane + {wk} worker")
+                    st.markdown(f"**CRI-O:** {profile.crio_version}")
+                    st.markdown(f"**CNI:** Flannel")
+            with col3:
+                if profile.description:
+                    st.markdown(f"**Description:** {profile.description}")
+
+            # Live cluster health check for imported clusters
+            if profile.cluster_source == "imported" and profile.kubeconfig_content:
+                if st.button(f"Check Health", key=f"health_{profile.name}"):
+                    with st.spinner("Checking cluster health..."):
+                        node_result = run_kubectl(profile, "get nodes --no-headers", timeout=10)
+                        if node_result.success and node_result.stdout.strip():
+                            lines = [l for l in node_result.stdout.strip().split("\n") if l.strip()]
+                            total_nodes = len(lines)
+                            ready_nodes = sum(1 for l in lines if "Ready" in l.split()[1] if len(l.split()) > 1)
+                            not_ready = total_nodes - ready_nodes
+                            hcol1, hcol2, hcol3 = st.columns(3)
+                            hcol1.metric("Nodes", total_nodes)
+                            hcol2.metric("Ready", ready_nodes)
+                            hcol3.metric("Not Ready", not_ready)
+                            if not_ready > 0:
+                                st.warning(f"{not_ready} node(s) are not Ready.")
+                            else:
+                                st.success("All nodes are Ready.")
+                            # Pod summary
+                            pod_result = run_kubectl(profile, "get pods -A --no-headers", timeout=15)
+                            if pod_result.success and pod_result.stdout.strip():
+                                pod_lines = [l for l in pod_result.stdout.strip().split("\n") if l.strip()]
+                                total_pods = len(pod_lines)
+                                running_pods = sum(1 for l in pod_lines if "Running" in l)
+                                failed_pods = sum(1 for l in pod_lines if any(s in l for s in ["Error", "CrashLoopBackOff", "ImagePullBackOff"]))
+                                pcol1, pcol2, pcol3 = st.columns(3)
+                                pcol1.metric("Total Pods", total_pods)
+                                pcol2.metric("Running", running_pods)
+                                pcol3.metric("Failed/Error", failed_pods)
+                        elif node_result.success:
+                            st.info("Connected but no nodes found.")
+                        else:
+                            st.error(f"Could not connect: {node_result.stderr or 'kubectl failed'}")
+
+            # Quick actions
+            if profile.cluster_source == "imported" and profile.kubeconfig_content:
+                qcol1, qcol2, qcol3 = st.columns(3)
+                with qcol1:
+                    if st.button("View Nodes", key=f"qnodes_{profile.name}"):
+                        result = run_kubectl(profile, "get nodes -o wide", timeout=10)
+                        if result.success:
+                            st.code(result.stdout or "(no output)", language="text")
+                        else:
+                            st.error(result.stderr or "Failed")
+                with qcol2:
+                    if st.button("View Namespaces", key=f"qns_{profile.name}"):
+                        result = run_kubectl(profile, "get namespaces", timeout=10)
+                        if result.success:
+                            st.code(result.stdout or "(no output)", language="text")
+                        else:
+                            st.error(result.stderr or "Failed")
+                with qcol3:
+                    if st.button("Warning Events", key=f"qevents_{profile.name}"):
+                        result = run_kubectl(
+                            profile,
+                            "get events -A --field-selector type=Warning --sort-by=.lastTimestamp",
+                            timeout=15,
+                        )
+                        if result.success:
+                            st.code(result.stdout or "(no warning events)", language="text")
+                        else:
+                            st.error(result.stderr or "Failed")
+
+
+# ══════════════════════════════════════════════════════════════════════════
+#  PAGE: Certificate Manager
+# ══════════════════════════════════════════════════════════════════════════
+
+def page_certificate_manager():
+    st.markdown("## Certificate Manager")
+    st.markdown("View cluster certificate expiration dates, TLS secrets, and plan renewals.")
+
+    profile = _get_active_profile()
+    if not profile:
+        return
+
+    _show_profile_summary(profile)
+
+    tab_certs, tab_tls, tab_renew = st.tabs([
+        "Cluster Certificates",
+        "TLS Secrets",
+        "Renewal Guide",
+    ])
+
+    # ── Cluster Certificates (kubeadm) ────────────────────────────────────
+    with tab_certs:
+        st.markdown("### Cluster Certificates (kubeadm)")
+
+        if profile.cluster_source == "imported":
+            st.info(
+                "Certificate inspection via `kubeadm certs check-expiration` requires SSH access "
+                "to control-plane nodes. For imported clusters, use the **TLS Secrets** tab to view "
+                "TLS certificates stored in the cluster."
+            )
+            # Still try to get API server cert info
+            if st.button("Check API Server Certificate", key="api_cert_check"):
+                with st.spinner("Checking API server certificate..."):
+                    cmd = (
+                        "get --raw /healthz -v=6 2>&1 || true"
+                    )
+                    result = run_kubectl(profile, "version --short", timeout=10)
+                    if result.success:
+                        st.success("API server is reachable and serving valid TLS.")
+                        st.code(result.stdout, language="text")
+                    else:
+                        if "certificate" in (result.stderr or "").lower():
+                            st.error("Certificate issue detected:")
+                            st.code(result.stderr, language="text")
+                        else:
+                            st.warning(f"Could not check: {result.stderr}")
+        else:
+            cp_nodes = profile.get_control_plane_nodes()
+            if not cp_nodes:
+                st.warning("No control-plane nodes defined.")
+            else:
+                st.markdown(
+                    "Runs `kubeadm certs check-expiration` on control-plane nodes via SSH "
+                    "to show certificate validity and expiration dates."
+                )
+                if st.button("Check Certificate Expiration", type="primary", key="check_certs"):
+                    for node in cp_nodes:
+                        node_label = f"{node.get('hostname', node.get('ip_address', '?'))} ({node.get('ip_address', '')})"
+                        with st.expander(f"Node: {node_label}", expanded=True):
+                            with st.spinner(f"Checking certificates on {node_label}..."):
+                                result = run_ssh_command(
+                                    ip_address=node["ip_address"],
+                                    command="sudo kubeadm certs check-expiration 2>/dev/null || echo 'kubeadm certs command not available'",
+                                    ssh_user=node.get("ssh_user", "root"),
+                                    ssh_port=node.get("ssh_port", 22),
+                                    ssh_key_path=node.get("ssh_key_path", "~/.ssh/id_rsa"),
+                                    timeout=30,
+                                )
+                                if result.success and result.stdout.strip():
+                                    st.code(result.stdout, language="text")
+                                    # Parse for expiring soon
+                                    if "RESIDUAL TIME" in result.stdout:
+                                        for line in result.stdout.split("\n"):
+                                            if any(warn in line.lower() for warn in ["invalid", "expired"]):
+                                                st.error(f"Certificate issue: {line.strip()}")
+                                else:
+                                    st.error(f"Failed: {result.stderr or 'No output'}")
+
+    # ── TLS Secrets ───────────────────────────────────────────────────────
+    with tab_tls:
+        st.markdown("### TLS Secrets")
+        st.markdown("View Kubernetes TLS secrets and their certificate details.")
+
+        if st.button("Load TLS Secrets", type="primary", key="load_tls"):
+            cmd = "get secrets -A -o json"
+            with st.spinner("Fetching secrets..."):
+                result = run_kubectl(profile, cmd, timeout=20)
+            if result.success and result.stdout.strip():
+                try:
+                    import pandas as pd
+                    secrets_json = json.loads(result.stdout)
+                    tls_secrets = []
+                    for secret in secrets_json.get("items", []):
+                        if secret.get("type") == "kubernetes.io/tls":
+                            meta = secret.get("metadata", {})
+                            annotations = meta.get("annotations", {})
+                            tls_secrets.append({
+                                "Namespace": meta.get("namespace", "?"),
+                                "Name": meta.get("name", "?"),
+                                "Type": "kubernetes.io/tls",
+                                "Created": meta.get("creationTimestamp", "N/A"),
+                                "Issuer": annotations.get("cert-manager.io/issuer-name", annotations.get("cert-manager.io/cluster-issuer", "N/A")),
+                                "Has cert": "tls.crt" in secret.get("data", {}),
+                                "Has key": "tls.key" in secret.get("data", {}),
+                            })
+                    if tls_secrets:
+                        st.markdown(f"**Found {len(tls_secrets)} TLS secret(s)**")
+                        st.dataframe(pd.DataFrame(tls_secrets), use_container_width=True, hide_index=True)
+                    else:
+                        st.info("No TLS secrets found in the cluster.")
+                except (json.JSONDecodeError, KeyError) as e:
+                    st.error(f"Failed to parse secrets: {e}")
+            elif result.success:
+                st.info("No secrets found.")
+            else:
+                st.error("Failed to fetch secrets")
+                st.code(result.stderr, language="text")
+
+        # cert-manager status
+        st.markdown("---")
+        st.markdown("#### cert-manager Status")
+        if st.button("Check cert-manager", key="check_certmanager"):
+            with st.spinner("Checking cert-manager..."):
+                result = run_kubectl(profile, "get pods -n cert-manager --no-headers", timeout=10)
+                if result.success and result.stdout.strip():
+                    st.success("cert-manager is installed:")
+                    st.code(result.stdout, language="text")
+                    # Check certificates
+                    cert_result = run_kubectl(profile, "get certificates -A --no-headers", timeout=10)
+                    if cert_result.success and cert_result.stdout.strip():
+                        st.markdown("**Managed Certificates:**")
+                        st.code(cert_result.stdout, language="text")
+                elif result.success:
+                    st.info("cert-manager namespace exists but no pods found.")
+                else:
+                    st.info("cert-manager does not appear to be installed.")
+
+    # ── Renewal Guide ─────────────────────────────────────────────────────
+    with tab_renew:
+        st.markdown("### Certificate Renewal Guide")
+
+        st.markdown("""
+#### Automatic Renewal (kubeadm)
+
+kubeadm automatically renews certificates during `kubeadm upgrade`. For manual renewal:
+
+```bash
+# Renew all certificates
+sudo kubeadm certs renew all
+
+# Renew specific certificate
+sudo kubeadm certs renew apiserver
+sudo kubeadm certs renew apiserver-kubelet-client
+sudo kubeadm certs renew front-proxy-client
+sudo kubeadm certs renew etcd-server
+sudo kubeadm certs renew etcd-peer
+sudo kubeadm certs renew etcd-healthcheck-client
+
+# After renewal, restart control plane components
+sudo systemctl restart kubelet
+```
+
+#### Certificate Authority (CA) Rotation
+
+CA rotation is more complex and requires:
+1. Generate new CA certificate and key
+2. Distribute to all nodes
+3. Re-sign all component certificates
+4. Rolling restart of all components
+
+#### cert-manager Renewal
+
+If using cert-manager, certificates are automatically renewed before expiration.
+Check cert-manager logs for renewal status:
+
+```bash
+kubectl logs -n cert-manager deploy/cert-manager -f
+```
+
+#### Best Practices
+- Monitor certificate expiration dates regularly
+- Set up alerts for certificates expiring within 30 days
+- Keep kubeadm version aligned with cluster version for smooth renewals
+- Back up `/etc/kubernetes/pki/` before any certificate operations
+- Test renewal in a staging environment first
+        """)
+
+
+# ══════════════════════════════════════════════════════════════════════════
+#  PAGE: Cost Optimizer
+# ══════════════════════════════════════════════════════════════════════════
+
+def page_cost_optimizer():
+    st.markdown("## Cost Estimator / Resource Optimizer")
+    st.markdown("Analyze resource usage vs requests/limits and identify optimization opportunities.")
+
+    profile = _get_active_profile()
+    if not profile:
+        return
+
+    _show_profile_summary(profile)
+
+    tab_usage, tab_right_size, tab_idle = st.tabs([
+        "Resource Usage",
+        "Right-Sizing",
+        "Idle Resources",
+    ])
+
+    # ── Resource Usage ────────────────────────────────────────────────────
+    with tab_usage:
+        st.markdown("### Actual Resource Usage vs Requests")
+        st.markdown("Compare real CPU/memory usage (from metrics-server) against configured requests and limits.")
+
+        usage_sub = st.radio("View", ["Node Usage", "Pod Usage"], horizontal=True, key="usage_view")
+
+        if usage_sub == "Node Usage":
+            if st.button("Load Node Usage", type="primary", key="load_node_usage"):
+                with st.spinner("Fetching node metrics..."):
+                    result = run_kubectl(profile, "top nodes --no-headers", timeout=15)
+                if result.success and result.stdout.strip():
+                    import pandas as pd
+                    lines = [l for l in result.stdout.strip().split("\n") if l.strip()]
+                    node_usage = []
+                    for line in lines:
+                        parts = line.split()
+                        if len(parts) >= 5:
+                            node_usage.append({
+                                "Node": parts[0],
+                                "CPU (cores)": parts[1],
+                                "CPU %": parts[2],
+                                "Memory": parts[3],
+                                "Memory %": parts[4],
+                            })
+                    if node_usage:
+                        st.dataframe(pd.DataFrame(node_usage), use_container_width=True, hide_index=True)
+                        # Chart
+                        try:
+                            import plotly.graph_objects as go
+                            fig = go.Figure()
+                            names = [n["Node"] for n in node_usage]
+                            cpu_pcts = [int(n["CPU %"].replace("%", "")) for n in node_usage]
+                            mem_pcts = [int(n["Memory %"].replace("%", "")) for n in node_usage]
+                            fig.add_trace(go.Bar(name="CPU %", x=names, y=cpu_pcts, marker_color="#326CE5"))
+                            fig.add_trace(go.Bar(name="Memory %", x=names, y=mem_pcts, marker_color="#764ba2"))
+                            fig.update_layout(
+                                title="Node Resource Utilization",
+                                yaxis_title="Utilization %",
+                                barmode="group",
+                                height=400,
+                            )
+                            fig.add_hline(y=80, line_dash="dash", line_color="red", annotation_text="80% threshold")
+                            st.plotly_chart(fig, use_container_width=True)
+                        except ImportError:
+                            pass
+                    else:
+                        st.code(result.stdout, language="text")
+                elif result.success:
+                    st.info("No node metrics available. Is metrics-server installed?")
+                else:
+                    st.error("Failed to fetch node metrics. Ensure metrics-server is installed.")
+                    st.code(result.stderr, language="text")
+                    st.info("Install metrics-server via **Monitoring Setup** > **Metrics Components**.")
+
+        elif usage_sub == "Pod Usage":
+            pcol1, pcol2 = st.columns([2, 1])
+            with pcol1:
+                _co_namespaces: list[str] = []
+                if profile.cluster_source == "imported" and profile.kubeconfig_content:
+                    _co_namespaces = fetch_namespaces(profile.kubeconfig_content)
+                if _co_namespaces:
+                    pod_usage_ns = st.selectbox("Namespace", ["All Namespaces"] + _co_namespaces, key="pod_usage_ns")
+                else:
+                    pod_usage_ns = st.text_input("Namespace (blank = all)", value="", key="pod_usage_ns_text")
+                    if not pod_usage_ns:
+                        pod_usage_ns = "All Namespaces"
+
+            if st.button("Load Pod Usage", type="primary", key="load_pod_usage"):
+                ns_flag = "-A" if pod_usage_ns == "All Namespaces" else f"-n {pod_usage_ns}"
+                with st.spinner("Fetching pod metrics..."):
+                    result = run_kubectl(profile, f"top pods {ns_flag} --no-headers", timeout=20)
+                if result.success and result.stdout.strip():
+                    import pandas as pd
+                    lines = [l for l in result.stdout.strip().split("\n") if l.strip()]
+                    pod_usage = []
+                    for line in lines:
+                        parts = line.split()
+                        if pod_usage_ns == "All Namespaces" and len(parts) >= 4:
+                            pod_usage.append({
+                                "Namespace": parts[0],
+                                "Pod": parts[1],
+                                "CPU": parts[2],
+                                "Memory": parts[3],
+                            })
+                        elif len(parts) >= 3:
+                            pod_usage.append({
+                                "Pod": parts[0],
+                                "CPU": parts[1],
+                                "Memory": parts[2],
+                            })
+                    if pod_usage:
+                        df = pd.DataFrame(pod_usage)
+                        st.dataframe(df, use_container_width=True, hide_index=True)
+                        st.markdown(f"**Total pods:** {len(df)}")
+                elif result.success:
+                    st.info("No pod metrics available.")
+                else:
+                    st.error("Failed to fetch pod metrics.")
+                    st.code(result.stderr, language="text")
+
+    # ── Right-Sizing ──────────────────────────────────────────────────────
+    with tab_right_size:
+        st.markdown("### Right-Sizing Recommendations")
+        st.markdown(
+            "Compare actual pod usage against configured requests/limits to find "
+            "over-provisioned or under-provisioned workloads."
+        )
+
+        rs_col1, rs_col2 = st.columns([2, 1])
+        with rs_col1:
+            _rs_namespaces: list[str] = []
+            if profile.cluster_source == "imported" and profile.kubeconfig_content:
+                _rs_namespaces = fetch_namespaces(profile.kubeconfig_content)
+            if _rs_namespaces:
+                rs_ns = st.selectbox("Namespace", _rs_namespaces, key="rs_ns")
+            else:
+                rs_ns = st.text_input("Namespace", value="default", key="rs_ns_text")
+
+        if st.button("Analyze Right-Sizing", type="primary", key="analyze_rs"):
+            if not rs_ns:
+                st.warning("Please specify a namespace.")
+            else:
+                with st.spinner("Fetching usage and resource specs..."):
+                    # Get actual usage
+                    usage_result = run_kubectl(
+                        profile,
+                        f"top pods -n {rs_ns} --no-headers --containers",
+                        timeout=20,
+                    )
+                    # Get resource specs
+                    spec_result = run_kubectl(
+                        profile,
+                        f"get pods -n {rs_ns} -o json",
+                        timeout=20,
+                    )
+
+                if usage_result.success and spec_result.success:
+                    try:
+                        import pandas as pd
+                        # Parse usage: POD CONTAINER CPU MEM
+                        usage_map = {}
+                        for line in (usage_result.stdout or "").strip().split("\n"):
+                            parts = line.split()
+                            if len(parts) >= 4:
+                                key = f"{parts[0]}/{parts[1]}"
+                                usage_map[key] = {"cpu_usage": parts[2], "mem_usage": parts[3]}
+
+                        # Parse specs
+                        pods_json = json.loads(spec_result.stdout)
+                        rows = []
+                        for pod in pods_json.get("items", []):
+                            pod_name = pod.get("metadata", {}).get("name", "?")
+                            for container in pod.get("spec", {}).get("containers", []):
+                                c_name = container.get("name", "?")
+                                res = container.get("resources", {})
+                                req_cpu = res.get("requests", {}).get("cpu", "none")
+                                req_mem = res.get("requests", {}).get("memory", "none")
+                                lim_cpu = res.get("limits", {}).get("cpu", "none")
+                                lim_mem = res.get("limits", {}).get("memory", "none")
+                                key = f"{pod_name}/{c_name}"
+                                usage = usage_map.get(key, {})
+                                rows.append({
+                                    "Pod": pod_name,
+                                    "Container": c_name,
+                                    "CPU Usage": usage.get("cpu_usage", "N/A"),
+                                    "CPU Request": req_cpu,
+                                    "CPU Limit": lim_cpu,
+                                    "Mem Usage": usage.get("mem_usage", "N/A"),
+                                    "Mem Request": req_mem,
+                                    "Mem Limit": lim_mem,
+                                })
+                        if rows:
+                            df = pd.DataFrame(rows)
+                            st.dataframe(df, use_container_width=True, hide_index=True)
+
+                            # Recommendations
+                            no_req_cpu = sum(1 for r in rows if r["CPU Request"] == "none")
+                            no_req_mem = sum(1 for r in rows if r["Mem Request"] == "none")
+                            no_lim_cpu = sum(1 for r in rows if r["CPU Limit"] == "none")
+                            no_lim_mem = sum(1 for r in rows if r["Mem Limit"] == "none")
+
+                            st.markdown("---")
+                            st.markdown("#### Recommendations")
+                            if no_req_cpu > 0:
+                                st.warning(f"{no_req_cpu} container(s) have **no CPU request** — scheduler cannot make optimal placement decisions.")
+                            if no_req_mem > 0:
+                                st.warning(f"{no_req_mem} container(s) have **no memory request** — pods may be evicted under pressure.")
+                            if no_lim_cpu > 0:
+                                st.info(f"{no_lim_cpu} container(s) have **no CPU limit** — they can consume all available CPU on the node.")
+                            if no_lim_mem > 0:
+                                st.warning(f"{no_lim_mem} container(s) have **no memory limit** — they may be OOMKilled or cause node instability.")
+                            if no_req_cpu == 0 and no_req_mem == 0 and no_lim_cpu == 0 and no_lim_mem == 0:
+                                st.success("All containers have CPU and memory requests and limits set.")
+                        else:
+                            st.info("No containers found in this namespace.")
+                    except (json.JSONDecodeError, KeyError) as e:
+                        st.error(f"Failed to parse data: {e}")
+                else:
+                    if not usage_result.success:
+                        st.error("Failed to fetch pod usage metrics. Is metrics-server installed?")
+                        st.code(usage_result.stderr, language="text")
+                    if not spec_result.success:
+                        st.error("Failed to fetch pod specs.")
+                        st.code(spec_result.stderr, language="text")
+
+    # ── Idle Resources ────────────────────────────────────────────────────
+    with tab_idle:
+        st.markdown("### Idle / Unused Resources")
+        st.markdown("Find resources that may be wasting cluster capacity.")
+
+        idle_checks = st.multiselect(
+            "Check for",
+            [
+                "Completed/Failed Jobs",
+                "Deployments scaled to 0",
+                "Orphaned ConfigMaps",
+                "Unbound PVCs",
+                "Empty Namespaces",
+            ],
+            default=["Completed/Failed Jobs", "Deployments scaled to 0", "Unbound PVCs"],
+            key="idle_checks",
+        )
+
+        if st.button("Scan for Idle Resources", type="primary", key="scan_idle"):
+            findings = []
+
+            if "Completed/Failed Jobs" in idle_checks:
+                with st.spinner("Checking completed/failed jobs..."):
+                    result = run_kubectl(profile, "get jobs -A -o json", timeout=15)
+                if result.success and result.stdout.strip():
+                    try:
+                        jobs = json.loads(result.stdout).get("items", [])
+                        old_jobs = []
+                        for job in jobs:
+                            status = job.get("status", {})
+                            conditions = status.get("conditions", [])
+                            for cond in conditions:
+                                if cond.get("type") in ("Complete", "Failed") and cond.get("status") == "True":
+                                    meta = job.get("metadata", {})
+                                    old_jobs.append(f"  - {meta.get('namespace', '?')}/{meta.get('name', '?')} ({cond['type']})")
+                        if old_jobs:
+                            findings.append(("warning", f"**{len(old_jobs)} completed/failed job(s)** can be cleaned up:\n" + "\n".join(old_jobs[:20])))
+                        else:
+                            findings.append(("success", "No completed/failed jobs found."))
+                    except (json.JSONDecodeError, KeyError):
+                        findings.append(("error", "Failed to parse jobs data."))
+
+            if "Deployments scaled to 0" in idle_checks:
+                with st.spinner("Checking zero-replica deployments..."):
+                    result = run_kubectl(profile, "get deployments -A -o json", timeout=15)
+                if result.success and result.stdout.strip():
+                    try:
+                        deploys = json.loads(result.stdout).get("items", [])
+                        zero_deploys = []
+                        for dep in deploys:
+                            replicas = dep.get("spec", {}).get("replicas", 1)
+                            if replicas == 0:
+                                meta = dep.get("metadata", {})
+                                zero_deploys.append(f"  - {meta.get('namespace', '?')}/{meta.get('name', '?')}")
+                        if zero_deploys:
+                            findings.append(("warning", f"**{len(zero_deploys)} deployment(s) scaled to 0 replicas:**\n" + "\n".join(zero_deploys[:20])))
+                        else:
+                            findings.append(("success", "No zero-replica deployments found."))
+                    except (json.JSONDecodeError, KeyError):
+                        findings.append(("error", "Failed to parse deployment data."))
+
+            if "Unbound PVCs" in idle_checks:
+                with st.spinner("Checking unbound PVCs..."):
+                    result = run_kubectl(profile, "get pvc -A --no-headers", timeout=15)
+                if result.success and result.stdout.strip():
+                    lines = [l for l in result.stdout.strip().split("\n") if l.strip()]
+                    pending_pvcs = [l for l in lines if "Pending" in l]
+                    if pending_pvcs:
+                        findings.append(("warning", f"**{len(pending_pvcs)} PVC(s) in Pending state** (not bound to a PV):\n```\n" + "\n".join(pending_pvcs[:10]) + "\n```"))
+                    else:
+                        findings.append(("success", "All PVCs are bound."))
+                elif result.success:
+                    findings.append(("info", "No PVCs found."))
+
+            if "Empty Namespaces" in idle_checks:
+                with st.spinner("Checking empty namespaces..."):
+                    ns_result = run_kubectl(profile, "get namespaces --no-headers", timeout=10)
+                if ns_result.success and ns_result.stdout.strip():
+                    ns_lines = [l.split()[0] for l in ns_result.stdout.strip().split("\n") if l.strip()]
+                    system_ns = {"kube-system", "kube-public", "kube-node-lease", "default"}
+                    empty_ns = []
+                    for ns in ns_lines:
+                        if ns in system_ns:
+                            continue
+                        pod_r = run_kubectl(profile, f"get pods -n {ns} --no-headers", timeout=10)
+                        if pod_r.success and not pod_r.stdout.strip():
+                            empty_ns.append(ns)
+                    if empty_ns:
+                        findings.append(("info", f"**{len(empty_ns)} namespace(s) with no pods:**\n  - " + "\n  - ".join(empty_ns[:15])))
+                    else:
+                        findings.append(("success", "No empty non-system namespaces found."))
+
+            if "Orphaned ConfigMaps" in idle_checks:
+                findings.append(("info", "Orphaned ConfigMap detection requires cross-referencing all pod specs — use the **Resource Viewer** to manually inspect ConfigMaps per namespace."))
+
+            # Display findings
+            st.markdown("---")
+            st.markdown("#### Findings")
+            for level, msg in findings:
+                if level == "warning":
+                    st.warning(msg)
+                elif level == "error":
+                    st.error(msg)
+                elif level == "success":
+                    st.success(msg)
+                else:
+                    st.info(msg)
+
+
 # ── Helper functions ──────────────────────────────────────────────────────
 
 def _get_active_profile() -> ClusterProfile | None:
@@ -3422,7 +4497,9 @@ def _show_profile_summary(profile: ClusterProfile):
 def main():
     page = render_sidebar()
 
-    if page == "Profile Manager":
+    if page == "Multi-Cluster Dashboard":
+        page_multi_cluster_dashboard()
+    elif page == "Profile Manager":
         page_profile_manager()
     elif page == "Cluster Creation":
         page_cluster_creation()
@@ -3436,6 +4513,10 @@ def main():
         page_log_analysis()
     elif page == "Upgrade Planner":
         page_upgrade_planner()
+    elif page == "Certificate Manager":
+        page_certificate_manager()
+    elif page == "Cost Optimizer":
+        page_cost_optimizer()
     elif page == "AI Assistant":
         page_ai_assistant()
 
