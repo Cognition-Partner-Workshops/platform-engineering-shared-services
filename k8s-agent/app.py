@@ -619,40 +619,71 @@ def page_cluster_creation():
         st.markdown("### SSH Connectivity Test")
         st.markdown("Test SSH access to all nodes before provisioning.")
 
-        if st.button("Test All Nodes", type="primary"):
-            for node in profile.nodes:
-                with st.status(f"Testing {node.get('hostname', node['ip_address'])}...", expanded=True):
-                    result = test_ssh_connectivity(node)
-                    if result.success:
-                        st.success(f"Connected to {node['ip_address']}")
-                        st.code(result.stdout, language="text")
-                    else:
-                        st.error(f"Failed to connect to {node['ip_address']}")
-                        st.code(result.stderr, language="text")
+        if profile.cluster_source == "imported":
+            st.info(
+                "SSH connectivity tests are not applicable for imported clusters. "
+                "Imported clusters connect via kubeconfig — no SSH access is needed. "
+                "Use the **Cluster Debugger** or **Resource Viewer** to verify connectivity."
+            )
+        elif not profile.nodes:
+            st.warning("No nodes defined in this profile. Add nodes in the Profile Manager first.")
+        else:
+            if st.button("Test All Nodes", type="primary"):
+                all_ok = True
+                for node in profile.nodes:
+                    with st.status(f"Testing {node.get('hostname', node['ip_address'])}...", expanded=True):
+                        result = test_ssh_connectivity(node)
+                        if result.success:
+                            st.success(f"Connected to {node['ip_address']}")
+                            st.code(result.stdout, language="text")
+                        else:
+                            all_ok = False
+                            st.error(f"Failed to connect to {node['ip_address']}")
+                            st.code(result.stderr, language="text")
+                if all_ok:
+                    st.success("All nodes are reachable via SSH. You can proceed to provisioning.")
+                else:
+                    st.error("Some nodes failed SSH connectivity. Fix the issues above before provisioning.")
 
     # ── Provision ─────────────────────────────────────────────────────────
     with tab_provision:
         st.markdown("### Automated Cluster Provisioning")
-        st.warning(
-            "This will SSH into each node and execute every provisioning step "
-            "automatically. Ensure all nodes are accessible and you have root/sudo access."
-        )
+
+        if profile.cluster_source == "imported":
+            st.info(
+                "Provisioning is not available for imported clusters. "
+                "This cluster was imported via kubeconfig and is managed externally. "
+                "Use the **Resource Viewer**, **Cluster Debugger**, or **Monitoring Setup** "
+                "pages to work with your cluster."
+            )
+        elif not profile.nodes:
+            st.warning("No nodes defined in this profile. Add nodes in the Profile Manager first.")
+        else:
+            st.warning(
+                "This will SSH into each node and execute every provisioning step "
+                "automatically. Ensure all nodes are accessible and you have root/sudo access."
+            )
 
         cp_nodes = profile.get_control_plane_nodes()
         worker_nodes = profile.get_worker_nodes()
 
-        st.markdown(f"**Control Plane:** {len(cp_nodes)} node(s) | **Workers:** {len(worker_nodes)} node(s)")
+        if profile.cluster_source != "imported" and profile.nodes:
+            st.markdown(f"**Control Plane:** {len(cp_nodes)} node(s) | **Workers:** {len(worker_nodes)} node(s)")
 
-        col1, col2, col3 = st.columns(3)
-        with col1:
-            step1 = st.checkbox("Step 1: Common Setup (all nodes)", value=True)
-        with col2:
-            step2 = st.checkbox("Step 2: Init Control Plane", value=True)
-        with col3:
-            step3 = st.checkbox("Step 3: Join Workers", value=True)
-        step4 = st.checkbox("Step 4: Apply Best Practices", value=True)
+            col1, col2, col3 = st.columns(3)
+            with col1:
+                step1 = st.checkbox("Step 1: Common Setup (all nodes)", value=True)
+            with col2:
+                step2 = st.checkbox("Step 2: Init Control Plane", value=True)
+            with col3:
+                step3 = st.checkbox("Step 3: Join Workers", value=True)
+            step4 = st.checkbox("Step 4: Apply Best Practices", value=True)
+        else:
+            step1 = step2 = step3 = step4 = False
 
-        if st.button("Start Provisioning", type="primary", use_container_width=True):
+        if profile.cluster_source == "imported" or not profile.nodes:
+            pass  # messages shown above
+        elif st.button("Start Provisioning", type="primary", use_container_width=True):
             update_profile_status(profile.name, "provisioning")
             overall_success = True
 
@@ -2355,9 +2386,15 @@ def page_resource_viewer():
             # Imported clusters — no SSH, but we can still get node list and show
             # container info via kubectl debug or just list pods per node
             st.info(
-                "**crictl** requires SSH access to each node and is available for "
-                "provisioned clusters. For imported clusters, container-level "
-                "information is shown via kubectl below."
+                "**crictl** requires SSH access to each node and is only available for "
+                "provisioned clusters. For imported clusters, pod and container "
+                "information per node is shown via `kubectl` below."
+            )
+            st.markdown(
+                "This view uses `kubectl get pods --field-selector spec.nodeName=<node>` "
+                "to list pods/containers on each node. For full container-level details "
+                "(container IDs, image digests, runtime state), SSH into the node and run "
+                "`sudo crictl ps -a` directly."
             )
             if st.button("Show containers per node (kubectl)", type="primary", key="crictl_kubectl"):
                 with st.spinner("Fetching node list..."):
@@ -2398,6 +2435,16 @@ def page_resource_viewer():
             if not all_nodes:
                 st.warning("No nodes defined in this profile.")
             else:
+                st.markdown(
+                    "> **Note:** `crictl` typically requires **root/sudo** access. "
+                    "If your SSH user is not root, the command will be prefixed with `sudo`."
+                )
+                use_sudo = st.checkbox(
+                    "Run with sudo (required if SSH user is not root)",
+                    value=True,
+                    key="crictl_sudo",
+                    help="Prefix the command with 'sudo' for non-root SSH users.",
+                )
                 crictl_cmd = st.text_input(
                     "CRI command",
                     value="crictl ps -a",
@@ -2442,23 +2489,35 @@ def page_resource_viewer():
                     selected_nodes = all_nodes
 
                 if st.button("Run on selected nodes", type="primary", key="crictl_run"):
-                    for node in selected_nodes:
-                        node_label = f"{node.get('hostname', node.get('ip_address', '?'))} ({node.get('ip_address', '')})"
-                        with st.expander(f"Node: **{node_label}** [{node.get('role', '')}]", expanded=True):
-                            with st.spinner(f"Running `{crictl_cmd}` on {node_label}..."):
-                                result = run_ssh_command(
-                                    ip_address=node["ip_address"],
-                                    command=crictl_cmd,
-                                    ssh_user=node.get("ssh_user", "root"),
-                                    ssh_port=node.get("ssh_port", 22),
-                                    ssh_key_path=node.get("ssh_key_path", "~/.ssh/id_rsa"),
-                                    timeout=30,
-                                )
-                                if result.success:
-                                    st.code(result.stdout or "(no output)", language="text")
-                                else:
-                                    st.error(f"Command failed on {node_label}")
-                                    st.code(result.stderr, language="text")
+                    if not selected_nodes:
+                        st.warning("No nodes selected. Please select at least one node.")
+                    else:
+                        actual_cmd = f"sudo {crictl_cmd}" if use_sudo and not crictl_cmd.strip().startswith("sudo") else crictl_cmd
+                        all_success = True
+                        for node in selected_nodes:
+                            node_label = f"{node.get('hostname', node.get('ip_address', '?'))} ({node.get('ip_address', '')})"
+                            with st.expander(f"Node: **{node_label}** [{node.get('role', '')}]", expanded=True):
+                                with st.spinner(f"Running `{actual_cmd}` on {node_label}..."):
+                                    result = run_ssh_command(
+                                        ip_address=node["ip_address"],
+                                        command=actual_cmd,
+                                        ssh_user=node.get("ssh_user", "root"),
+                                        ssh_port=node.get("ssh_port", 22),
+                                        ssh_key_path=node.get("ssh_key_path", "~/.ssh/id_rsa"),
+                                        timeout=30,
+                                    )
+                                    if result.success:
+                                        st.code(result.stdout or "(no output)", language="text")
+                                    else:
+                                        all_success = False
+                                        st.error(f"Command failed on {node_label}")
+                                        st.code(result.stderr, language="text")
+                                        if "permission denied" in (result.stderr or "").lower():
+                                            st.info("Tip: Enable the 'Run with sudo' checkbox above if your SSH user needs elevated privileges.")
+                        if all_success:
+                            st.success(f"Command completed successfully on {len(selected_nodes)} node(s).")
+                        else:
+                            st.warning("Command failed on some nodes. Check the details above.")
 
     # ── Node Health ──────────────────────────────────────────────────────
     with tab_node_health:
