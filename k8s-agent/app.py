@@ -576,6 +576,7 @@ def page_profile_manager():
                     st.markdown(f"**Updated:** {profile.updated_at[:10] if profile.updated_at else 'N/A'}")
                     if st.button("Set Active", key=f"activate_{profile.name}"):
                         st.session_state.active_profile = profile.name
+                        st.session_state.profile_selector = profile.name
                         st.rerun()
                     if st.button("Delete", key=f"delete_{profile.name}", type="secondary"):
                         delete_profile(profile.name)
@@ -2350,8 +2351,8 @@ def page_resource_viewer():
         _rv_namespaces = fetch_namespaces(profile.kubeconfig_content)
 
     (tab_resources, tab_scaling, tab_shell, tab_res_limits, tab_crictl,
-     tab_node_health, tab_rbac, tab_helm, tab_events,
-     tab_restart_tracker, tab_netpol, tab_pvc) = st.tabs([
+     tab_node_health, tab_rbac, tab_events,
+     tab_restart_tracker, tab_pvc) = st.tabs([
         "Cluster Resources",
         "Scaling",
         "Pod Shell",
@@ -2359,10 +2360,8 @@ def page_resource_viewer():
         "Node Containers",
         "Node Health",
         "RBAC Viewer",
-        "Helm Releases",
         "Events Timeline",
         "Pod Restart Tracker",
-        "Network Policies",
         "PVC / Storage",
     ])
 
@@ -2827,7 +2826,6 @@ def page_resource_viewer():
                                 template = spec.get("template", {})
                                 pod_spec = template.get("spec", {})
                                 containers = pod_spec.get("containers", [])
-                                init_containers = pod_spec.get("initContainers", [])
                                 for ctr in containers:
                                     res = ctr.get("resources", {})
                                     req = res.get("requests", {})
@@ -2836,23 +2834,6 @@ def page_resource_viewer():
                                         "Type": wl_label,
                                         "Workload": workload_name,
                                         "Container": ctr.get("name", "?"),
-                                        "Init": "",
-                                        "CPU Req": req.get("cpu", "-"),
-                                        "CPU Lim": lim.get("cpu", "-"),
-                                        "Mem Req": req.get("memory", "-"),
-                                        "Mem Lim": lim.get("memory", "-"),
-                                        "Eph Req": req.get("ephemeral-storage", "-"),
-                                        "Eph Lim": lim.get("ephemeral-storage", "-"),
-                                    })
-                                for ctr in init_containers:
-                                    res = ctr.get("resources", {})
-                                    req = res.get("requests", {})
-                                    lim = res.get("limits", {})
-                                    all_rows.append({
-                                        "Type": wl_label,
-                                        "Workload": workload_name,
-                                        "Container": ctr.get("name", "?"),
-                                        "Init": "init",
                                         "CPU Req": req.get("cpu", "-"),
                                         "CPU Lim": lim.get("cpu", "-"),
                                         "Mem Req": req.get("memory", "-"),
@@ -2874,7 +2855,6 @@ def page_resource_viewer():
                         "Type": st.column_config.TextColumn(width="small"),
                         "Workload": st.column_config.TextColumn(width="medium"),
                         "Container": st.column_config.TextColumn(width="medium"),
-                        "Init": st.column_config.TextColumn(width="small"),
                         "CPU Req": st.column_config.TextColumn(width="small"),
                         "CPU Lim": st.column_config.TextColumn(width="small"),
                         "Mem Req": st.column_config.TextColumn(width="small"),
@@ -2887,20 +2867,20 @@ def page_resource_viewer():
                 # Summary stats
                 st.markdown("---")
                 st.markdown("#### Summary")
-                no_cpu_req = sum(1 for r in all_rows if r["CPU Req"] == "-" and r["Init"] == "")
-                no_mem_req = sum(1 for r in all_rows if r["Mem Req"] == "-" and r["Init"] == "")
-                no_cpu_lim = sum(1 for r in all_rows if r["CPU Lim"] == "-" and r["Init"] == "")
-                no_mem_lim = sum(1 for r in all_rows if r["Mem Lim"] == "-" and r["Init"] == "")
-                non_init = sum(1 for r in all_rows if r["Init"] == "")
+                total_ctr = len(all_rows)
+                no_cpu_req = sum(1 for r in all_rows if r["CPU Req"] == "-")
+                no_mem_req = sum(1 for r in all_rows if r["Mem Req"] == "-")
+                no_cpu_lim = sum(1 for r in all_rows if r["CPU Lim"] == "-")
+                no_mem_lim = sum(1 for r in all_rows if r["Mem Lim"] == "-")
                 sc1, sc2, sc3, sc4 = st.columns(4)
                 with sc1:
-                    st.metric("No CPU Request", f"{no_cpu_req}/{non_init}")
+                    st.metric("No CPU Request", f"{no_cpu_req}/{total_ctr}")
                 with sc2:
-                    st.metric("No CPU Limit", f"{no_cpu_lim}/{non_init}")
+                    st.metric("No CPU Limit", f"{no_cpu_lim}/{total_ctr}")
                 with sc3:
-                    st.metric("No Mem Request", f"{no_mem_req}/{non_init}")
+                    st.metric("No Mem Request", f"{no_mem_req}/{total_ctr}")
                 with sc4:
-                    st.metric("No Mem Limit", f"{no_mem_lim}/{non_init}")
+                    st.metric("No Mem Limit", f"{no_mem_lim}/{total_ctr}")
 
                 if no_cpu_req > 0 or no_mem_req > 0:
                     st.warning(
@@ -2914,10 +2894,10 @@ def page_resource_viewer():
                     )
 
                 # Download as TSV
-                tsv_lines = ["Type\tWorkload\tContainer\tInit\tCPU Req\tCPU Lim\tMem Req\tMem Lim\tEph Req\tEph Lim"]
+                tsv_lines = ["Type\tWorkload\tContainer\tCPU Req\tCPU Lim\tMem Req\tMem Lim\tEph Req\tEph Lim"]
                 for r in all_rows:
                     tsv_lines.append(
-                        f"{r['Type']}\t{r['Workload']}\t{r['Container']}\t{r['Init']}\t"
+                        f"{r['Type']}\t{r['Workload']}\t{r['Container']}\t"
                         f"{r['CPU Req']}\t{r['CPU Lim']}\t{r['Mem Req']}\t{r['Mem Lim']}\t"
                         f"{r['Eph Req']}\t{r['Eph Lim']}"
                     )
@@ -2959,8 +2939,54 @@ def page_resource_viewer():
                     )
                 if node_result.success and node_result.stdout.strip():
                     node_names = [n.strip() for n in node_result.stdout.strip().split("\n") if n.strip()]
+
+                    # Pod count distribution across nodes
+                    node_pod_counts: dict[str, int] = {}
                     for node_name in node_names:
-                        with st.expander(f"Node: **{node_name}**", expanded=True):
+                        with st.spinner(f"Fetching pods on {node_name}..."):
+                            count_result = run_kubectl(
+                                profile,
+                                f"get pods -A --field-selector spec.nodeName={node_name} "
+                                "--no-headers",
+                                timeout=15,
+                            )
+                            if count_result.success:
+                                lines = [l for l in (count_result.stdout or "").strip().split("\n") if l.strip()]
+                                node_pod_counts[node_name] = len(lines)
+                            else:
+                                node_pod_counts[node_name] = 0
+
+                    # Show pod distribution summary
+                    st.markdown("#### Pod Distribution Across Nodes")
+                    dist_cols = st.columns(min(len(node_names), 6))
+                    for idx, node_name in enumerate(node_names):
+                        with dist_cols[idx % min(len(node_names), 6)]:
+                            st.metric(node_name, f"{node_pod_counts.get(node_name, 0)} pods")
+                    total_pods = sum(node_pod_counts.values())
+                    if total_pods > 0 and len(node_names) > 1:
+                        avg_pods = total_pods / len(node_names)
+                        max_pods = max(node_pod_counts.values())
+                        min_pods = min(node_pod_counts.values())
+                        spread = max_pods - min_pods
+                        st.markdown(
+                            f"**Total:** {total_pods} pods across {len(node_names)} nodes | "
+                            f"**Avg:** {avg_pods:.1f} | **Min:** {min_pods} | **Max:** {max_pods} | "
+                            f"**Spread:** {spread}"
+                        )
+                        if spread > avg_pods * 0.5 and avg_pods > 0:
+                            st.warning(
+                                f"Pod distribution is uneven (spread of {spread}). "
+                                "Consider checking node affinity rules or pod topology spread constraints."
+                            )
+                        else:
+                            st.success("Pods are reasonably well-distributed across nodes.")
+
+                    st.markdown("---")
+
+                    # Detailed per-node pod listing
+                    for node_name in node_names:
+                        pod_count = node_pod_counts.get(node_name, 0)
+                        with st.expander(f"Node: **{node_name}** ({pod_count} pods)", expanded=True):
                             with st.spinner(f"Fetching containers on {node_name}..."):
                                 pod_result = run_kubectl(
                                     profile,
@@ -3218,115 +3244,6 @@ def page_resource_viewer():
                 else:
                     st.error("Describe failed")
                     st.code(result.stderr, language="text")
-
-    # ── Helm Releases ────────────────────────────────────────────────────
-    with tab_helm:
-        st.markdown("### Helm Release Manager")
-        st.markdown("List, inspect, and manage Helm releases on your cluster.")
-
-        helm_tab_list, helm_tab_install, helm_tab_history = st.tabs([
-            "List Releases", "Install Chart", "Release History",
-        ])
-
-        with helm_tab_list:
-            helm_ns_all = st.checkbox("All namespaces", value=True, key="helm_ns_all")
-            helm_ns = ""
-            if not helm_ns_all:
-                if _rv_namespaces:
-                    helm_ns = st.selectbox("Namespace", options=_rv_namespaces,
-                                           index=_rv_namespaces.index("default") if "default" in _rv_namespaces else 0,
-                                           key="helm_ns")
-                else:
-                    helm_ns = st.text_input("Namespace", value="default", key="helm_ns")
-
-            if st.button("List Helm Releases", type="primary", key="helm_list"):
-                helm_cmd = "helm list"
-                if helm_ns_all:
-                    helm_cmd += " -A"
-                elif helm_ns:
-                    helm_cmd += f" -n {helm_ns}"
-                helm_cmd += " -o table"
-
-                with st.spinner("Fetching Helm releases..."):
-                    result = run_kubectl(profile, helm_cmd.replace("kubectl ", ""), timeout=15)
-                    if result.success:
-                        st.code(result.stdout or "(no releases found)", language="text")
-                    else:
-                        st.warning("Helm may not be installed on this cluster.")
-                        st.code(result.stderr, language="text")
-
-        with helm_tab_install:
-            st.markdown("#### Install a Helm Chart")
-            hcol1, hcol2 = st.columns(2)
-            with hcol1:
-                helm_release_name = st.text_input("Release Name", placeholder="my-release", key="helm_rel")
-                helm_chart = st.text_input("Chart", placeholder="prometheus-community/kube-prometheus-stack", key="helm_chart")
-            with hcol2:
-                if _rv_namespaces:
-                    helm_install_ns = st.selectbox("Namespace", options=_rv_namespaces,
-                                                   index=_rv_namespaces.index("default") if "default" in _rv_namespaces else 0,
-                                                   key="helm_install_ns")
-                else:
-                    helm_install_ns = st.text_input("Namespace", value="default", key="helm_install_ns")
-                helm_create_ns = st.checkbox("Create namespace if not exists", value=True, key="helm_create_ns")
-            helm_values = st.text_area(
-                "Values (YAML, optional)",
-                placeholder="# Custom values.yaml content here",
-                height=150,
-                key="helm_values",
-            )
-
-            if st.button("Install Chart", type="primary", key="helm_install") and helm_release_name and helm_chart:
-                install_cmd = f"helm install {helm_release_name} {helm_chart} -n {helm_install_ns}"
-                if helm_create_ns:
-                    install_cmd += " --create-namespace"
-                # If user provided values, write to temp file
-                if helm_values.strip():
-                    values_path = os.path.join(config.UPLOADS_DIR, f"helm-values-{helm_release_name}.yaml")
-                    with open(values_path, "w") as vf:
-                        vf.write(helm_values)
-                    install_cmd += f" -f {values_path}"
-
-                with st.spinner(f"Installing {helm_chart}..."):
-                    result = run_kubectl(profile, install_cmd.replace("kubectl ", ""), timeout=120)
-                    if result.success:
-                        st.success(f"Release '{helm_release_name}' installed!")
-                        st.code(result.stdout, language="text")
-                    else:
-                        st.error("Helm install failed")
-                        st.code(result.stderr, language="text")
-
-        with helm_tab_history:
-            st.markdown("#### Release History")
-            hist_name = st.text_input("Release name", placeholder="my-release", key="helm_hist_name")
-            hist_ns = st.text_input("Namespace", value="default", key="helm_hist_ns")
-
-            if st.button("Get History", key="helm_hist") and hist_name:
-                hist_cmd = f"helm history {hist_name} -n {hist_ns}"
-                with st.spinner("Fetching history..."):
-                    result = run_kubectl(profile, hist_cmd.replace("kubectl ", ""), timeout=15)
-                    if result.success:
-                        st.code(result.stdout, language="text")
-                    else:
-                        st.error("Could not get release history")
-                        st.code(result.stderr, language="text")
-
-            st.markdown("---")
-            st.markdown("#### Rollback Release")
-            rb_name = st.text_input("Release name", placeholder="my-release", key="helm_rb_name")
-            rb_ns = st.text_input("Namespace", value="default", key="helm_rb_ns")
-            rb_rev = st.number_input("Revision number", min_value=1, value=1, key="helm_rb_rev")
-
-            if st.button("Rollback", key="helm_rollback") and rb_name:
-                rb_cmd = f"helm rollback {rb_name} {rb_rev} -n {rb_ns}"
-                with st.spinner(f"Rolling back {rb_name} to revision {rb_rev}..."):
-                    result = run_kubectl(profile, rb_cmd.replace("kubectl ", ""), timeout=60)
-                    if result.success:
-                        st.success(f"Rolled back '{rb_name}' to revision {rb_rev}")
-                        st.code(result.stdout, language="text")
-                    else:
-                        st.error("Rollback failed")
-                        st.code(result.stderr, language="text")
 
     # ── Events Timeline ──────────────────────────────────────────────────
     with tab_events:
@@ -3590,177 +3507,6 @@ def page_resource_viewer():
                 st.info("No pods found.")
             else:
                 st.error("Failed to fetch pods")
-                st.code(result.stderr, language="text")
-
-    # ── Network Policy Visualizer ─────────────────────────────────────────
-    with tab_netpol:
-        st.markdown("### Network Policy Visualizer")
-        st.markdown("View and analyze NetworkPolicies to understand pod-to-pod communication rules.")
-
-        npcol1, npcol2 = st.columns([2, 1])
-        with npcol1:
-            if _rv_namespaces:
-                np_ns = st.selectbox("Namespace", ["All Namespaces"] + _rv_namespaces, key="netpol_ns")
-            else:
-                np_ns = st.text_input("Namespace (blank = all)", value="", key="netpol_ns_text")
-                if not np_ns:
-                    np_ns = "All Namespaces"
-
-        if st.button("Load Network Policies", type="primary", key="load_netpol"):
-            ns_flag = "-A" if np_ns == "All Namespaces" else f"-n {np_ns}"
-            cmd = f"get networkpolicies {ns_flag} -o json"
-            with st.spinner("Fetching network policies..."):
-                result = run_kubectl(profile, cmd, timeout=15)
-            if result.success and result.stdout.strip():
-                try:
-                    import pandas as pd
-                    np_json = json.loads(result.stdout)
-                    policies = np_json.get("items", [])
-                    if not policies:
-                        st.info("No NetworkPolicies found. All pod-to-pod traffic is allowed by default.")
-                    else:
-                        st.markdown(f"**Found {len(policies)} NetworkPolicies**")
-
-                        policy_summary = []
-                        for pol in policies:
-                            meta = pol.get("metadata", {})
-                            spec = pol.get("spec", {})
-                            pol_name = meta.get("name", "?")
-                            pol_ns = meta.get("namespace", "?")
-                            # Pod selector
-                            pod_sel = spec.get("podSelector", {})
-                            match_labels = pod_sel.get("matchLabels", {})
-                            selector_str = ", ".join(f"{k}={v}" for k, v in match_labels.items()) if match_labels else "(all pods)"
-                            # Policy types
-                            policy_types = spec.get("policyTypes", [])
-                            # Ingress rules count
-                            ingress_rules = spec.get("ingress", [])
-                            egress_rules = spec.get("egress", [])
-
-                            policy_summary.append({
-                                "Namespace": pol_ns,
-                                "Policy": pol_name,
-                                "Pod Selector": selector_str,
-                                "Types": ", ".join(policy_types) if policy_types else "N/A",
-                                "Ingress Rules": len(ingress_rules),
-                                "Egress Rules": len(egress_rules),
-                            })
-
-                        st.dataframe(pd.DataFrame(policy_summary), use_container_width=True, hide_index=True)
-
-                        # Detailed view per policy
-                        for pol in policies:
-                            meta = pol.get("metadata", {})
-                            spec = pol.get("spec", {})
-                            pol_name = meta.get("name", "?")
-                            pol_ns = meta.get("namespace", "?")
-                            with st.expander(f"{pol_ns}/{pol_name}", expanded=False):
-                                # Pod selector
-                                pod_sel = spec.get("podSelector", {})
-                                match_labels = pod_sel.get("matchLabels", {})
-                                if match_labels:
-                                    st.markdown("**Applies to pods matching:** " + ", ".join(f"`{k}={v}`" for k, v in match_labels.items()))
-                                else:
-                                    st.markdown("**Applies to:** All pods in namespace")
-
-                                # Ingress
-                                ingress_rules = spec.get("ingress", [])
-                                if ingress_rules:
-                                    st.markdown("**Ingress Rules:**")
-                                    for i, rule in enumerate(ingress_rules):
-                                        sources = []
-                                        for fr in rule.get("from", []):
-                                            if "podSelector" in fr:
-                                                labels = fr["podSelector"].get("matchLabels", {})
-                                                sources.append("Pods: " + (", ".join(f"{k}={v}" for k, v in labels.items()) if labels else "all"))
-                                            if "namespaceSelector" in fr:
-                                                labels = fr["namespaceSelector"].get("matchLabels", {})
-                                                sources.append("Namespaces: " + (", ".join(f"{k}={v}" for k, v in labels.items()) if labels else "all"))
-                                            if "ipBlock" in fr:
-                                                sources.append(f"CIDR: {fr['ipBlock'].get('cidr', '?')}")
-                                        ports = []
-                                        for p in rule.get("ports", []):
-                                            ports.append(f"{p.get('protocol', 'TCP')}/{p.get('port', '*')}")
-                                        src_str = ", ".join(sources) if sources else "any"
-                                        port_str = ", ".join(ports) if ports else "all ports"
-                                        st.markdown(f"  - Rule {i+1}: Allow from **{src_str}** on **{port_str}**")
-                                elif "Ingress" in spec.get("policyTypes", []):
-                                    st.warning("Ingress type declared but no rules — all ingress traffic is **denied**.")
-
-                                # Egress
-                                egress_rules = spec.get("egress", [])
-                                if egress_rules:
-                                    st.markdown("**Egress Rules:**")
-                                    for i, rule in enumerate(egress_rules):
-                                        destinations = []
-                                        for to in rule.get("to", []):
-                                            if "podSelector" in to:
-                                                labels = to["podSelector"].get("matchLabels", {})
-                                                destinations.append("Pods: " + (", ".join(f"{k}={v}" for k, v in labels.items()) if labels else "all"))
-                                            if "namespaceSelector" in to:
-                                                labels = to["namespaceSelector"].get("matchLabels", {})
-                                                destinations.append("Namespaces: " + (", ".join(f"{k}={v}" for k, v in labels.items()) if labels else "all"))
-                                            if "ipBlock" in to:
-                                                destinations.append(f"CIDR: {to['ipBlock'].get('cidr', '?')}")
-                                        ports = []
-                                        for p in rule.get("ports", []):
-                                            ports.append(f"{p.get('protocol', 'TCP')}/{p.get('port', '*')}")
-                                        dest_str = ", ".join(destinations) if destinations else "any"
-                                        port_str = ", ".join(ports) if ports else "all ports"
-                                        st.markdown(f"  - Rule {i+1}: Allow to **{dest_str}** on **{port_str}**")
-                                elif "Egress" in spec.get("policyTypes", []):
-                                    st.warning("Egress type declared but no rules — all egress traffic is **denied**.")
-
-                                st.markdown("---")
-                                st.markdown("**Raw YAML:**")
-                                import yaml
-                                st.code(yaml.dump(pol, default_flow_style=False), language="yaml")
-
-                        # Coverage check
-                        st.markdown("---")
-                        st.markdown("#### Coverage Analysis")
-                        if st.button("Check Unprotected Pods", key="netpol_coverage"):
-                            # Get all pods and check which are selected by a policy
-                            pod_ns_flag = f"-n {np_ns}" if np_ns != "All Namespaces" else "-A"
-                            pod_cmd = f"get pods {pod_ns_flag} -o json"
-                            with st.spinner("Analyzing coverage..."):
-                                pod_result = run_kubectl(profile, pod_cmd, timeout=15)
-                            if pod_result.success and pod_result.stdout.strip():
-                                try:
-                                    all_pods = json.loads(pod_result.stdout).get("items", [])
-                                    protected_pods = set()
-                                    for pol in policies:
-                                        pol_ns_name = pol.get("metadata", {}).get("namespace", "")
-                                        pod_sel = pol.get("spec", {}).get("podSelector", {})
-                                        match_labels = pod_sel.get("matchLabels", {})
-                                        for p in all_pods:
-                                            p_ns = p.get("metadata", {}).get("namespace", "")
-                                            p_name = p.get("metadata", {}).get("name", "")
-                                            p_labels = p.get("metadata", {}).get("labels", {})
-                                            if p_ns != pol_ns_name:
-                                                continue
-                                            if not match_labels or all(p_labels.get(k) == v for k, v in match_labels.items()):
-                                                protected_pods.add(f"{p_ns}/{p_name}")
-                                    unprotected = []
-                                    for p in all_pods:
-                                        p_ns = p.get("metadata", {}).get("namespace", "")
-                                        p_name = p.get("metadata", {}).get("name", "")
-                                        if f"{p_ns}/{p_name}" not in protected_pods:
-                                            unprotected.append({"Namespace": p_ns, "Pod": p_name})
-                                    if unprotected:
-                                        st.warning(f"{len(unprotected)} pod(s) are **not covered** by any NetworkPolicy (all traffic allowed):")
-                                        st.dataframe(pd.DataFrame(unprotected), use_container_width=True, hide_index=True)
-                                    else:
-                                        st.success("All pods are covered by at least one NetworkPolicy.")
-                                except (json.JSONDecodeError, KeyError):
-                                    st.error("Failed to parse pod data for coverage analysis.")
-
-                except (json.JSONDecodeError, KeyError) as e:
-                    st.error(f"Failed to parse network policy data: {e}")
-            elif result.success:
-                st.info("No NetworkPolicies found. All pod-to-pod traffic is allowed by default.")
-            else:
-                st.error("Failed to fetch network policies")
                 st.code(result.stderr, language="text")
 
     # ── PVC / Storage Dashboard ───────────────────────────────────────────
