@@ -106,7 +106,12 @@ def test_ssh_connectivity(node: dict) -> SSHResult:
 
 
 def _proxy_env_block(profile: ClusterProfile) -> str:
-    """Generate shell export lines for proxy environment variables."""
+    """Generate shell export lines for proxy environment variables.
+
+    These are valid *shell* statements — use inside scripts for the
+    current session.  Do NOT write these to ``/etc/environment``;
+    use :func:`_proxy_env_file_block` for that.
+    """
     lines = []
     proxy = profile.http_proxy or profile.http_proxy_alt
     proxys = profile.https_proxy or profile.https_proxy_alt
@@ -122,9 +127,45 @@ def _proxy_env_block(profile: ClusterProfile) -> str:
     return "\n".join(lines)
 
 
+def _proxy_env_file_block(profile: ClusterProfile) -> str:
+    """Generate KEY=VALUE lines suitable for ``/etc/environment``.
+
+    ``/etc/environment`` is parsed by ``pam_env.so`` which expects plain
+    ``KEY=VALUE`` lines — the ``export`` keyword is **not** valid there.
+    """
+    lines = []
+    proxy = profile.http_proxy or profile.http_proxy_alt
+    proxys = profile.https_proxy or profile.https_proxy_alt
+    if proxy:
+        lines.append(f'http_proxy="{proxy}"')
+        lines.append(f'HTTP_PROXY="{proxy}"')
+    if proxys:
+        lines.append(f'https_proxy="{proxys}"')
+        lines.append(f'HTTPS_PROXY="{proxys}"')
+    if profile.no_proxy:
+        lines.append(f'no_proxy="{profile.no_proxy}"')
+        lines.append(f'NO_PROXY="{profile.no_proxy}"')
+    return "\n".join(lines)
+
+
+def _source_env_preamble() -> str:
+    """Return a shell snippet that sources /etc/environment.
+
+    Each ``ProvisionStep`` runs in its own SSH session, so environment
+    variables set by a previous step (e.g. proxy settings) are lost.
+    Sourcing ``/etc/environment`` at the top of every network-dependent
+    step ensures the variables are available.
+    """
+    return (
+        "# Source /etc/environment so proxy vars (and others) persist across SSH sessions\n"
+        "set -a; . /etc/environment 2>/dev/null || true; set +a\n"
+    )
+
+
 def generate_common_setup_script(profile: ClusterProfile) -> str:
     """Generate the common setup script that runs on ALL nodes (control-plane + workers)."""
     proxy_block = _proxy_env_block(profile)
+    proxy_env_file_block = _proxy_env_file_block(profile)
     proxy_section = ""
     if proxy_block:
         proxy_section = f"""
@@ -132,9 +173,9 @@ def generate_common_setup_script(profile: ClusterProfile) -> str:
 echo ">> Configuring proxy settings..."
 {proxy_block}
 
-# Persist proxy in /etc/environment for all users
-cat >> /etc/environment <<PROXYEOF
-{proxy_block}
+# Persist proxy in /etc/environment for all users (KEY=VALUE format for pam_env)
+cat >> /etc/environment <<'PROXYEOF'
+{proxy_env_file_block}
 PROXYEOF
 """
 
@@ -569,6 +610,7 @@ def get_common_setup_steps(profile: ClusterProfile) -> List[ProvisionStep]:
     steps: List[ProvisionStep] = []
 
     # 0. Proxy (optional)
+    proxy_env_file_block = _proxy_env_file_block(profile)
     if proxy_block:
         steps.append(ProvisionStep(
             name="configure_proxy",
@@ -576,9 +618,9 @@ def get_common_setup_steps(profile: ClusterProfile) -> List[ProvisionStep]:
             script=f"""set -euo pipefail
 echo '>> Configuring proxy settings...'
 {proxy_block}
-# Persist proxy in /etc/environment for all users
+# Persist proxy in /etc/environment for all users (KEY=VALUE format for pam_env)
 cat >> /etc/environment <<'PROXYEOF'
-{proxy_block}
+{proxy_env_file_block}
 PROXYEOF
 echo 'Proxy configured.'
 """,
@@ -652,10 +694,12 @@ echo 'System prerequisites configured.'
         ))
 
     # 3. Install CRI-O
+    _env_preamble = _source_env_preamble()
     steps.append(ProvisionStep(
         name="install_crio",
         title=f"Install CRI-O {profile.crio_version}",
         script=f"""set -euo pipefail
+{_env_preamble}
 echo '>> Installing CRI-O {profile.crio_version}...'
 
 OS="$(. /etc/os-release && echo "$ID")"
@@ -714,6 +758,7 @@ echo 'CRI-O configured and running (storage: {profile.crio_root}).'
         name="install_k8s",
         title=f"Install Kubernetes {profile.kubernetes_version} Components",
         script=f"""set -euo pipefail
+{_env_preamble}
 echo '>> Installing Kubernetes {profile.kubernetes_version} components...'
 
 OS="$(. /etc/os-release && echo "$ID")"
@@ -762,12 +807,15 @@ def get_control_plane_steps(profile: ClusterProfile) -> List[ProvisionStep]:
 
     steps: List[ProvisionStep] = []
 
+    _env_preamble = _source_env_preamble()
+
     # 0. Proxy on CP (optional)
     if proxy_block:
         steps.append(ProvisionStep(
             name="cp_proxy",
             title="Set Proxy Environment for kubeadm",
             script=f"""set -euo pipefail
+{_env_preamble}
 echo '>> Setting proxy environment for kubeadm...'
 {proxy_block}
 echo 'Proxy environment set.'
@@ -780,6 +828,7 @@ echo 'Proxy environment set.'
         name="kubeadm_init",
         title="Run kubeadm init",
         script=f"""set -euo pipefail
+{_env_preamble}
 echo '>> Preparing kubeadm config...'
 mkdir -p "{audit_log_dir}"
 cat > /tmp/kubeadm-config.yaml <<EOF
@@ -873,6 +922,7 @@ echo 'kubectl configured.'
         name="install_flannel",
         title="Install Flannel CNI",
         script=f"""set -euo pipefail
+{_env_preamble}
 echo '>> Installing Flannel CNI...'
 {flannel_apply}
 echo '>> Waiting for Flannel pods to be ready...'
