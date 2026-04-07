@@ -1769,10 +1769,11 @@ def page_resource_viewer():
     if profile.cluster_source == "imported" and profile.kubeconfig_content:
         _rv_namespaces = fetch_namespaces(profile.kubeconfig_content)
 
-    tab_resources, tab_scaling, tab_shell, tab_crictl, tab_node_health, tab_rbac, tab_helm, tab_events = st.tabs([
+    tab_resources, tab_scaling, tab_shell, tab_res_limits, tab_crictl, tab_node_health, tab_rbac, tab_helm, tab_events = st.tabs([
         "Cluster Resources",
         "Scaling",
         "Pod Shell",
+        "Resource Requests/Limits",
         "Node Containers",
         "Node Health",
         "RBAC Viewer",
@@ -2180,6 +2181,170 @@ def page_resource_viewer():
                         st.code(result.stderr, language="text")
         elif not sh_load:
             st.info("Click **Load Pods** to see running pods in the selected namespace.")
+
+    # ── Resource Requests / Limits ───────────────────────────────────────
+    with tab_res_limits:
+        st.markdown("### Container Resource Requests & Limits")
+        st.markdown(
+            "View CPU, memory, and ephemeral-storage requests and limits for all "
+            "containers in a namespace (from Deployments, StatefulSets, DaemonSets, and Jobs)."
+        )
+
+        rl_col1, rl_col2 = st.columns(2)
+        with rl_col1:
+            if _rv_namespaces:
+                rl_ns = st.selectbox(
+                    "Namespace",
+                    options=_rv_namespaces,
+                    index=_rv_namespaces.index("default") if "default" in _rv_namespaces else 0,
+                    key="rl_ns",
+                )
+            else:
+                rl_ns = st.text_input("Namespace", value="default", key="rl_ns")
+        with rl_col2:
+            rl_workload = st.selectbox(
+                "Workload Type",
+                options=["Deployments", "StatefulSets", "DaemonSets", "Jobs", "All"],
+                index=0,
+                key="rl_workload",
+            )
+
+        if st.button("Fetch Resource Requests/Limits", type="primary", key="rl_fetch"):
+            import json as _json
+
+            workload_map = {
+                "Deployments": "deploy",
+                "StatefulSets": "statefulsets",
+                "DaemonSets": "daemonsets",
+                "Jobs": "jobs",
+            }
+            if rl_workload == "All":
+                types_to_fetch = list(workload_map.items())
+            else:
+                types_to_fetch = [(rl_workload, workload_map[rl_workload])]
+
+            all_rows: list[dict] = []
+            for wl_label, wl_cmd in types_to_fetch:
+                with st.spinner(f"Fetching {wl_label}..."):
+                    result = run_kubectl(
+                        profile,
+                        f"get {wl_cmd} -n {rl_ns} -o json",
+                        timeout=30,
+                    )
+                    if result.success and result.stdout.strip():
+                        try:
+                            data = _json.loads(result.stdout)
+                            for item in data.get("items", []):
+                                workload_name = item.get("metadata", {}).get("name", "?")
+                                spec = item.get("spec", {})
+                                # For Jobs the pod template is at spec.template,
+                                # for Deployments/StatefulSets/DaemonSets it's spec.template
+                                template = spec.get("template", {})
+                                pod_spec = template.get("spec", {})
+                                containers = pod_spec.get("containers", [])
+                                init_containers = pod_spec.get("initContainers", [])
+                                for ctr in containers:
+                                    res = ctr.get("resources", {})
+                                    req = res.get("requests", {})
+                                    lim = res.get("limits", {})
+                                    all_rows.append({
+                                        "Type": wl_label,
+                                        "Workload": workload_name,
+                                        "Container": ctr.get("name", "?"),
+                                        "Init": "",
+                                        "CPU Req": req.get("cpu", "-"),
+                                        "CPU Lim": lim.get("cpu", "-"),
+                                        "Mem Req": req.get("memory", "-"),
+                                        "Mem Lim": lim.get("memory", "-"),
+                                        "Eph Req": req.get("ephemeral-storage", "-"),
+                                        "Eph Lim": lim.get("ephemeral-storage", "-"),
+                                    })
+                                for ctr in init_containers:
+                                    res = ctr.get("resources", {})
+                                    req = res.get("requests", {})
+                                    lim = res.get("limits", {})
+                                    all_rows.append({
+                                        "Type": wl_label,
+                                        "Workload": workload_name,
+                                        "Container": ctr.get("name", "?"),
+                                        "Init": "init",
+                                        "CPU Req": req.get("cpu", "-"),
+                                        "CPU Lim": lim.get("cpu", "-"),
+                                        "Mem Req": req.get("memory", "-"),
+                                        "Mem Lim": lim.get("memory", "-"),
+                                        "Eph Req": req.get("ephemeral-storage", "-"),
+                                        "Eph Lim": lim.get("ephemeral-storage", "-"),
+                                    })
+                        except _json.JSONDecodeError:
+                            st.warning(f"Could not parse JSON for {wl_label}")
+                    elif not result.success:
+                        st.warning(f"Failed to fetch {wl_label}: {result.stderr}")
+
+            if all_rows:
+                st.markdown(f"**{len(all_rows)} container(s)** found in namespace `{rl_ns}`:")
+                st.dataframe(
+                    all_rows,
+                    use_container_width=True,
+                    column_config={
+                        "Type": st.column_config.TextColumn(width="small"),
+                        "Workload": st.column_config.TextColumn(width="medium"),
+                        "Container": st.column_config.TextColumn(width="medium"),
+                        "Init": st.column_config.TextColumn(width="small"),
+                        "CPU Req": st.column_config.TextColumn(width="small"),
+                        "CPU Lim": st.column_config.TextColumn(width="small"),
+                        "Mem Req": st.column_config.TextColumn(width="small"),
+                        "Mem Lim": st.column_config.TextColumn(width="small"),
+                        "Eph Req": st.column_config.TextColumn(width="small"),
+                        "Eph Lim": st.column_config.TextColumn(width="small"),
+                    },
+                )
+
+                # Summary stats
+                st.markdown("---")
+                st.markdown("#### Summary")
+                no_cpu_req = sum(1 for r in all_rows if r["CPU Req"] == "-" and r["Init"] == "")
+                no_mem_req = sum(1 for r in all_rows if r["Mem Req"] == "-" and r["Init"] == "")
+                no_cpu_lim = sum(1 for r in all_rows if r["CPU Lim"] == "-" and r["Init"] == "")
+                no_mem_lim = sum(1 for r in all_rows if r["Mem Lim"] == "-" and r["Init"] == "")
+                non_init = sum(1 for r in all_rows if r["Init"] == "")
+                sc1, sc2, sc3, sc4 = st.columns(4)
+                with sc1:
+                    st.metric("No CPU Request", f"{no_cpu_req}/{non_init}")
+                with sc2:
+                    st.metric("No CPU Limit", f"{no_cpu_lim}/{non_init}")
+                with sc3:
+                    st.metric("No Mem Request", f"{no_mem_req}/{non_init}")
+                with sc4:
+                    st.metric("No Mem Limit", f"{no_mem_lim}/{non_init}")
+
+                if no_cpu_req > 0 or no_mem_req > 0:
+                    st.warning(
+                        f"{no_cpu_req + no_mem_req} container(s) are missing resource requests. "
+                        "This can affect scheduling and QoS class assignment."
+                    )
+                if no_cpu_lim > 0 or no_mem_lim > 0:
+                    st.info(
+                        f"{no_cpu_lim + no_mem_lim} container(s) are missing resource limits. "
+                        "Consider setting limits to prevent resource contention."
+                    )
+
+                # Download as TSV
+                tsv_lines = ["Type\tWorkload\tContainer\tInit\tCPU Req\tCPU Lim\tMem Req\tMem Lim\tEph Req\tEph Lim"]
+                for r in all_rows:
+                    tsv_lines.append(
+                        f"{r['Type']}\t{r['Workload']}\t{r['Container']}\t{r['Init']}\t"
+                        f"{r['CPU Req']}\t{r['CPU Lim']}\t{r['Mem Req']}\t{r['Mem Lim']}\t"
+                        f"{r['Eph Req']}\t{r['Eph Lim']}"
+                    )
+                st.download_button(
+                    "Download as TSV",
+                    data="\n".join(tsv_lines),
+                    file_name=f"resource_limits_{rl_ns}.tsv",
+                    mime="text/tab-separated-values",
+                    key="rl_download",
+                )
+            else:
+                st.info(f"No containers found in namespace `{rl_ns}` for the selected workload type(s).")
 
     # ── Node Containers (crictl) ────────────────────────────────────────
     with tab_crictl:
