@@ -145,6 +145,7 @@ def init_session_state():
         "provisioning_log": [],
         "debug_results": {},
         "log_analysis_results": {},
+        "_flash_message": None,
     }
     for key, value in defaults.items():
         if key not in st.session_state:
@@ -259,6 +260,17 @@ def render_sidebar():
 def page_profile_manager():
     st.markdown("## Cluster Profile Manager")
     st.markdown("Create, edit, and manage profiles for your on-prem Kubernetes clusters.")
+
+    # Show any flash message from a previous action (e.g. after st.rerun)
+    if st.session_state.get("_flash_message"):
+        _flash = st.session_state._flash_message
+        if _flash[0] == "success":
+            st.success(_flash[1])
+        elif _flash[0] == "error":
+            st.error(_flash[1])
+        elif _flash[0] == "info":
+            st.info(_flash[1])
+        st.session_state._flash_message = None
 
     tab_create, tab_import_cluster, tab_list, tab_import = st.tabs([
         "Create Profile", "Import Existing Cluster", "Manage Profiles", "Import / Export",
@@ -454,7 +466,7 @@ def page_profile_manager():
                     )
                     path = save_profile(profile)
                     st.session_state.active_profile = name
-                    st.success(f"Profile '{name}' created successfully!")
+                    st.session_state._flash_message = ("success", f"Profile '{name}' created successfully! Select it from the sidebar to get started.")
                     st.rerun()
 
     # ── Import Existing Cluster ──────────────────────────────────────────
@@ -508,14 +520,18 @@ def page_profile_manager():
                     cluster_source="imported",
                     kubeconfig_content=kubeconfig_content,
                 )
-                save_profile(profile)
-                st.session_state.active_profile = import_name
-                st.success(
-                    f"Cluster '{import_name}' imported! "
-                    "Select it from the sidebar to start using Debugger, Monitoring, "
-                    "Resource Viewer, etc."
-                )
-                st.rerun()
+                try:
+                    save_profile(profile)
+                    st.session_state.active_profile = import_name
+                    st.session_state._flash_message = (
+                        "success",
+                        f"Cluster '{import_name}' imported successfully! "
+                        "It is now the active profile. Use the sidebar navigation to go to "
+                        "Cluster Debugger, Resource Viewer, Monitoring Setup, etc."
+                    )
+                    st.rerun()
+                except Exception as e:
+                    st.error(f"Failed to import cluster: {e}")
 
     # ── Manage Profiles ───────────────────────────────────────────────────
     with tab_list:
