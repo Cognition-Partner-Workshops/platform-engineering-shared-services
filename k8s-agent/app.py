@@ -80,6 +80,11 @@ from modules.log_analyzer import (
     llm_analyze_logs,
     llm_correlate_analysis,
     get_pod_list,
+    smart_analyze,
+    cluster_logs,
+    detect_anomalies,
+    mine_log_patterns,
+    summarize_logs,
 )
 from modules.llm_client import query_llm, stream_llm
 
@@ -1575,10 +1580,11 @@ def page_log_analysis():
 
     available_log_sources = get_available_log_sources(profile)
 
-    tab_system, tab_pod, tab_correlation, tab_ai = st.tabs([
+    tab_system, tab_pod, tab_correlation, tab_smart, tab_ai = st.tabs([
         "System Logs",
         "Pod Logs",
         "Error Correlation",
+        "Smart Log Analysis",
         "AI Log Analysis",
     ])
 
@@ -1730,6 +1736,258 @@ def page_log_analysis():
                     with st.spinner("AI is performing deep correlation analysis..."):
                         analysis = llm_correlate_analysis(multi_logs)
                         st.markdown(analysis)
+
+    # ── Smart Log Analysis (LogAI-inspired) ─────────────────────────────
+    with tab_smart:
+        st.markdown("### Smart Log Analysis (LogAI-inspired)")
+        st.markdown(
+            "ML-powered log analysis using techniques from "
+            "[Salesforce LogAI](https://github.com/salesforce/logai): "
+            "**log clustering** (TF-IDF + DBSCAN), **anomaly detection**, "
+            "**pattern mining** (Drain-style), and **auto-summarization**."
+        )
+
+        smart_mode = st.radio(
+            "Analysis mode",
+            ["Collect from cluster", "Paste logs"],
+            horizontal=True,
+            key="smart_mode",
+        )
+
+        smart_log_text = ""
+
+        if smart_mode == "Collect from cluster":
+            scol1, scol2, scol3 = st.columns(3)
+            with scol1:
+                smart_source = st.selectbox(
+                    "Log Source", available_log_sources, key="smart_source",
+                )
+            with scol2:
+                smart_lines = st.number_input(
+                    "Lines to fetch", min_value=100, max_value=5000, value=500, key="smart_lines",
+                )
+            with scol3:
+                smart_since_opts = {
+                    "Last 15 min": ("15 minutes ago", "15m"),
+                    "Last 1 hour": ("1 hour ago", "1h"),
+                    "Last 6 hours": ("6 hours ago", "6h"),
+                    "Last 24 hours": ("24 hours ago", "24h"),
+                }
+                smart_since_label = st.selectbox(
+                    "Time Range", list(smart_since_opts.keys()), index=1, key="smart_since",
+                )
+                smart_since, smart_since_k8s = smart_since_opts[smart_since_label]
+
+            if st.button("Collect & Analyze", type="primary", key="smart_collect"):
+                with st.spinner(f"Collecting {smart_source} logs..."):
+                    result = collect_logs(
+                        cp_node, smart_source, smart_lines, smart_since, smart_since_k8s, profile=profile,
+                    )
+                if result.success and result.stdout.strip():
+                    smart_log_text = result.stdout
+                    st.session_state["_smart_log_text"] = smart_log_text
+                    st.session_state["_smart_source"] = smart_source
+                elif result.success:
+                    st.info("No logs returned for the selected source and time range.")
+                else:
+                    st.error(f"Failed to collect logs: {result.stderr}")
+
+            # Persist across reruns
+            if "_smart_log_text" in st.session_state and not smart_log_text:
+                smart_log_text = st.session_state["_smart_log_text"]
+
+        else:
+            smart_log_text = st.text_area(
+                "Paste log output",
+                height=200,
+                placeholder="Paste your Kubernetes logs here for smart analysis...",
+                key="smart_paste",
+            )
+            if smart_log_text:
+                st.session_state["_smart_log_text"] = smart_log_text
+                st.session_state["_smart_source"] = "pasted"
+
+        # Run analysis if we have log text
+        if smart_log_text:
+            src_label = st.session_state.get("_smart_source", "")
+            with st.spinner("Running LogAI-inspired analysis pipeline..."):
+                sa_result = smart_analyze(smart_log_text, source=src_label)
+
+            # ── Summary / Health Score ────────────────────────────────
+            st.markdown("---")
+            st.markdown("#### Log Summary & Health Score")
+            summary = sa_result.summary
+            health = summary.get("health_score", 100)
+            health_color = "green" if health >= 80 else ("orange" if health >= 50 else "red")
+            scol1, scol2, scol3, scol4, scol5 = st.columns(5)
+            scol1.metric("Total Lines", summary.get("total_lines", 0))
+            scol2.metric("Errors", summary.get("error_count", 0))
+            scol3.metric("Warnings", summary.get("warning_count", 0))
+            scol4.metric("Unique Templates", summary.get("unique_templates", 0))
+            scol5.metric("Health Score", f"{health}/100")
+
+            if health < 50:
+                st.error(f"Health score is **{health}/100** — significant issues detected in logs.")
+            elif health < 80:
+                st.warning(f"Health score is **{health}/100** — some issues detected.")
+            else:
+                st.success(f"Health score is **{health}/100** — logs look healthy.")
+
+            st.markdown(
+                f"**Time span:** {summary.get('first_timestamp', 'N/A')} → {summary.get('last_timestamp', 'N/A')} | "
+                f"**Template diversity:** {summary.get('template_diversity', 0)}%"
+            )
+
+            # Top errors
+            top_errors = summary.get("top_errors", [])
+            if top_errors:
+                with st.expander(f"Top {len(top_errors)} Error Patterns", expanded=True):
+                    for pattern, count in top_errors:
+                        st.markdown(f"- **x{count}** — `{pattern[:200]}`")
+
+            # ── Log Clustering ────────────────────────────────────────
+            st.markdown("---")
+            st.markdown("#### Log Clustering (TF-IDF + DBSCAN)")
+            st.markdown(
+                "Groups similar log messages together to reduce noise and highlight distinct message types. "
+                "Uses TF-IDF vectorization and DBSCAN density-based clustering."
+            )
+            if sa_result.clusters:
+                import pandas as pd
+                cluster_data = []
+                for c in sa_result.clusters:
+                    label = f"Cluster {c.cluster_id}" if c.cluster_id >= 0 else "Noise (unique)"
+                    cluster_data.append({
+                        "Cluster": label,
+                        "Count": c.count,
+                        "Level": c.level,
+                        "Template": c.template[:120],
+                        "First Seen": c.first_seen or "N/A",
+                        "Last Seen": c.last_seen or "N/A",
+                    })
+                df_clusters = pd.DataFrame(cluster_data)
+                st.dataframe(df_clusters, use_container_width=True, hide_index=True)
+
+                # Cluster distribution chart
+                try:
+                    import plotly.express as px
+                    fig = px.pie(
+                        df_clusters, names="Cluster", values="Count",
+                        title="Log Message Distribution by Cluster",
+                        color_discrete_sequence=px.colors.qualitative.Set3,
+                    )
+                    fig.update_layout(height=400)
+                    st.plotly_chart(fig, use_container_width=True)
+                except ImportError:
+                    pass
+
+                # Show sample messages per cluster
+                error_clusters = [c for c in sa_result.clusters if c.level == "ERROR"]
+                if error_clusters:
+                    with st.expander(f"Error Clusters ({len(error_clusters)})", expanded=True):
+                        for c in error_clusters:
+                            label = f"Cluster {c.cluster_id}" if c.cluster_id >= 0 else "Noise"
+                            st.markdown(f"**{label}** — {c.count} messages")
+                            for sample in c.sample_messages[:2]:
+                                st.code(sample, language="text")
+            else:
+                st.info("Not enough log lines for clustering (need 3+ lines).")
+
+            # ── Anomaly Detection ─────────────────────────────────────
+            st.markdown("---")
+            st.markdown("#### Anomaly Detection")
+            st.markdown(
+                "Detects unusual log lines using TF-IDF distance from centroid (outlier scoring) "
+                "and frequency-based rare template detection."
+            )
+            if sa_result.anomalies:
+                st.markdown(f"**{len(sa_result.anomalies)} anomalous log line(s) detected**")
+                import pandas as pd
+                anomaly_data = []
+                for a in sa_result.anomalies[:30]:
+                    anomaly_data.append({
+                        "Score": round(a.score, 2),
+                        "Reason": a.reason,
+                        "Timestamp": a.timestamp or "N/A",
+                        "Message": a.message[:150],
+                    })
+                df_anomalies = pd.DataFrame(anomaly_data)
+                st.dataframe(df_anomalies, use_container_width=True, hide_index=True)
+
+                # Show full messages for top anomalies
+                with st.expander("Top Anomaly Details", expanded=False):
+                    for i, a in enumerate(sa_result.anomalies[:10]):
+                        st.markdown(f"**#{i+1}** (score: {a.score:.2f}) — {a.reason}")
+                        st.code(a.message, language="text")
+            else:
+                st.success("No anomalous log lines detected — all messages follow expected patterns.")
+
+            # ── Pattern Mining ────────────────────────────────────────
+            st.markdown("---")
+            st.markdown("#### Pattern Mining (Drain-style)")
+            st.markdown(
+                "Extracts frequent log templates by replacing variable tokens (IPs, IDs, numbers, paths) "
+                "with placeholders — similar to LogAI's Drain parser."
+            )
+            if sa_result.patterns:
+                import pandas as pd
+                pattern_data = []
+                for p in sa_result.patterns[:20]:
+                    pattern_data.append({
+                        "Template": p["template"][:120],
+                        "Count": p["count"],
+                        "% of Logs": p["percentage"],
+                        "Level": p["level"],
+                    })
+                df_patterns = pd.DataFrame(pattern_data)
+                st.dataframe(df_patterns, use_container_width=True, hide_index=True)
+
+                # Bar chart of top patterns
+                try:
+                    import plotly.express as px
+                    top_10 = sa_result.patterns[:10]
+                    fig = px.bar(
+                        x=[p["template"][:60] for p in top_10],
+                        y=[p["count"] for p in top_10],
+                        labels={"x": "Template", "y": "Count"},
+                        title="Top 10 Log Templates",
+                        color=[p["level"] for p in top_10],
+                        color_discrete_map={"ERROR": "#FF4B4B", "WARNING": "#FFA500", "INFO": "#326CE5"},
+                    )
+                    fig.update_layout(height=400, xaxis_tickangle=-45)
+                    st.plotly_chart(fig, use_container_width=True)
+                except ImportError:
+                    pass
+            else:
+                st.info("No patterns extracted.")
+
+            # ── Timeline ──────────────────────────────────────────────
+            if sa_result.timeline_buckets and len(sa_result.timeline_buckets) > 1:
+                st.markdown("---")
+                st.markdown("#### Log Volume Timeline")
+                try:
+                    import plotly.graph_objects as go
+                    import pandas as pd
+                    ts_labels = [b["timestamp"] for b in sa_result.timeline_buckets if b["timestamp"] != "unknown"]
+                    ts_totals = [b["total"] for b in sa_result.timeline_buckets if b["timestamp"] != "unknown"]
+                    ts_errors = [b["errors"] for b in sa_result.timeline_buckets if b["timestamp"] != "unknown"]
+                    ts_warnings = [b["warnings"] for b in sa_result.timeline_buckets if b["timestamp"] != "unknown"]
+
+                    if ts_labels:
+                        fig = go.Figure()
+                        fig.add_trace(go.Scatter(x=ts_labels, y=ts_totals, name="Total", mode="lines+markers", line=dict(color="#326CE5")))
+                        fig.add_trace(go.Bar(x=ts_labels, y=ts_errors, name="Errors", marker_color="#FF4B4B"))
+                        fig.add_trace(go.Bar(x=ts_labels, y=ts_warnings, name="Warnings", marker_color="#FFA500"))
+                        fig.update_layout(
+                            title="Log Volume Over Time",
+                            yaxis_title="Count",
+                            xaxis_title="Time",
+                            barmode="stack",
+                            height=400,
+                        )
+                        st.plotly_chart(fig, use_container_width=True)
+                except ImportError:
+                    pass
 
     # ── AI Log Analysis ───────────────────────────────────────────────────
     with tab_ai:
