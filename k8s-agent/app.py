@@ -1646,6 +1646,8 @@ def page_log_analysis():
     # ── Pod Logs ──────────────────────────────────────────────────────────
     with tab_pod:
         st.markdown("### Pod Logs")
+
+        # --- Namespace selection ---
         col1, col2 = st.columns(2)
         with col1:
             if _cluster_namespaces:
@@ -1654,42 +1656,114 @@ def page_log_analysis():
                                       key="pod_ns")
             else:
                 pod_ns = st.text_input("Namespace", value="default", key="pod_ns")
-            pod_name = st.text_input("Pod Name", placeholder="my-pod-xyz", key="pod_name_input")
         with col2:
-            container = st.text_input("Container (optional)", key="pod_container")
-            pod_lines = st.number_input("Lines", min_value=50, max_value=1000, value=200, key="pod_lines")
-            pod_previous = st.checkbox("Previous container logs (crash recovery)")
+            pod_lines = st.number_input("Lines", min_value=50, max_value=5000, value=200, key="pod_lines")
 
-        if st.button("Fetch Pod Logs", type="primary", key="fetch_pod") and pod_name:
-            with st.spinner(f"Fetching logs for {pod_ns}/{pod_name}..."):
-                result = collect_pod_logs(
-                    cp_node, pod_ns, pod_name, container, pod_lines,
-                    "1h", pod_previous, profile=profile,
-                )
-                if result.success:
-                    analysis = analyze_logs(result.stdout, f"{pod_ns}/{pod_name}")
-                    m1, m2, m3 = st.columns(3)
-                    m1.metric("Total Lines", analysis.total_lines)
-                    m2.metric("Errors", analysis.error_count)
-                    m3.metric("Warnings", analysis.warning_count)
-
-                    if analysis.error_patterns:
-                        st.markdown("**Error Patterns:**")
-                        for pattern, count in list(analysis.error_patterns.items())[:10]:
-                            st.markdown(f"- `{pattern}` (x{count})")
-
-                    st.code(result.stdout[-5000:], language="text")
-
-                    if analysis.error_count > 0 and is_llm_configured():
-                        if st.button("Analyze with AI", key="pod_ai"):
-                            with st.spinner("AI analyzing pod logs..."):
-                                ai_analysis = llm_analyze_logs(
-                                    result.stdout, f"{pod_ns}/{pod_name}"
-                                )
-                                st.markdown(ai_analysis)
+        # --- Load pods from the cluster ---
+        if st.button("Load Pods", key="load_pods_btn"):
+            with st.spinner(f"Fetching pods in namespace '{pod_ns}'..."):
+                pod_result = get_pod_list(cp_node, namespace=pod_ns, profile=profile)
+                if pod_result.success and pod_result.stdout.strip():
+                    _pods: list[dict] = []
+                    for line in pod_result.stdout.strip().split("\n"):
+                        parts = line.split()
+                        if len(parts) >= 4:
+                            _pods.append({
+                                "namespace": parts[0],
+                                "name": parts[1],
+                                "status": parts[2],
+                                "containers": parts[3],
+                            })
+                        elif len(parts) >= 2:
+                            _pods.append({
+                                "namespace": parts[0],
+                                "name": parts[1],
+                                "status": parts[2] if len(parts) > 2 else "Unknown",
+                                "containers": parts[3] if len(parts) > 3 else "",
+                            })
+                    st.session_state["_pod_list"] = _pods
+                    st.session_state["_pod_list_ns"] = pod_ns
+                    st.success(f"Found {len(_pods)} pod(s) in namespace '{pod_ns}'.")
+                elif pod_result.success:
+                    st.session_state["_pod_list"] = []
+                    st.session_state["_pod_list_ns"] = pod_ns
+                    st.warning(f"No pods found in namespace '{pod_ns}'.")
                 else:
-                    st.error("Failed to fetch pod logs")
-                    st.code(result.stderr, language="text")
+                    st.error(f"Failed to fetch pods: {pod_result.stderr}")
+
+        # --- Pod & container dropdowns ---
+        _pods_loaded = st.session_state.get("_pod_list", [])
+        _pods_loaded_ns = st.session_state.get("_pod_list_ns", "")
+
+        col_p1, col_p2 = st.columns(2)
+        with col_p1:
+            if _pods_loaded and _pods_loaded_ns == pod_ns:
+                pod_options = [f"{p['name']}  ({p['status']})" for p in _pods_loaded]
+                selected_pod_idx = st.selectbox(
+                    "Pod Name", options=range(len(pod_options)),
+                    format_func=lambda i: pod_options[i],
+                    key="pod_name_select",
+                )
+                pod_name = _pods_loaded[selected_pod_idx]["name"] if selected_pod_idx is not None else ""
+            else:
+                pod_name = st.text_input("Pod Name", placeholder="my-pod-xyz (click Load Pods to get dropdown)", key="pod_name_input")
+
+        with col_p2:
+            if _pods_loaded and _pods_loaded_ns == pod_ns and pod_name:
+                # Find the selected pod's containers
+                _selected_pod = next((p for p in _pods_loaded if p["name"] == pod_name), None)
+                _containers: list[str] = []
+                if _selected_pod and _selected_pod.get("containers"):
+                    _containers = [c.strip() for c in _selected_pod["containers"].split(",") if c.strip()]
+                if _containers:
+                    container_options = ["(all / default)"] + _containers
+                    container_sel = st.selectbox("Container", options=container_options, key="pod_container_select")
+                    container = "" if container_sel == "(all / default)" else container_sel
+                else:
+                    container = st.text_input("Container (optional)", key="pod_container")
+            else:
+                container = st.text_input("Container (optional)", key="pod_container")
+
+        pod_previous = st.checkbox("Previous container logs (crash recovery)")
+
+        # --- Fetch logs ---
+        if st.button("Fetch Pod Logs", type="primary", key="fetch_pod"):
+            if not pod_name:
+                st.warning("Please enter a pod name or click **Load Pods** to select one.")
+            else:
+                with st.spinner(f"Fetching logs for {pod_ns}/{pod_name}..."):
+                    result = collect_pod_logs(
+                        cp_node, pod_ns, pod_name, container, pod_lines,
+                        "1h", pod_previous, profile=profile,
+                    )
+                    if result.success:
+                        if not result.stdout.strip():
+                            st.info(f"No log output returned for pod `{pod_ns}/{pod_name}`. "
+                                    "The pod may have just started or has no recent logs.")
+                        else:
+                            analysis = analyze_logs(result.stdout, f"{pod_ns}/{pod_name}")
+                            m1, m2, m3 = st.columns(3)
+                            m1.metric("Total Lines", analysis.total_lines)
+                            m2.metric("Errors", analysis.error_count)
+                            m3.metric("Warnings", analysis.warning_count)
+
+                            if analysis.error_patterns:
+                                st.markdown("**Error Patterns:**")
+                                for pattern, count in list(analysis.error_patterns.items())[:10]:
+                                    st.markdown(f"- `{pattern}` (x{count})")
+
+                            st.code(result.stdout[-5000:], language="text")
+
+                            if analysis.error_count > 0 and is_llm_configured():
+                                if st.button("Analyze with AI", key="pod_ai"):
+                                    with st.spinner("AI analyzing pod logs..."):
+                                        ai_analysis = llm_analyze_logs(
+                                            result.stdout, f"{pod_ns}/{pod_name}"
+                                        )
+                                        st.markdown(ai_analysis)
+                    else:
+                        st.error(f"Failed to fetch pod logs for `{pod_ns}/{pod_name}`")
+                        st.code(result.stderr, language="text")
 
     # ── Error Correlation ─────────────────────────────────────────────────
     with tab_correlation:
