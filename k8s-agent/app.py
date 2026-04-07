@@ -3327,6 +3327,67 @@ def _show_profile_summary(profile: ClusterProfile):
         with st.expander("Cluster Details", expanded=False):
             st.markdown(f"**Description:** {profile.description or 'N/A'}")
             st.markdown(f"**Kubeconfig:** {'Loaded' if profile.kubeconfig_content else 'Not loaded'}")
+
+            # Fetch live cluster info from kubeconfig
+            if profile.kubeconfig_content:
+                node_result = run_kubectl(
+                    profile,
+                    "get nodes -o wide --no-headers",
+                    timeout=10,
+                )
+                if node_result.success and node_result.stdout.strip():
+                    st.markdown("---")
+                    st.markdown("**Cluster Nodes:**")
+                    node_lines = [l for l in node_result.stdout.strip().split("\n") if l.strip()]
+                    node_data = []
+                    for line in node_lines:
+                        parts = line.split()
+                        if len(parts) >= 5:
+                            node_data.append({
+                                "Name": parts[0],
+                                "Status": parts[1],
+                                "Roles": parts[2] if parts[2] != "<none>" else "worker",
+                                "Age": parts[3],
+                                "Kubelet Version": parts[4],
+                                "Internal IP": parts[5] if len(parts) > 5 else "N/A",
+                                "OS Image": " ".join(parts[7:9]) if len(parts) > 8 else (parts[7] if len(parts) > 7 else "N/A"),
+                                "Container Runtime": parts[-1] if len(parts) > 9 else "N/A",
+                            })
+                    if node_data:
+                        import pandas as pd
+                        st.dataframe(
+                            pd.DataFrame(node_data),
+                            use_container_width=True,
+                            hide_index=True,
+                        )
+                        # Summary
+                        cp_count = sum(1 for n in node_data if "control-plane" in n["Roles"] or "master" in n["Roles"])
+                        worker_count = len(node_data) - cp_count
+                        ready_count = sum(1 for n in node_data if "Ready" in n["Status"])
+                        st.markdown(
+                            f"**Total:** {len(node_data)} node(s) — "
+                            f"{cp_count} control-plane, {worker_count} worker | "
+                            f"**Ready:** {ready_count}/{len(node_data)}"
+                        )
+                    else:
+                        st.code(node_result.stdout, language="text")
+
+                    # Cluster info (API server endpoint)
+                    info_result = run_kubectl(profile, "cluster-info", timeout=10)
+                    if info_result.success and info_result.stdout.strip():
+                        st.markdown("---")
+                        st.markdown("**Cluster Info:**")
+                        # Strip ANSI color codes for clean display
+                        import re
+                        clean_info = re.sub(r'\x1b\[[0-9;]*m', '', info_result.stdout)
+                        st.code(clean_info.strip(), language="text")
+                elif node_result.success:
+                    st.info("Connected to cluster but no nodes found.")
+                else:
+                    st.warning(
+                        f"Could not fetch cluster details: {node_result.stderr or 'kubectl command failed'}. "
+                        "Verify that kubectl is installed and the kubeconfig is valid."
+                    )
     else:
         cols = st.columns(5)
         cols[0].metric("Profile", profile.name)
