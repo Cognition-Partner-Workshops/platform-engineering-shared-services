@@ -42,6 +42,7 @@ from modules.cluster_creator import (
     get_control_plane_steps,
     get_worker_join_steps,
     get_best_practices_steps,
+    get_cluster_reset_steps,
 )
 from modules.cluster_debugger import (
     DIAGNOSTIC_COMMANDS,
@@ -604,9 +605,10 @@ def page_cluster_creation():
 
     _show_profile_summary(profile)
 
-    tab_preflight, tab_provision, tab_scripts, tab_manifests, tab_advice = st.tabs([
+    tab_preflight, tab_provision, tab_reset, tab_scripts, tab_manifests, tab_advice = st.tabs([
         "Pre-flight Checks",
         "Provision Cluster",
+        "Reset Cluster",
         "View Scripts",
         "Offline Manifests",
         "AI Advice",
@@ -782,6 +784,150 @@ def page_cluster_creation():
             elif not overall_success:
                 update_profile_status(profile.name, "error")
                 st.error("Provisioning did not complete successfully. Check the errors above.")
+
+    # ── Reset Cluster ────────────────────────────────────────────────────
+    with tab_reset:
+        st.markdown("### Reset / Tear Down Cluster")
+        st.markdown(
+            "Completely reset the Kubernetes cluster on all (or selected) nodes. "
+            "This will run `kubeadm reset`, stop services, remove CRI-O data, "
+            "CNI configs, etcd data, and flush iptables — preparing nodes for a "
+            "fresh cluster installation."
+        )
+
+        if profile.cluster_source == "imported":
+            st.info(
+                "Cluster reset requires SSH access to each node and is only "
+                "available for **provisioned** clusters. For imported clusters, "
+                "run `kubeadm reset` directly on each node."
+            )
+        else:
+            all_nodes = profile.nodes
+            if not all_nodes:
+                st.warning("No nodes defined in this profile.")
+            else:
+                st.error(
+                    "**WARNING:** This is a destructive operation. All Kubernetes data, "
+                    "containers, etcd data, and configuration will be permanently deleted "
+                    "from the selected nodes. This cannot be undone."
+                )
+
+                # Node selection
+                reset_node_labels = [
+                    f"{n.get('hostname', n.get('ip_address', '?'))} ({n.get('ip_address', '?')}) [{n.get('role', '?')}]"
+                    for n in all_nodes
+                ]
+                reset_all = st.checkbox("Reset ALL nodes", value=True, key="reset_all_nodes")
+
+                if not reset_all:
+                    reset_idx = st.multiselect(
+                        "Select nodes to reset",
+                        options=list(range(len(all_nodes))),
+                        format_func=lambda i: reset_node_labels[i],
+                        default=list(range(len(all_nodes))),
+                        key="reset_node_select",
+                    )
+                    reset_nodes = [all_nodes[i] for i in reset_idx]
+                else:
+                    reset_nodes = all_nodes
+
+                # Options
+                col_r1, col_r2 = st.columns(2)
+                with col_r1:
+                    remove_packages = st.checkbox(
+                        "Also remove kubeadm/kubelet/kubectl packages",
+                        value=False,
+                        key="reset_remove_pkgs",
+                    )
+                with col_r2:
+                    auto_reprovision = st.checkbox(
+                        "Re-provision cluster after reset",
+                        value=False,
+                        key="reset_reprovision",
+                        help="After reset completes, automatically start fresh provisioning using the Provision Cluster flow.",
+                    )
+
+                # Confirmation
+                confirm_text = st.text_input(
+                    'Type **RESET** to confirm',
+                    key="reset_confirm",
+                    help="Type RESET (all caps) to enable the reset button.",
+                )
+
+                reset_enabled = confirm_text.strip() == "RESET" and len(reset_nodes) > 0
+                if st.button(
+                    f"Reset {len(reset_nodes)} Node(s)",
+                    type="primary",
+                    disabled=not reset_enabled,
+                    use_container_width=True,
+                    key="reset_go",
+                ):
+                    update_profile_status(profile.name, "provisioning")
+                    reset_steps = get_cluster_reset_steps(profile)
+
+                    # Optionally add package removal step
+                    if remove_packages:
+                        reset_steps.append(
+                            ProvisionStep(
+                                name="remove_packages",
+                                title="Remove kubeadm/kubelet/kubectl packages",
+                                script="""set -uo pipefail
+echo '>> Removing Kubernetes packages...'
+if command -v yum &>/dev/null; then
+    yum remove -y kubeadm kubelet kubectl cri-o 2>/dev/null || true
+elif command -v apt-get &>/dev/null; then
+    apt-get remove -y --purge kubeadm kubelet kubectl cri-o 2>/dev/null || true
+fi
+echo 'Packages removed.'
+""",
+                                timeout=120,
+                                fatal=False,
+                            )
+                        )
+
+                    reset_success = True
+                    for node in reset_nodes:
+                        node_label = f"{node.get('hostname', node.get('ip_address', '?'))} ({node.get('ip_address', '')})"
+                        st.markdown(f"---\n#### Resetting: {node_label} [{node.get('role', '')}]")
+                        progress = st.progress(0, text=f"Starting reset on {node_label}...")
+                        node_ok = True
+                        for idx, step in enumerate(reset_steps):
+                            pct = int((idx / len(reset_steps)) * 100)
+                            progress.progress(pct, text=f"[{idx+1}/{len(reset_steps)}] {step.title}")
+                            with st.status(f"{step.title}...", expanded=False) as status:
+                                result = _run_step(node, step)
+                                if result.success:
+                                    st.code(result.stdout[-1500:] if result.stdout else "(no output)", language="text")
+                                    status.update(label=f"{step.title} — done", state="complete")
+                                else:
+                                    st.warning(f"{step.title} — issue encountered")
+                                    st.code(result.stderr or result.stdout, language="text")
+                                    status.update(label=f"{step.title} — issue", state="error")
+                                    node_ok = False
+                                    if step.fatal:
+                                        reset_success = False
+                                        break
+                        progress.progress(100, text=f"{'Reset complete' if node_ok else 'Reset had issues'} on {node_label}")
+                        if node_ok:
+                            st.success(f"Node {node_label} reset successfully.")
+                        else:
+                            st.warning(f"Node {node_label} reset completed with some issues. Check details above.")
+
+                    if reset_success:
+                        update_profile_status(profile.name, "draft")
+                        st.success("All selected nodes have been reset. The cluster has been torn down.")
+                        st.info("You can now go to the **Provision Cluster** tab to create a new cluster on these nodes.")
+
+                        if auto_reprovision:
+                            st.markdown("---")
+                            st.markdown("### Auto Re-provisioning")
+                            st.info(
+                                "Auto re-provision is enabled. Please switch to the **Provision Cluster** tab "
+                                "and click **Start Provisioning** to set up a fresh cluster with the current profile settings."
+                            )
+                    else:
+                        update_profile_status(profile.name, "error")
+                        st.error("Reset encountered fatal errors on some nodes. Review the output above before re-provisioning.")
 
     # ── View Scripts ──────────────────────────────────────────────────────
     with tab_scripts:

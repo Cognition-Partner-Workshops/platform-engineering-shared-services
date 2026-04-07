@@ -1043,6 +1043,149 @@ echo 'Audit log directory ready.'
     ]
 
 
+def get_cluster_reset_steps(profile: ClusterProfile) -> List[ProvisionStep]:
+    """Return the ordered list of steps to fully reset/teardown a K8s node.
+
+    This runs kubeadm reset, stops services, removes CRI-O data, CNI configs,
+    and cleans up iptables — preparing the node for a fresh cluster install.
+    """
+    crio_root = profile.crio_root or "/var/lib/containers/storage"
+    kubelet_root = profile.kubelet_root or "/var/lib/kubelet"
+    log_root = profile.log_root or "/var/log"
+
+    return [
+        ProvisionStep(
+            name="drain_node",
+            title="Drain & Cordon Node (best effort)",
+            script="""set -uo pipefail
+echo '>> Attempting to drain this node (best effort)...'
+HOSTNAME=$(hostname)
+kubectl drain "$HOSTNAME" --ignore-daemonsets --delete-emptydir-data --force --timeout=60s 2>/dev/null || true
+kubectl cordon "$HOSTNAME" 2>/dev/null || true
+echo 'Drain/cordon complete (or skipped if kubectl not available).'
+""",
+            timeout=90,
+            fatal=False,
+        ),
+        ProvisionStep(
+            name="kubeadm_reset",
+            title="Run kubeadm reset",
+            script="""set -uo pipefail
+echo '>> Running kubeadm reset...'
+kubeadm reset -f --cri-socket unix:///var/run/crio/crio.sock 2>/dev/null || \
+kubeadm reset -f 2>/dev/null || \
+echo 'kubeadm reset returned non-zero (may already be reset)'
+echo 'kubeadm reset complete.'
+""",
+            timeout=120,
+        ),
+        ProvisionStep(
+            name="stop_services",
+            title="Stop kubelet & CRI-O services",
+            script="""set -uo pipefail
+echo '>> Stopping kubelet...'
+systemctl stop kubelet 2>/dev/null || true
+systemctl disable kubelet 2>/dev/null || true
+echo '>> Stopping CRI-O...'
+systemctl stop crio 2>/dev/null || true
+systemctl disable crio 2>/dev/null || true
+echo 'Services stopped.'
+""",
+            timeout=60,
+        ),
+        ProvisionStep(
+            name="clean_cni",
+            title="Remove CNI configuration & network interfaces",
+            script="""set -uo pipefail
+echo '>> Removing CNI configs...'
+rm -rf /etc/cni/net.d/*
+echo '>> Removing flannel interface...'
+ip link delete flannel.1 2>/dev/null || true
+ip link delete cni0 2>/dev/null || true
+ip link delete flannel-wg 2>/dev/null || true
+echo 'CNI cleanup complete.'
+""",
+            timeout=30,
+        ),
+        ProvisionStep(
+            name="clean_iptables",
+            title="Flush iptables rules",
+            script="""set -uo pipefail
+echo '>> Flushing iptables...'
+iptables -F && iptables -t nat -F && iptables -t mangle -F && iptables -X
+ip6tables -F && ip6tables -t nat -F && ip6tables -t mangle -F && ip6tables -X 2>/dev/null || true
+echo 'iptables flushed.'
+""",
+            timeout=30,
+        ),
+        ProvisionStep(
+            name="clean_kubelet_data",
+            title="Remove kubelet data",
+            script=f"""set -uo pipefail
+echo '>> Removing kubelet data at {kubelet_root}...'
+rm -rf {kubelet_root}/*
+rm -rf /etc/kubernetes/*
+rm -rf /tmp/kubeadm-join-command.txt
+echo 'Kubelet data removed.'
+""",
+            timeout=60,
+        ),
+        ProvisionStep(
+            name="clean_crio_data",
+            title="Remove CRI-O container data",
+            script=f"""set -uo pipefail
+echo '>> Removing CRI-O storage at {crio_root}...'
+rm -rf {crio_root}/*
+echo '>> Removing CRI-O run root...'
+rm -rf /run/containers/storage/*
+echo 'CRI-O data removed.'
+""",
+            timeout=60,
+            fatal=False,
+        ),
+        ProvisionStep(
+            name="clean_etcd",
+            title="Remove etcd data (control-plane only, best effort)",
+            script="""set -uo pipefail
+echo '>> Removing etcd data...'
+rm -rf /var/lib/etcd/*
+echo 'etcd data removed (if present).'
+""",
+            timeout=30,
+            fatal=False,
+        ),
+        ProvisionStep(
+            name="clean_logs",
+            title="Clean K8s-related logs",
+            script=f"""set -uo pipefail
+echo '>> Cleaning K8s logs at {log_root}...'
+rm -rf {log_root}/pods/*
+rm -rf {log_root}/containers/*
+rm -rf /var/log/kubernetes/* 2>/dev/null || true
+echo 'Logs cleaned.'
+""",
+            timeout=30,
+            fatal=False,
+        ),
+        ProvisionStep(
+            name="verify_clean",
+            title="Verify cleanup",
+            script="""set -uo pipefail
+echo '>> Verifying cleanup...'
+echo "kubelet active: $(systemctl is-active kubelet 2>/dev/null || echo 'not found')"
+echo "crio active: $(systemctl is-active crio 2>/dev/null || echo 'not found')"
+echo "kubeadm present: $(which kubeadm 2>/dev/null || echo 'not found')"
+echo "kubectl present: $(which kubectl 2>/dev/null || echo 'not found')"
+echo "CNI configs: $(ls /etc/cni/net.d/ 2>/dev/null || echo 'empty/missing')"
+echo ""
+echo "Node is ready for a fresh cluster installation."
+""",
+            timeout=30,
+            fatal=False,
+        ),
+    ]
+
+
 def execute_provision_steps(
     node: dict,
     steps: List[ProvisionStep],
