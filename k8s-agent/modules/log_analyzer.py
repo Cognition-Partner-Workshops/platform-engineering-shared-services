@@ -485,6 +485,59 @@ class LogAnomaly:
 
 
 @dataclass
+class IstioAccessEntry:
+    """A parsed Istio/Envoy access log entry."""
+    timestamp: str = ""
+    method: str = ""
+    path: str = ""
+    protocol: str = ""
+    response_code: int = 0
+    response_flags: str = ""
+    bytes_received: int = 0
+    bytes_sent: int = 0
+    duration_ms: float = 0.0          # total request duration
+    upstream_service_time_ms: float = 0.0  # time spent in upstream
+    upstream_cluster: str = ""
+    upstream_host: str = ""
+    downstream_remote: str = ""
+    downstream_local: str = ""
+    requested_server_name: str = ""
+    authority: str = ""               # Host header
+    user_agent: str = ""
+    raw_line: str = ""
+
+
+@dataclass
+class IstioAnalysisResult:
+    """Result from Istio access log analysis."""
+    total_requests: int = 0
+    parsed_entries: list[IstioAccessEntry] = field(default_factory=list)
+    # Latency percentiles
+    p50_ms: float = 0.0
+    p90_ms: float = 0.0
+    p95_ms: float = 0.0
+    p99_ms: float = 0.0
+    avg_ms: float = 0.0
+    max_ms: float = 0.0
+    min_ms: float = 0.0
+    # Status code distribution
+    status_distribution: dict = field(default_factory=dict)   # code -> count
+    status_class_distribution: dict = field(default_factory=dict)  # "2xx"->count
+    # Error rate
+    error_rate: float = 0.0  # percentage of 4xx+5xx
+    # Slow requests (above p95)
+    slow_requests: list[IstioAccessEntry] = field(default_factory=list)
+    # Per-path stats
+    path_stats: list[dict] = field(default_factory=list)
+    # Per-upstream stats
+    upstream_stats: list[dict] = field(default_factory=list)
+    # Response flags distribution
+    response_flags_dist: dict = field(default_factory=dict)
+    # Timeline buckets (per-minute)
+    timeline_buckets: list[dict] = field(default_factory=list)
+
+
+@dataclass
 class SmartAnalysisResult:
     """Full result from smart log analysis."""
     total_lines: int = 0
@@ -493,6 +546,7 @@ class SmartAnalysisResult:
     patterns: list[dict] = field(default_factory=list)
     summary: dict = field(default_factory=dict)
     timeline_buckets: list[dict] = field(default_factory=list)
+    istio: IstioAnalysisResult | None = None  # populated when Istio logs detected
 
 
 def _tokenize_log(message: str) -> str:
@@ -832,6 +886,274 @@ def smart_analyze(log_text: str, source: str = "") -> SmartAnalysisResult:
             ts_buckets[bucket_key]["errors"] += 1
         elif entry.level == "WARNING":
             ts_buckets[bucket_key]["warnings"] += 1
+
+    result.timeline_buckets = sorted(ts_buckets.values(), key=lambda b: b["timestamp"])
+
+    # 6. Istio / Envoy access log analysis (auto-detected)
+    istio_result = analyze_istio_access_logs(log_text)
+    if istio_result and istio_result.total_requests > 0:
+        result.istio = istio_result
+
+    return result
+
+
+# ══════════════════════════════════════════════════════════════════════════
+#  Istio / Envoy Access Log Analysis
+#  Parses Envoy access log format used by Istio sidecars and provides
+#  response-time analytics, status code distributions, per-path and
+#  per-upstream breakdowns, and slow-request detection.
+# ══════════════════════════════════════════════════════════════════════════
+
+# Envoy default access log format (as emitted by Istio):
+# [%START_TIME%] "%REQ(:METHOD)% %REQ(X-ENVOY-ORIGINAL-PATH?:PATH)% %PROTOCOL%"
+# %RESPONSE_CODE% %RESPONSE_FLAGS% %BYTES_RECEIVED% %BYTES_SENT%
+# %DURATION% %RESP(X-ENVOY-UPSTREAM-SERVICE-TIME)%
+# "%REQ(X-FORWARDED-FOR)%" "%REQ(USER-AGENT)%" "%REQ(X-REQUEST-ID)%"
+# "%REQ(:AUTHORITY)%" "%UPSTREAM_HOST%" %UPSTREAM_CLUSTER%
+# %UPSTREAM_LOCAL_ADDRESS% %DOWNSTREAM_LOCAL_ADDRESS%
+# %DOWNSTREAM_REMOTE_ADDRESS% %REQUESTED_SERVER_NAME% %ROUTE_NAME%
+
+_ISTIO_LOG_RE = re.compile(
+    r'\[(?P<timestamp>[^\]]+)\]\s+'
+    r'"(?P<method>\S+)\s+(?P<path>\S+)\s+(?P<protocol>[^"]*?)"\s+'
+    r'(?P<response_code>\d+)\s+'
+    r'(?P<response_flags>\S+)\s+'
+    r'(?P<bytes_received>\d+)\s+'
+    r'(?P<bytes_sent>\d+)\s+'
+    r'(?P<duration>\d+)\s+'
+    r'(?P<upstream_service_time>\d+|-)\s+'
+    r'"(?P<xff>[^"]*)"\s+'
+    r'"(?P<user_agent>[^"]*)"\s+'
+    r'"(?P<request_id>[^"]*)"\s+'
+    r'"(?P<authority>[^"]*)"\s+'
+    r'"(?P<upstream_host>[^"]*)"\s*'
+    r'(?P<rest>.*)'
+)
+
+# Simpler fallback: JSON-format Istio access logs (structured logging)
+_ISTIO_JSON_KEYS = {
+    "response_code", "duration", "method", "path", "upstream_service_time",
+    "upstream_cluster", "authority", "bytes_received", "bytes_sent",
+}
+
+
+def _parse_istio_line(line: str) -> IstioAccessEntry | None:
+    """Try to parse a single line as an Istio/Envoy access log entry."""
+    import json as _json
+
+    # Try structured JSON format first
+    stripped = line.strip()
+    if stripped.startswith("{"):
+        try:
+            obj = _json.loads(stripped)
+            # Verify it looks like an Istio access log
+            if "response_code" in obj or "method" in obj or "duration" in obj:
+                duration = obj.get("duration", 0)
+                ust = obj.get("upstream_service_time", 0)
+                # Istio JSON logs may use different field names
+                return IstioAccessEntry(
+                    timestamp=str(obj.get("start_time", obj.get("timestamp", ""))),
+                    method=str(obj.get("method", obj.get("request_method", ""))),
+                    path=str(obj.get("path", obj.get("request_path", ""))),
+                    protocol=str(obj.get("protocol", "")),
+                    response_code=int(obj.get("response_code", 0)),
+                    response_flags=str(obj.get("response_flags", "-")),
+                    bytes_received=int(obj.get("bytes_received", 0)),
+                    bytes_sent=int(obj.get("bytes_sent", 0)),
+                    duration_ms=float(duration) if duration not in ("-", "", None) else 0.0,
+                    upstream_service_time_ms=float(ust) if ust not in ("-", "", None) else 0.0,
+                    upstream_cluster=str(obj.get("upstream_cluster", "")),
+                    upstream_host=str(obj.get("upstream_host", "")),
+                    authority=str(obj.get("authority", obj.get("host", ""))),
+                    user_agent=str(obj.get("user_agent", "")),
+                    downstream_remote=str(obj.get("downstream_remote_address", "")),
+                    downstream_local=str(obj.get("downstream_local_address", "")),
+                    requested_server_name=str(obj.get("requested_server_name", "")),
+                    raw_line=line,
+                )
+        except (_json.JSONDecodeError, ValueError, TypeError):
+            pass
+
+    # Try standard Envoy text format
+    m = _ISTIO_LOG_RE.match(stripped)
+    if m:
+        ust = m.group("upstream_service_time")
+        rest = m.group("rest").strip()
+        # Parse remaining fields from rest (upstream_cluster, etc.)
+        rest_parts = rest.split()
+        upstream_cluster = rest_parts[0] if rest_parts else ""
+        return IstioAccessEntry(
+            timestamp=m.group("timestamp"),
+            method=m.group("method"),
+            path=m.group("path"),
+            protocol=m.group("protocol"),
+            response_code=int(m.group("response_code")),
+            response_flags=m.group("response_flags"),
+            bytes_received=int(m.group("bytes_received")),
+            bytes_sent=int(m.group("bytes_sent")),
+            duration_ms=float(m.group("duration")),
+            upstream_service_time_ms=float(ust) if ust != "-" else 0.0,
+            upstream_cluster=upstream_cluster,
+            upstream_host=m.group("upstream_host"),
+            authority=m.group("authority"),
+            user_agent=m.group("user_agent"),
+            downstream_remote=m.group("xff") or "",
+            raw_line=line,
+        )
+
+    return None
+
+
+def _is_likely_istio_log(lines: list[str], sample_size: int = 20) -> bool:
+    """Heuristic: check if a meaningful fraction of lines look like Istio access logs."""
+    sample = lines[:sample_size]
+    parsed = sum(1 for l in sample if _parse_istio_line(l) is not None)
+    return parsed >= max(1, len(sample) * 0.3)  # at least 30% parse successfully
+
+
+def analyze_istio_access_logs(log_text: str) -> IstioAnalysisResult | None:
+    """Parse and analyze Istio/Envoy access logs.
+
+    Returns None if the logs don't look like Istio access logs.
+    Returns an IstioAnalysisResult with latency stats, status distribution,
+    per-path breakdowns, per-upstream breakdowns, and slow requests.
+    """
+    lines = [l.strip() for l in log_text.strip().split("\n") if l.strip()]
+    if not lines:
+        return None
+
+    # Quick heuristic — bail early if this doesn't look like Istio logs
+    if not _is_likely_istio_log(lines):
+        return None
+
+    entries: list[IstioAccessEntry] = []
+    for line in lines:
+        entry = _parse_istio_line(line)
+        if entry is not None:
+            entries.append(entry)
+
+    if not entries:
+        return None
+
+    result = IstioAnalysisResult(
+        total_requests=len(entries),
+        parsed_entries=entries,
+    )
+
+    # ── Latency percentiles ──────────────────────────────────────────
+    import numpy as np
+    durations = np.array([e.duration_ms for e in entries])
+    if len(durations) > 0:
+        result.avg_ms = float(np.mean(durations))
+        result.min_ms = float(np.min(durations))
+        result.max_ms = float(np.max(durations))
+        result.p50_ms = float(np.percentile(durations, 50))
+        result.p90_ms = float(np.percentile(durations, 90))
+        result.p95_ms = float(np.percentile(durations, 95))
+        result.p99_ms = float(np.percentile(durations, 99))
+
+    # ── Status code distribution ─────────────────────────────────────
+    status_counter: Counter = Counter()
+    class_counter: Counter = Counter()
+    for e in entries:
+        status_counter[e.response_code] += 1
+        class_label = f"{e.response_code // 100}xx"
+        class_counter[class_label] += 1
+
+    result.status_distribution = dict(status_counter.most_common())
+    result.status_class_distribution = dict(class_counter.most_common())
+
+    # Error rate (4xx + 5xx)
+    error_count = sum(1 for e in entries if e.response_code >= 400)
+    result.error_rate = (error_count / len(entries)) * 100 if entries else 0.0
+
+    # ── Slow requests (above p95) ────────────────────────────────────
+    p95_threshold = result.p95_ms
+    slow = [e for e in entries if e.duration_ms > p95_threshold]
+    # Sort by duration descending, limit to top 50
+    slow.sort(key=lambda e: e.duration_ms, reverse=True)
+    result.slow_requests = slow[:50]
+
+    # ── Per-path stats ───────────────────────────────────────────────
+    path_groups: dict[str, list[IstioAccessEntry]] = {}
+    for e in entries:
+        # Normalize path: strip query params for grouping
+        base_path = e.path.split("?")[0] if e.path else "(unknown)"
+        path_groups.setdefault(base_path, []).append(e)
+
+    path_stats = []
+    for path, group in path_groups.items():
+        durations_g = [e.duration_ms for e in group]
+        errors_g = sum(1 for e in group if e.response_code >= 400)
+        path_stats.append({
+            "path": path,
+            "count": len(group),
+            "avg_ms": round(sum(durations_g) / len(durations_g), 1) if durations_g else 0,
+            "p50_ms": round(float(np.percentile(durations_g, 50)), 1) if durations_g else 0,
+            "p95_ms": round(float(np.percentile(durations_g, 95)), 1) if durations_g else 0,
+            "p99_ms": round(float(np.percentile(durations_g, 99)), 1) if durations_g else 0,
+            "max_ms": round(max(durations_g), 1) if durations_g else 0,
+            "error_count": errors_g,
+            "error_rate": round((errors_g / len(group)) * 100, 1) if group else 0,
+        })
+    path_stats.sort(key=lambda p: p["count"], reverse=True)
+    result.path_stats = path_stats[:50]
+
+    # ── Per-upstream stats ───────────────────────────────────────────
+    upstream_groups: dict[str, list[IstioAccessEntry]] = {}
+    for e in entries:
+        key = e.upstream_cluster or e.upstream_host or "(direct/unknown)"
+        upstream_groups.setdefault(key, []).append(e)
+
+    upstream_stats = []
+    for upstream, group in upstream_groups.items():
+        ust_vals = [e.upstream_service_time_ms for e in group if e.upstream_service_time_ms > 0]
+        dur_vals = [e.duration_ms for e in group]
+        errors_g = sum(1 for e in group if e.response_code >= 400)
+        upstream_stats.append({
+            "upstream": upstream,
+            "count": len(group),
+            "avg_duration_ms": round(sum(dur_vals) / len(dur_vals), 1) if dur_vals else 0,
+            "avg_upstream_ms": round(sum(ust_vals) / len(ust_vals), 1) if ust_vals else 0,
+            "p95_duration_ms": round(float(np.percentile(dur_vals, 95)), 1) if dur_vals else 0,
+            "p95_upstream_ms": round(float(np.percentile(ust_vals, 95)), 1) if ust_vals else 0,
+            "error_count": errors_g,
+            "error_rate": round((errors_g / len(group)) * 100, 1) if group else 0,
+        })
+    upstream_stats.sort(key=lambda u: u["count"], reverse=True)
+    result.upstream_stats = upstream_stats[:30]
+
+    # ── Response flags distribution ──────────────────────────────────
+    flags_counter: Counter = Counter()
+    for e in entries:
+        flag = e.response_flags if e.response_flags and e.response_flags != "-" else "(none)"
+        flags_counter[flag] += 1
+    result.response_flags_dist = dict(flags_counter.most_common())
+
+    # ── Timeline buckets (per-minute) ────────────────────────────────
+    ts_buckets: dict[str, dict] = {}
+    for e in entries:
+        # Try to extract minute-level bucket from timestamp
+        ts = e.timestamp
+        if ts:
+            # Envoy format: 2024-01-15T10:30:45.123Z or similar
+            bucket_key = ts[:16] if len(ts) >= 16 else ts[:10]
+        else:
+            bucket_key = "unknown"
+        if bucket_key not in ts_buckets:
+            ts_buckets[bucket_key] = {
+                "timestamp": bucket_key, "total": 0, "errors": 0,
+                "avg_duration": 0.0, "_durations": [],
+            }
+        ts_buckets[bucket_key]["total"] += 1
+        ts_buckets[bucket_key]["_durations"].append(e.duration_ms)
+        if e.response_code >= 400:
+            ts_buckets[bucket_key]["errors"] += 1
+
+    # Compute avg duration per bucket
+    for bucket in ts_buckets.values():
+        durs = bucket.pop("_durations", [])
+        bucket["avg_duration"] = round(sum(durs) / len(durs), 1) if durs else 0
 
     result.timeline_buckets = sorted(ts_buckets.values(), key=lambda b: b["timestamp"])
 

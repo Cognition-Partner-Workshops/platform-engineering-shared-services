@@ -85,6 +85,7 @@ from modules.log_analyzer import (
     detect_anomalies,
     mine_log_patterns,
     summarize_logs,
+    analyze_istio_access_logs,
 )
 from modules.llm_client import query_llm, stream_llm
 
@@ -2062,6 +2063,203 @@ def page_log_analysis():
                         st.plotly_chart(fig, use_container_width=True)
                 except ImportError:
                     pass
+
+            # ── Istio / Envoy Access Log Analysis ────────────────────────
+            if sa_result.istio:
+                istio = sa_result.istio
+                st.markdown("---")
+                st.markdown("#### Istio / Envoy Access Log Analysis")
+                st.markdown(
+                    "Detected **Istio/Envoy access logs** — showing response time analytics, "
+                    "status code distribution, per-path and per-upstream breakdowns, and slow requests."
+                )
+
+                # ── Overview metrics ──
+                icol1, icol2, icol3, icol4, icol5, icol6 = st.columns(6)
+                icol1.metric("Total Requests", f"{istio.total_requests:,}")
+                icol2.metric("Avg Latency", f"{istio.avg_ms:.0f} ms")
+                icol3.metric("P50", f"{istio.p50_ms:.0f} ms")
+                icol4.metric("P95", f"{istio.p95_ms:.0f} ms")
+                icol5.metric("P99", f"{istio.p99_ms:.0f} ms")
+                icol6.metric("Error Rate", f"{istio.error_rate:.1f}%")
+
+                if istio.error_rate > 10:
+                    st.error(f"High error rate: **{istio.error_rate:.1f}%** of requests returned 4xx/5xx.")
+                elif istio.error_rate > 2:
+                    st.warning(f"Elevated error rate: **{istio.error_rate:.1f}%** of requests returned 4xx/5xx.")
+
+                icol7, icol8, icol9 = st.columns(3)
+                icol7.metric("Min Latency", f"{istio.min_ms:.0f} ms")
+                icol8.metric("Max Latency", f"{istio.max_ms:.0f} ms")
+                icol9.metric("P90", f"{istio.p90_ms:.0f} ms")
+
+                # ── Status Code Distribution ──
+                st.markdown("##### Status Code Distribution")
+                if istio.status_distribution:
+                    import pandas as pd
+                    status_data = [{"Status Code": str(k), "Count": v} for k, v in sorted(istio.status_distribution.items())]
+                    df_status = pd.DataFrame(status_data)
+                    scol_t, scol_c = st.columns([1, 1])
+                    with scol_t:
+                        st.dataframe(df_status, use_container_width=True, hide_index=True)
+                    with scol_c:
+                        try:
+                            import plotly.express as px
+                            fig = px.pie(
+                                df_status, names="Status Code", values="Count",
+                                title="Response Status Codes",
+                                color="Status Code",
+                                color_discrete_map={
+                                    str(k): ("#2ecc71" if k < 300 else "#f39c12" if k < 400 else "#e67e22" if k < 500 else "#e74c3c")
+                                    for k in istio.status_distribution
+                                },
+                            )
+                            fig.update_layout(height=350)
+                            st.plotly_chart(fig, use_container_width=True)
+                        except ImportError:
+                            pass
+
+                # ── Status class summary ──
+                if istio.status_class_distribution:
+                    class_cols = st.columns(len(istio.status_class_distribution))
+                    for idx, (cls, cnt) in enumerate(sorted(istio.status_class_distribution.items())):
+                        class_cols[idx].metric(cls, cnt)
+
+                # ── Response Flags ──
+                if istio.response_flags_dist and len(istio.response_flags_dist) > 1:
+                    with st.expander("Response Flags (Envoy)", expanded=False):
+                        st.markdown(
+                            "Envoy response flags indicate special conditions: "
+                            "`UF`=upstream failure, `UH`=no healthy upstream, "
+                            "`UT`=upstream timeout, `NR`=no route, `DC`=downstream disconnected, etc."
+                        )
+                        import pandas as pd
+                        flags_data = [{"Flag": k, "Count": v} for k, v in istio.response_flags_dist.items()]
+                        st.dataframe(pd.DataFrame(flags_data), use_container_width=True, hide_index=True)
+
+                # ── Latency Distribution Histogram ──
+                st.markdown("##### Latency Distribution")
+                try:
+                    import plotly.express as px
+                    durations = [e.duration_ms for e in istio.parsed_entries]
+                    fig = px.histogram(
+                        x=durations, nbins=50,
+                        labels={"x": "Duration (ms)", "y": "Count"},
+                        title="Request Latency Distribution",
+                    )
+                    fig.add_vline(x=istio.p50_ms, line_dash="dash", line_color="green",
+                                  annotation_text=f"P50: {istio.p50_ms:.0f}ms")
+                    fig.add_vline(x=istio.p95_ms, line_dash="dash", line_color="orange",
+                                  annotation_text=f"P95: {istio.p95_ms:.0f}ms")
+                    fig.add_vline(x=istio.p99_ms, line_dash="dash", line_color="red",
+                                  annotation_text=f"P99: {istio.p99_ms:.0f}ms")
+                    fig.update_layout(height=400)
+                    st.plotly_chart(fig, use_container_width=True)
+                except ImportError:
+                    pass
+
+                # ── Per-Path Response Time ──
+                if istio.path_stats:
+                    st.markdown("##### Per-Path Response Time")
+                    import pandas as pd
+                    path_data = []
+                    for ps in istio.path_stats[:30]:
+                        path_data.append({
+                            "Path": ps["path"][:80],
+                            "Requests": ps["count"],
+                            "Avg (ms)": ps["avg_ms"],
+                            "P50 (ms)": ps["p50_ms"],
+                            "P95 (ms)": ps["p95_ms"],
+                            "P99 (ms)": ps["p99_ms"],
+                            "Max (ms)": ps["max_ms"],
+                            "Errors": ps["error_count"],
+                            "Error %": ps["error_rate"],
+                        })
+                    df_paths = pd.DataFrame(path_data)
+                    st.dataframe(df_paths, use_container_width=True, hide_index=True)
+
+                    # Bar chart of top paths by P95
+                    try:
+                        import plotly.express as px
+                        top_paths = istio.path_stats[:15]
+                        fig = px.bar(
+                            x=[p["path"][:50] for p in top_paths],
+                            y=[p["p95_ms"] for p in top_paths],
+                            labels={"x": "Path", "y": "P95 Latency (ms)"},
+                            title="Top Paths by P95 Latency",
+                            color=[p["error_rate"] for p in top_paths],
+                            color_continuous_scale="RdYlGn_r",
+                        )
+                        fig.update_layout(height=400, xaxis_tickangle=-45,
+                                          coloraxis_colorbar_title="Error %")
+                        st.plotly_chart(fig, use_container_width=True)
+                    except ImportError:
+                        pass
+
+                # ── Per-Upstream Service Stats ──
+                if istio.upstream_stats:
+                    st.markdown("##### Per-Upstream Service Stats")
+                    import pandas as pd
+                    up_data = []
+                    for us in istio.upstream_stats[:20]:
+                        up_data.append({
+                            "Upstream": us["upstream"][:60],
+                            "Requests": us["count"],
+                            "Avg Duration (ms)": us["avg_duration_ms"],
+                            "Avg Upstream (ms)": us["avg_upstream_ms"],
+                            "P95 Duration (ms)": us["p95_duration_ms"],
+                            "P95 Upstream (ms)": us["p95_upstream_ms"],
+                            "Errors": us["error_count"],
+                            "Error %": us["error_rate"],
+                        })
+                    st.dataframe(pd.DataFrame(up_data), use_container_width=True, hide_index=True)
+
+                # ── Slow Requests ──
+                if istio.slow_requests:
+                    with st.expander(f"Slow Requests (>{istio.p95_ms:.0f}ms — top {len(istio.slow_requests)})", expanded=True):
+                        import pandas as pd
+                        slow_data = []
+                        for sr in istio.slow_requests[:30]:
+                            slow_data.append({
+                                "Duration (ms)": sr.duration_ms,
+                                "Upstream (ms)": sr.upstream_service_time_ms,
+                                "Method": sr.method,
+                                "Path": sr.path[:80],
+                                "Status": sr.response_code,
+                                "Flags": sr.response_flags,
+                                "Upstream Host": sr.upstream_host[:40],
+                                "Timestamp": sr.timestamp[:25] if sr.timestamp else "",
+                            })
+                        st.dataframe(pd.DataFrame(slow_data), use_container_width=True, hide_index=True)
+
+                # ── Istio Request Timeline ──
+                if istio.timeline_buckets and len(istio.timeline_buckets) > 1:
+                    st.markdown("##### Request Timeline")
+                    try:
+                        import plotly.graph_objects as go
+                        ts_labels = [b["timestamp"] for b in istio.timeline_buckets if b["timestamp"] != "unknown"]
+                        ts_totals = [b["total"] for b in istio.timeline_buckets if b["timestamp"] != "unknown"]
+                        ts_errors = [b["errors"] for b in istio.timeline_buckets if b["timestamp"] != "unknown"]
+                        ts_avg_dur = [b["avg_duration"] for b in istio.timeline_buckets if b["timestamp"] != "unknown"]
+
+                        if ts_labels:
+                            fig = go.Figure()
+                            fig.add_trace(go.Bar(x=ts_labels, y=ts_totals, name="Requests", marker_color="#326CE5"))
+                            fig.add_trace(go.Bar(x=ts_labels, y=ts_errors, name="Errors (4xx+5xx)", marker_color="#FF4B4B"))
+                            fig.add_trace(go.Scatter(
+                                x=ts_labels, y=ts_avg_dur, name="Avg Latency (ms)",
+                                mode="lines+markers", yaxis="y2", line=dict(color="orange"),
+                            ))
+                            fig.update_layout(
+                                title="Requests & Latency Over Time",
+                                yaxis_title="Request Count",
+                                yaxis2=dict(title="Avg Latency (ms)", overlaying="y", side="right"),
+                                barmode="overlay",
+                                height=400,
+                            )
+                            st.plotly_chart(fig, use_container_width=True)
+                    except ImportError:
+                        pass
 
     # ── AI Log Analysis ───────────────────────────────────────────────────
     with tab_ai:
