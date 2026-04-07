@@ -899,16 +899,12 @@ def page_cluster_debugger():
             return
         cp_node = cp_nodes[0]
 
-    # kubectl availability check for imported clusters
+    # kubectl availability warning for imported clusters
     if profile.cluster_source == "imported" and not get_kubectl_path():
-        st.error(
-            "**kubectl not found** on this machine.\n\n"
-            "Install it with:\n```\n"
-            "curl -LO https://dl.k8s.io/release/$(curl -Ls https://dl.k8s.io/release/stable.txt)/bin/linux/amd64/kubectl\n"
-            "chmod +x kubectl && sudo mv kubectl /usr/local/bin/\n```\n"
-            "Or see: https://kubernetes.io/docs/tasks/tools/"
+        st.warning(
+            "kubectl not found on this machine. Commands will fail until kubectl is installed.\n\n"
+            "Install: `curl -LO https://dl.k8s.io/release/$(curl -Ls https://dl.k8s.io/release/stable.txt)/bin/linux/amd64/kubectl && chmod +x kubectl && mv kubectl ~/.local/bin/`"
         )
-        return
 
     available_commands = get_available_commands(profile)
 
@@ -1073,17 +1069,6 @@ def page_monitoring_setup():
             return
         cp_node = cp_nodes[0]
 
-    # kubectl availability check for imported clusters
-    if profile.cluster_source == "imported" and not get_kubectl_path():
-        st.error(
-            "**kubectl not found** on this machine.\n\n"
-            "Install it with:\n```\n"
-            "curl -LO https://dl.k8s.io/release/$(curl -Ls https://dl.k8s.io/release/stable.txt)/bin/linux/amd64/kubectl\n"
-            "chmod +x kubectl && sudo mv kubectl /usr/local/bin/\n```\n"
-            "Or see: https://kubernetes.io/docs/tasks/tools/"
-        )
-        return
-
     # Namespace selection — auto-fetch from cluster for imported clusters
     if profile.cluster_source == "imported" and profile.kubeconfig_content:
         cluster_ns = fetch_namespaces(profile.kubeconfig_content)
@@ -1097,8 +1082,9 @@ def page_monitoring_setup():
     else:
         namespace = st.text_input("Monitoring Namespace", value="monitoring", key="mon_ns_txt")
 
-    tab_install, tab_dashboards, tab_alerts, tab_status, tab_scripts, tab_advice = st.tabs([
+    tab_install, tab_metrics, tab_dashboards, tab_alerts, tab_status, tab_scripts, tab_advice = st.tabs([
         "Install Stack",
+        "Metrics Components",
         "Dashboards",
         "Alert Rules",
         "Status",
@@ -1144,6 +1130,142 @@ def page_monitoring_setup():
                     else:
                         st.error("Alert rules installation failed")
                         st.code(result.stderr, language="text")
+
+    # ── Metrics Components ────────────────────────────────────────────────
+    with tab_metrics:
+        st.markdown("### Metrics Components")
+        st.markdown(
+            "Install **metrics-server** (enables `kubectl top`) and/or "
+            "**kube-state-metrics** (exposes workload/object-level metrics to Prometheus)."
+        )
+
+        met_col1, met_col2 = st.columns(2)
+
+        with met_col1:
+            st.markdown("#### metrics-server")
+            st.markdown(
+                "Provides CPU/memory usage for pods and nodes. "
+                "Required for `kubectl top` and HPA autoscaling."
+            )
+            ms_insecure = st.checkbox(
+                "Add `--kubelet-insecure-tls` flag (self-signed certs)",
+                value=True,
+                key="ms_insecure",
+            )
+            if st.button("Install metrics-server", type="primary", key="install_ms"):
+                ms_url = (
+                    "https://github.com/kubernetes-sigs/metrics-server"
+                    "/releases/latest/download/components.yaml"
+                )
+                with st.status("Installing metrics-server...", expanded=True):
+                    # Apply the manifest
+                    apply_result = run_kubectl(
+                        profile,
+                        f"apply -f {ms_url}",
+                        timeout=60,
+                    )
+                    if apply_result.success:
+                        st.write("Manifest applied successfully.")
+                        st.code(apply_result.stdout, language="text")
+                        # Patch for insecure TLS if requested
+                        if ms_insecure:
+                            patch_cmd = (
+                                "patch deployment metrics-server -n kube-system "
+                                "--type=json -p="
+                                "'[{\"op\":\"add\",\"path\":\"/spec/template/spec/containers/0/args/-\","
+                                "\"value\":\"--kubelet-insecure-tls\"}]'"
+                            )
+                            patch_result = run_kubectl(profile, patch_cmd, timeout=30)
+                            if patch_result.success:
+                                st.success("metrics-server installed with --kubelet-insecure-tls!")
+                            else:
+                                st.warning("Installed but TLS patch may have failed (already applied?).")
+                                st.code(patch_result.stderr, language="text")
+                        else:
+                            st.success("metrics-server installed!")
+                    else:
+                        st.error("metrics-server installation failed")
+                        st.code(apply_result.stderr, language="text")
+
+            # Check status
+            if st.button("Check metrics-server status", key="ms_status"):
+                with st.spinner("Checking..."):
+                    result = run_kubectl(
+                        profile,
+                        "get deployment metrics-server -n kube-system -o wide",
+                        timeout=15,
+                    )
+                    if result.success:
+                        st.code(result.stdout, language="text")
+                    else:
+                        st.warning("metrics-server not found or not ready.")
+                        st.code(result.stderr, language="text")
+
+        with met_col2:
+            st.markdown("#### kube-state-metrics")
+            st.markdown(
+                "Exposes object-level metrics (Deployments, Pods, Nodes, etc.) "
+                "to Prometheus for dashboards and alerting."
+            )
+            ksm_ns = namespace  # reuse the monitoring namespace
+            if st.button("Install kube-state-metrics", type="primary", key="install_ksm"):
+                with st.status("Installing kube-state-metrics...", expanded=True):
+                    # Use helm if available, otherwise apply raw manifest
+                    helm_cmd = (
+                        f"helm install kube-state-metrics "
+                        f"oci://registry-1.docker.io/bitnamicharts/kube-state-metrics "
+                        f"-n {ksm_ns} --create-namespace"
+                    )
+                    result = run_kubectl(profile, helm_cmd, timeout=120)
+                    if result.success:
+                        st.success("kube-state-metrics installed via Helm!")
+                        st.code(result.stdout, language="text")
+                    else:
+                        st.warning("Helm install failed, trying kubectl apply...")
+                        st.code(result.stderr, language="text")
+                        # Fallback: direct manifest from GitHub
+                        ksm_url = (
+                            "https://raw.githubusercontent.com/kubernetes/"
+                            "kube-state-metrics/main/examples/standard/service.yaml"
+                        )
+                        apply_result = run_kubectl(
+                            profile,
+                            f"apply -f https://raw.githubusercontent.com/kubernetes/kube-state-metrics/main/examples/standard/ 2>/dev/null || echo 'Manual install required'",
+                            timeout=60,
+                        )
+                        if apply_result.success:
+                            st.success("kube-state-metrics applied!")
+                            st.code(apply_result.stdout, language="text")
+                        else:
+                            st.error(
+                                "Could not install kube-state-metrics automatically.\n\n"
+                                "Manual install:\n"
+                                "```\nhelm repo add prometheus-community "
+                                "https://prometheus-community.github.io/helm-charts\n"
+                                "helm install kube-state-metrics "
+                                f"prometheus-community/kube-state-metrics -n {ksm_ns}\n```"
+                            )
+
+            if st.button("Check kube-state-metrics status", key="ksm_status"):
+                with st.spinner("Checking..."):
+                    result = run_kubectl(
+                        profile,
+                        f"get pods -n {ksm_ns} -l app.kubernetes.io/name=kube-state-metrics -o wide",
+                        timeout=15,
+                    )
+                    if result.success and result.stdout.strip():
+                        st.code(result.stdout, language="text")
+                    else:
+                        # Try broader search
+                        result2 = run_kubectl(
+                            profile,
+                            "get pods -A -l app.kubernetes.io/name=kube-state-metrics -o wide",
+                            timeout=15,
+                        )
+                        if result2.success and result2.stdout.strip():
+                            st.code(result2.stdout, language="text")
+                        else:
+                            st.warning("kube-state-metrics not found on the cluster.")
 
     # ── Dashboards ────────────────────────────────────────────────────────
     with tab_dashboards:
@@ -1248,17 +1370,6 @@ def page_log_analysis():
             st.error("No control-plane node defined in this profile.")
             return
         cp_node = cp_nodes[0]
-
-    # kubectl availability check for imported clusters
-    if profile.cluster_source == "imported" and not get_kubectl_path():
-        st.error(
-            "**kubectl not found** on this machine.\n\n"
-            "Install it with:\n```\n"
-            "curl -LO https://dl.k8s.io/release/$(curl -Ls https://dl.k8s.io/release/stable.txt)/bin/linux/amd64/kubectl\n"
-            "chmod +x kubectl && sudo mv kubectl /usr/local/bin/\n```\n"
-            "Or see: https://kubernetes.io/docs/tasks/tools/"
-        )
-        return
 
     # Pre-fetch namespaces for imported clusters (used by Pod Logs tab)
     _cluster_namespaces: list[str] = []
@@ -1506,24 +1617,15 @@ def page_resource_viewer():
         )
         return
 
-    # kubectl availability check for imported clusters
-    if profile.cluster_source == "imported" and not get_kubectl_path():
-        st.error(
-            "**kubectl not found** on this machine.\n\n"
-            "Install it with:\n```\n"
-            "curl -LO https://dl.k8s.io/release/$(curl -Ls https://dl.k8s.io/release/stable.txt)/bin/linux/amd64/kubectl\n"
-            "chmod +x kubectl && sudo mv kubectl /usr/local/bin/\n```\n"
-            "Or see: https://kubernetes.io/docs/tasks/tools/"
-        )
-        return
-
     # Pre-fetch namespaces for imported clusters
     _rv_namespaces: list[str] = []
     if profile.cluster_source == "imported" and profile.kubeconfig_content:
         _rv_namespaces = fetch_namespaces(profile.kubeconfig_content)
 
-    tab_resources, tab_node_health, tab_rbac, tab_helm, tab_events = st.tabs([
+    tab_resources, tab_scaling, tab_shell, tab_node_health, tab_rbac, tab_helm, tab_events = st.tabs([
         "Cluster Resources",
+        "Scaling",
+        "Pod Shell",
         "Node Health",
         "RBAC Viewer",
         "Helm Releases",
@@ -1597,26 +1699,65 @@ def page_resource_viewer():
         # Describe a specific resource
         st.markdown("---")
         st.markdown("#### Describe a Resource")
-        desc_col1, desc_col2 = st.columns(2)
-        with desc_col1:
-            desc_name = st.text_input(
-                "Resource name",
-                placeholder="e.g., my-pod-xyz",
-                key="desc_name",
-            )
+        desc_col1, desc_col2, desc_col3 = st.columns([2, 2, 1])
         with desc_col2:
             if _rv_namespaces:
                 desc_ns = st.selectbox(
-                    "Namespace (if applicable)",
+                    "Namespace",
                     options=_rv_namespaces,
                     index=_rv_namespaces.index("default") if "default" in _rv_namespaces else 0,
                     key="desc_ns",
                 )
             else:
                 desc_ns = st.text_input(
-                    "Namespace (if applicable)",
+                    "Namespace",
                     value="default",
                     key="desc_ns",
+                )
+        with desc_col3:
+            desc_refresh = st.button("Load names", key="desc_load_names")
+
+        # Fetch resource names for the dropdown
+        _desc_resource_names: list[str] = []
+        if desc_refresh or st.session_state.get("_desc_cached_names"):
+            if desc_refresh:
+                # Determine the kubectl get command for names
+                _desc_cmd_base, _desc_ns_supported = _RESOURCE_TYPES[resource_type]
+                _names_cmd = f"{_desc_cmd_base} -o name"
+                if _desc_ns_supported and desc_ns:
+                    _names_cmd += f" -n {desc_ns}"
+                elif _desc_ns_supported:
+                    _names_cmd += " -A"
+                _names_result = run_kubectl(profile, _names_cmd, timeout=15)
+                if _names_result.success and _names_result.stdout.strip():
+                    raw_names = _names_result.stdout.strip().split("\n")
+                    # Strip resource type prefix (e.g. "pod/my-pod" -> "my-pod")
+                    _desc_resource_names = [
+                        n.split("/", 1)[-1] if "/" in n else n
+                        for n in raw_names if n.strip()
+                    ]
+                    st.session_state["_desc_cached_names"] = _desc_resource_names
+                    st.session_state["_desc_cached_type"] = resource_type
+                else:
+                    _desc_resource_names = []
+                    st.session_state["_desc_cached_names"] = []
+            else:
+                # Use cached names if resource type matches
+                if st.session_state.get("_desc_cached_type") == resource_type:
+                    _desc_resource_names = st.session_state.get("_desc_cached_names", [])
+
+        with desc_col1:
+            if _desc_resource_names:
+                desc_name = st.selectbox(
+                    "Resource name",
+                    options=_desc_resource_names,
+                    key="desc_name_select",
+                )
+            else:
+                desc_name = st.text_input(
+                    "Resource name",
+                    placeholder="Click 'Load names' or type a name",
+                    key="desc_name",
                 )
 
         if st.button("Describe", key="describe_res") and desc_name:
@@ -1642,6 +1783,255 @@ def page_resource_viewer():
                 else:
                     st.error("Describe failed")
                     st.code(result.stderr, language="text")
+
+    # ── Scaling ──────────────────────────────────────────────────────────
+    with tab_scaling:
+        st.markdown("### Deployment Scaling")
+        st.markdown("Scale deployment replicas up or down.")
+
+        sc_col1, sc_col2 = st.columns(2)
+        with sc_col1:
+            if _rv_namespaces:
+                sc_ns = st.selectbox(
+                    "Namespace",
+                    options=_rv_namespaces,
+                    index=_rv_namespaces.index("default") if "default" in _rv_namespaces else 0,
+                    key="sc_ns",
+                )
+            else:
+                sc_ns = st.text_input("Namespace", value="default", key="sc_ns")
+        with sc_col2:
+            sc_load = st.button("Load Deployments", key="sc_load")
+
+        # Fetch deployments for the dropdown
+        _sc_deployments: list[str] = []
+        _sc_dep_info: dict[str, str] = {}
+        if sc_load or st.session_state.get("_sc_cached_deps"):
+            if sc_load:
+                dep_result = run_kubectl(
+                    profile,
+                    f"get deployments -n {sc_ns} -o custom-columns=NAME:.metadata.name,REPLICAS:.spec.replicas,AVAILABLE:.status.availableReplicas --no-headers",
+                    timeout=15,
+                )
+                if dep_result.success and dep_result.stdout.strip():
+                    for line in dep_result.stdout.strip().split("\n"):
+                        parts = line.split()
+                        if parts:
+                            dep_name = parts[0]
+                            _sc_deployments.append(dep_name)
+                            replicas = parts[1] if len(parts) > 1 else "?"
+                            available = parts[2] if len(parts) > 2 else "?"
+                            _sc_dep_info[dep_name] = f"{replicas} replicas ({available} available)"
+                    st.session_state["_sc_cached_deps"] = _sc_deployments
+                    st.session_state["_sc_cached_dep_info"] = _sc_dep_info
+                    st.session_state["_sc_cached_ns"] = sc_ns
+                else:
+                    st.session_state["_sc_cached_deps"] = []
+                    st.session_state["_sc_cached_dep_info"] = {}
+                    if dep_result.success:
+                        st.info(f"No deployments found in namespace '{sc_ns}'.")
+                    else:
+                        st.error("Failed to list deployments")
+                        st.code(dep_result.stderr, language="text")
+            else:
+                if st.session_state.get("_sc_cached_ns") == sc_ns:
+                    _sc_deployments = st.session_state.get("_sc_cached_deps", [])
+                    _sc_dep_info = st.session_state.get("_sc_cached_dep_info", {})
+
+        if _sc_deployments:
+            sc_dep_col1, sc_dep_col2, sc_dep_col3 = st.columns([3, 1, 1])
+            with sc_dep_col1:
+                sc_selected = st.selectbox(
+                    "Deployment",
+                    options=_sc_deployments,
+                    format_func=lambda d: f"{d}  ({_sc_dep_info.get(d, '')})",
+                    key="sc_selected",
+                )
+            with sc_dep_col2:
+                sc_replicas = st.number_input(
+                    "Target replicas",
+                    min_value=0,
+                    max_value=100,
+                    value=1,
+                    key="sc_replicas",
+                )
+            with sc_dep_col3:
+                st.markdown("<br>", unsafe_allow_html=True)
+                if st.button("Scale", type="primary", key="sc_apply"):
+                    scale_cmd = f"scale deployment {sc_selected} --replicas={sc_replicas} -n {sc_ns}"
+                    with st.spinner(f"Scaling {sc_selected} to {sc_replicas} replicas..."):
+                        result = run_kubectl(profile, scale_cmd, timeout=30)
+                        if result.success:
+                            st.success(f"Scaled **{sc_selected}** to **{sc_replicas}** replicas!")
+                            st.code(result.stdout, language="text")
+                            # Refresh to show updated state
+                            verify = run_kubectl(
+                                profile,
+                                f"get deployment {sc_selected} -n {sc_ns} -o wide",
+                                timeout=15,
+                            )
+                            if verify.success:
+                                st.code(verify.stdout, language="text")
+                        else:
+                            st.error("Scaling failed")
+                            st.code(result.stderr, language="text")
+
+            # Quick scale buttons
+            st.markdown("---")
+            st.markdown("#### Quick Actions")
+            qa_col1, qa_col2, qa_col3, qa_col4 = st.columns(4)
+            with qa_col1:
+                if st.button("Scale to 0 (stop)", key="sc_0"):
+                    with st.spinner("Scaling to 0..."):
+                        result = run_kubectl(profile, f"scale deployment {sc_selected} --replicas=0 -n {sc_ns}", timeout=30)
+                        st.success("Scaled to 0") if result.success else st.error(result.stderr)
+            with qa_col2:
+                if st.button("Scale to 1", key="sc_1"):
+                    with st.spinner("Scaling to 1..."):
+                        result = run_kubectl(profile, f"scale deployment {sc_selected} --replicas=1 -n {sc_ns}", timeout=30)
+                        st.success("Scaled to 1") if result.success else st.error(result.stderr)
+            with qa_col3:
+                if st.button("Scale to 3", key="sc_3"):
+                    with st.spinner("Scaling to 3..."):
+                        result = run_kubectl(profile, f"scale deployment {sc_selected} --replicas=3 -n {sc_ns}", timeout=30)
+                        st.success("Scaled to 3") if result.success else st.error(result.stderr)
+            with qa_col4:
+                if st.button("Scale to 5", key="sc_5"):
+                    with st.spinner("Scaling to 5..."):
+                        result = run_kubectl(profile, f"scale deployment {sc_selected} --replicas=5 -n {sc_ns}", timeout=30)
+                        st.success("Scaled to 5") if result.success else st.error(result.stderr)
+        elif not sc_load:
+            st.info("Click **Load Deployments** to see deployments in the selected namespace.")
+
+    # ── Pod Shell ────────────────────────────────────────────────────────
+    with tab_shell:
+        st.markdown("### Pod Shell (Exec)")
+        st.markdown("Execute commands inside a running pod/container.")
+
+        sh_col1, sh_col2 = st.columns(2)
+        with sh_col1:
+            if _rv_namespaces:
+                sh_ns = st.selectbox(
+                    "Namespace",
+                    options=_rv_namespaces,
+                    index=_rv_namespaces.index("default") if "default" in _rv_namespaces else 0,
+                    key="sh_ns",
+                )
+            else:
+                sh_ns = st.text_input("Namespace", value="default", key="sh_ns")
+        with sh_col2:
+            sh_load = st.button("Load Pods", key="sh_load")
+
+        # Fetch running pods
+        _sh_pods: list[str] = []
+        _sh_containers: dict[str, list[str]] = {}
+        if sh_load or st.session_state.get("_sh_cached_pods"):
+            if sh_load:
+                pod_result = run_kubectl(
+                    profile,
+                    f"get pods -n {sh_ns} --field-selector=status.phase=Running -o jsonpath="
+                    "'{range .items[*]}{.metadata.name}{\"\\n\"}{end}'",
+                    timeout=15,
+                )
+                if pod_result.success and pod_result.stdout.strip():
+                    _sh_pods = [p.strip() for p in pod_result.stdout.strip().split("\n") if p.strip()]
+                    st.session_state["_sh_cached_pods"] = _sh_pods
+                    st.session_state["_sh_cached_ns"] = sh_ns
+                    # Fetch container names for each pod
+                    _sh_containers = {}
+                    for pod_name in _sh_pods[:20]:  # limit to first 20 for perf
+                        ctr_result = run_kubectl(
+                            profile,
+                            f"get pod {pod_name} -n {sh_ns} -o jsonpath="
+                            "'{range .spec.containers[*]}{.name}{\"\\n\"}{end}'",
+                            timeout=10,
+                        )
+                        if ctr_result.success and ctr_result.stdout.strip():
+                            _sh_containers[pod_name] = [
+                                c.strip() for c in ctr_result.stdout.strip().split("\n") if c.strip()
+                            ]
+                        else:
+                            _sh_containers[pod_name] = []
+                    st.session_state["_sh_cached_containers"] = _sh_containers
+                else:
+                    st.session_state["_sh_cached_pods"] = []
+                    st.session_state["_sh_cached_containers"] = {}
+                    if pod_result.success:
+                        st.info(f"No running pods found in namespace '{sh_ns}'.")
+                    else:
+                        st.error("Failed to list pods")
+                        st.code(pod_result.stderr, language="text")
+            else:
+                if st.session_state.get("_sh_cached_ns") == sh_ns:
+                    _sh_pods = st.session_state.get("_sh_cached_pods", [])
+                    _sh_containers = st.session_state.get("_sh_cached_containers", {})
+
+        if _sh_pods:
+            sh_pod_col1, sh_pod_col2 = st.columns(2)
+            with sh_pod_col1:
+                sh_selected_pod = st.selectbox("Pod", options=_sh_pods, key="sh_pod")
+            with sh_pod_col2:
+                containers = _sh_containers.get(sh_selected_pod, [])
+                if containers:
+                    sh_selected_ctr = st.selectbox("Container", options=containers, key="sh_ctr")
+                else:
+                    sh_selected_ctr = st.text_input("Container (optional)", key="sh_ctr")
+
+            st.info(
+                "**Note:** This runs non-interactive commands via `kubectl exec`. "
+                "For a fully interactive shell, use your terminal:\n\n"
+                f"`kubectl exec -it {sh_selected_pod} -n {sh_ns}"
+                f"{' -c ' + sh_selected_ctr if sh_selected_ctr else ''} -- /bin/sh`"
+            )
+
+            sh_cmd = st.text_input(
+                "Command to execute",
+                value="sh -c 'hostname && cat /etc/os-release && df -h'",
+                key="sh_cmd",
+                help="Enter the command to run inside the container",
+            )
+
+            sh_preset_col1, sh_preset_col2, sh_preset_col3, sh_preset_col4 = st.columns(4)
+            with sh_preset_col1:
+                if st.button("env", key="sh_p_env"):
+                    sh_cmd = "env"
+            with sh_preset_col2:
+                if st.button("ps aux", key="sh_p_ps"):
+                    sh_cmd = "ps aux"
+            with sh_preset_col3:
+                if st.button("df -h", key="sh_p_df"):
+                    sh_cmd = "df -h"
+            with sh_preset_col4:
+                if st.button("cat /etc/resolv.conf", key="sh_p_dns"):
+                    sh_cmd = "cat /etc/resolv.conf"
+
+            if st.button("Execute", type="primary", key="sh_exec") and sh_cmd:
+                ctr_flag = f" -c {sh_selected_ctr}" if sh_selected_ctr else ""
+                exec_cmd = f"exec {sh_selected_pod} -n {sh_ns}{ctr_flag} -- {sh_cmd}"
+                with st.spinner(f"Executing in {sh_selected_pod}..."):
+                    result = run_kubectl(profile, exec_cmd, timeout=30)
+                    if result.success:
+                        st.code(result.stdout or "(no output)", language="text")
+                    else:
+                        st.error("Exec failed")
+                        st.code(result.stderr, language="text")
+
+            # Pod logs quick access
+            st.markdown("---")
+            st.markdown("#### Quick Pod Logs")
+            log_lines = st.number_input("Tail lines", min_value=10, max_value=500, value=50, key="sh_log_lines")
+            if st.button("View Logs", key="sh_logs"):
+                ctr_flag = f" -c {sh_selected_ctr}" if sh_selected_ctr else ""
+                log_cmd = f"logs {sh_selected_pod} -n {sh_ns}{ctr_flag} --tail={log_lines}"
+                with st.spinner("Fetching logs..."):
+                    result = run_kubectl(profile, log_cmd, timeout=30)
+                    if result.success:
+                        st.code(result.stdout or "(no logs)", language="text")
+                    else:
+                        st.error("Failed to fetch logs")
+                        st.code(result.stderr, language="text")
+        elif not sh_load:
+            st.info("Click **Load Pods** to see running pods in the selected namespace.")
 
     # ── Node Health ──────────────────────────────────────────────────────
     with tab_node_health:

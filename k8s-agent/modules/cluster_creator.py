@@ -1205,10 +1205,34 @@ def run_kubectl(profile: ClusterProfile, command: str, timeout: int = 30) -> SSH
         with open(kubeconfig_path, "w") as f:
             f.write(profile.kubeconfig_content)
 
+        kubectl = config.get_kubectl_path()
+        helm = config.get_helm_path()
+
         if is_helm:
-            full_cmd = f"KUBECONFIG={kubeconfig_path} {command}"
+            bin_path = helm or "helm"
+            resolved = command.strip()
+            if resolved.startswith("helm "):
+                resolved = bin_path + resolved[4:]
+            full_cmd = f"KUBECONFIG={kubeconfig_path} {resolved}"
         else:
-            full_cmd = f"kubectl --kubeconfig={kubeconfig_path} {command}"
+            if not kubectl:
+                return SSHResult(
+                    hostname="local (kubeconfig)",
+                    command=command,
+                    return_code=1,
+                    stdout="",
+                    stderr=(
+                        "kubectl not found on this machine.\n\n"
+                        "Install kubectl:\n"
+                        "  curl -LO https://dl.k8s.io/release/"
+                        "$(curl -Ls https://dl.k8s.io/release/stable.txt)"
+                        "/bin/linux/amd64/kubectl\n"
+                        "  chmod +x kubectl && mv kubectl ~/.local/bin/\n\n"
+                        "Or see: https://kubernetes.io/docs/tasks/tools/"
+                    ),
+                    success=False,
+                )
+            full_cmd = f"{kubectl} --kubeconfig={kubeconfig_path} {command}"
         try:
             proc = subprocess.run(
                 full_cmd,

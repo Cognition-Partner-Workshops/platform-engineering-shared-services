@@ -28,6 +28,7 @@ KUBECTL_DIAGNOSTIC_COMMANDS = {
     "Services": "get svc -A",
     "PVCs": "get pvc -A",
     "Ingresses": "get ingress -A",
+    "Disk Usage (Nodes)": "top nodes",
 }
 
 # Full SSH commands (backward-compat for provisioned clusters)
