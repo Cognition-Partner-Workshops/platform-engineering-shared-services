@@ -1173,7 +1173,7 @@ echo 'iptables flushed.'
             title="Remove kubelet data",
             script=f"""set -uo pipefail
 echo '>> Removing kubelet data at {kubelet_root}...'
-rm -rf {kubelet_root}/*
+rm -rf "{kubelet_root}"/*
 rm -rf /etc/kubernetes/*
 rm -rf /tmp/kubeadm-join-command.txt
 echo 'Kubelet data removed.'
@@ -1185,7 +1185,7 @@ echo 'Kubelet data removed.'
             title="Remove CRI-O container data",
             script=f"""set -uo pipefail
 echo '>> Removing CRI-O storage at {crio_root}...'
-rm -rf {crio_root}/*
+rm -rf "{crio_root}"/*
 echo '>> Removing CRI-O run root...'
 rm -rf /run/containers/storage/*
 echo 'CRI-O data removed.'
@@ -1209,8 +1209,8 @@ echo 'etcd data removed (if present).'
             title="Clean K8s-related logs",
             script=f"""set -uo pipefail
 echo '>> Cleaning K8s logs at {log_root}...'
-rm -rf {log_root}/pods/*
-rm -rf {log_root}/containers/*
+rm -rf "{log_root}"/pods/*
+rm -rf "{log_root}"/containers/*
 rm -rf /var/log/kubernetes/* 2>/dev/null || true
 echo 'Logs cleaned.'
 """,
@@ -1390,9 +1390,14 @@ def run_kubectl(profile: ClusterProfile, command: str, timeout: int = 30) -> SSH
     is_helm = command.strip().startswith("helm ")
 
     if profile.kubeconfig_content:
-        # Write kubeconfig to a file and run locally
+        # Write kubeconfig to a file and run locally.
+        # Sanitize the profile name for use as a filename — replace any
+        # non-alphanumeric characters (spaces, shell metacharacters, etc.)
+        # with underscores so the path is always safe for shell interpolation.
+        import re as _re
+        safe_name = _re.sub(r"[^\w.-]", "_", profile.name) or "cluster"
         kubeconfig_path = os.path.join(
-            config.DATA_DIR, "kubeconfigs", f"{profile.name}.kubeconfig"
+            config.DATA_DIR, "kubeconfigs", f"{safe_name}.kubeconfig"
         )
         os.makedirs(os.path.dirname(kubeconfig_path), exist_ok=True)
         with open(kubeconfig_path, "w") as f:
@@ -1406,7 +1411,7 @@ def run_kubectl(profile: ClusterProfile, command: str, timeout: int = 30) -> SSH
             resolved = command.strip()
             if resolved.startswith("helm "):
                 resolved = bin_path + resolved[4:]
-            full_cmd = f"KUBECONFIG={kubeconfig_path} {resolved}"
+            full_cmd = f'KUBECONFIG="{kubeconfig_path}" {resolved}'
         else:
             if not kubectl:
                 return SSHResult(
@@ -1425,7 +1430,7 @@ def run_kubectl(profile: ClusterProfile, command: str, timeout: int = 30) -> SSH
                     ),
                     success=False,
                 )
-            full_cmd = f"{kubectl} --kubeconfig={kubeconfig_path} {command}"
+            full_cmd = f'{kubectl} --kubeconfig="{kubeconfig_path}" {command}'
         try:
             proc = subprocess.run(
                 full_cmd,
