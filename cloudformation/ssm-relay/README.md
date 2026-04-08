@@ -142,13 +142,21 @@ The `ssm-relay-demo-ssm-portforward-user` has the minimum permissions needed:
 {
   "Statement": [
     {
-      "Sid": "AllowPortForwardToRelayInstance",
+      "Sid": "AllowStartSessionOnInstance",
       "Effect": "Allow",
       "Action": ["ssm:StartSession"],
-      "Resource": [
-        "arn:aws:ec2:REGION:ACCOUNT:instance/INSTANCE_ID",
-        "arn:aws:ssm:REGION::document/AWS-StartPortForwardingSession"
-      ]
+      "Resource": ["arn:aws:ec2:REGION:ACCOUNT:instance/INSTANCE_ID"],
+      "Condition": {
+        "BoolIfExists": {
+          "ssm:SessionDocumentAccessCheck": "true"
+        }
+      }
+    },
+    {
+      "Sid": "AllowPortForwardDocumentOnly",
+      "Effect": "Allow",
+      "Action": ["ssm:StartSession"],
+      "Resource": ["arn:aws:ssm:REGION::document/AWS-StartPortForwardingSession"]
     },
     {
       "Sid": "AllowTerminateOwnSession",
