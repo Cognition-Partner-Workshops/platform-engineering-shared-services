@@ -1,0 +1,481 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >
+  SSM Relay Stack — Provisions a private VPC with no internet ingress,
+  an EC2 relay box running a mock Artifactory (nginx), VPC Endpoints for
+  AWS Systems Manager, and a fine-grained IAM user that can only establish
+  SSM port-forwarding sessions. Demonstrates secure data-plane connectivity
+  to private resources without any inbound network access.
+
+# ---------------------------------------------------------------------------
+# Parameters
+# ---------------------------------------------------------------------------
+Parameters:
+  EnvironmentName:
+    Type: String
+    Default: ssm-relay-demo
+    Description: Prefix applied to all resource names for easy identification.
+
+  VpcCidr:
+    Type: String
+    Default: 10.200.0.0/16
+    Description: CIDR block for the VPC.
+
+  PrivateSubnetACidr:
+    Type: String
+    Default: 10.200.1.0/24
+    Description: CIDR block for private subnet in AZ-a.
+
+  PrivateSubnetBCidr:
+    Type: String
+    Default: 10.200.2.0/24
+    Description: CIDR block for private subnet in AZ-b.
+
+  InstanceType:
+    Type: String
+    Default: t3.micro
+    Description: EC2 instance type for the relay box.
+
+  LatestAmiId:
+    Type: AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>
+    Default: /aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-x86_64
+    Description: >
+      SSM Parameter path that resolves to the latest Amazon Linux 2023 AMI.
+      The SSM agent is pre-installed on this AMI.
+
+  MockArtifactoryPort:
+    Type: Number
+    Default: 8081
+    Description: Port the mock Artifactory (nginx) listens on inside the relay box.
+
+# ---------------------------------------------------------------------------
+# Resources
+# ---------------------------------------------------------------------------
+Resources:
+
+  # =========================================================================
+  # 1. VPC — completely private, NO Internet Gateway
+  # =========================================================================
+  Vpc:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: !Ref VpcCidr
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+      Tags:
+        - Key: Name
+          Value: !Sub "${EnvironmentName}-vpc"
+
+  # Two private subnets across AZs for resilience
+  PrivateSubnetA:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      CidrBlock: !Ref PrivateSubnetACidr
+      AvailabilityZone: !Select [0, !GetAZs ""]
+      MapPublicIpOnLaunch: false
+      Tags:
+        - Key: Name
+          Value: !Sub "${EnvironmentName}-private-a"
+
+  PrivateSubnetB:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      CidrBlock: !Ref PrivateSubnetBCidr
+      AvailabilityZone: !Select [1, !GetAZs ""]
+      MapPublicIpOnLaunch: false
+      Tags:
+        - Key: Name
+          Value: !Sub "${EnvironmentName}-private-b"
+
+  # Route table — local routes only (no NAT, no IGW)
+  PrivateRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref Vpc
+      Tags:
+        - Key: Name
+          Value: !Sub "${EnvironmentName}-private-rt"
+
+  PrivateSubnetARouteAssoc:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PrivateSubnetA
+      RouteTableId: !Ref PrivateRouteTable
+
+  PrivateSubnetBRouteAssoc:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PrivateSubnetB
+      RouteTableId: !Ref PrivateRouteTable
+
+  # =========================================================================
+  # 2. Security Groups
+  # =========================================================================
+
+  # SG for VPC Endpoints — allows HTTPS from within the VPC
+  VpcEndpointSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Allow HTTPS traffic from VPC CIDR to SSM VPC Endpoints
+      VpcId: !Ref Vpc
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: !Ref VpcCidr
+          Description: HTTPS from VPC CIDR for SSM endpoints
+      Tags:
+        - Key: Name
+          Value: !Sub "${EnvironmentName}-vpce-sg"
+
+  # SG for the Relay EC2 — NO ingress from internet; only self-referencing
+  # for mock artifactory health checks and SSM-tunneled traffic
+  RelaySecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Relay box SG - no internet ingress - internal mock artifactory only
+      VpcId: !Ref Vpc
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: !Ref MockArtifactoryPort
+          ToPort: !Ref MockArtifactoryPort
+          CidrIp: !Ref VpcCidr
+          Description: Mock Artifactory from within VPC only
+      Tags:
+        - Key: Name
+          Value: !Sub "${EnvironmentName}-relay-sg"
+
+  # =========================================================================
+  # 3a. S3 Gateway Endpoint — required so the instance can install packages
+  #     via dnf/yum (Amazon Linux repos are hosted on S3).
+  # =========================================================================
+  S3GatewayEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      VpcId: !Ref Vpc
+      ServiceName: !Sub "com.amazonaws.${AWS::Region}.s3"
+      VpcEndpointType: Gateway
+      RouteTableIds:
+        - !Ref PrivateRouteTable
+
+  # =========================================================================
+  # 3b. VPC Endpoints for SSM (Interface Endpoints)
+  #     These allow the EC2 instance to register with SSM without internet.
+  # =========================================================================
+  SsmEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      VpcId: !Ref Vpc
+      ServiceName: !Sub "com.amazonaws.${AWS::Region}.ssm"
+      VpcEndpointType: Interface
+      PrivateDnsEnabled: true
+      SubnetIds:
+        - !Ref PrivateSubnetA
+        - !Ref PrivateSubnetB
+      SecurityGroupIds:
+        - !Ref VpcEndpointSecurityGroup
+
+  SsmMessagesEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      VpcId: !Ref Vpc
+      ServiceName: !Sub "com.amazonaws.${AWS::Region}.ssmmessages"
+      VpcEndpointType: Interface
+      PrivateDnsEnabled: true
+      SubnetIds:
+        - !Ref PrivateSubnetA
+        - !Ref PrivateSubnetB
+      SecurityGroupIds:
+        - !Ref VpcEndpointSecurityGroup
+
+  Ec2MessagesEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      VpcId: !Ref Vpc
+      ServiceName: !Sub "com.amazonaws.${AWS::Region}.ec2messages"
+      VpcEndpointType: Interface
+      PrivateDnsEnabled: true
+      SubnetIds:
+        - !Ref PrivateSubnetA
+        - !Ref PrivateSubnetB
+      SecurityGroupIds:
+        - !Ref VpcEndpointSecurityGroup
+
+  # =========================================================================
+  # 4. IAM Role + Instance Profile for the EC2 relay box
+  #    Grants SSM managed-instance permissions so the agent can register.
+  # =========================================================================
+  RelayInstanceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${EnvironmentName}-relay-instance-role"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ec2.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
+      Tags:
+        - Key: Name
+          Value: !Sub "${EnvironmentName}-relay-instance-role"
+
+  RelayInstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      InstanceProfileName: !Sub "${EnvironmentName}-relay-instance-profile"
+      Roles:
+        - !Ref RelayInstanceRole
+
+  # =========================================================================
+  # 5. EC2 Relay Box — runs mock Artifactory (nginx) on a private subnet
+  # =========================================================================
+  RelayInstance:
+    Type: AWS::EC2::Instance
+    Properties:
+      InstanceType: !Ref InstanceType
+      ImageId: !Ref LatestAmiId
+      IamInstanceProfile: !Ref RelayInstanceProfile
+      SubnetId: !Ref PrivateSubnetA
+      SecurityGroupIds:
+        - !Ref RelaySecurityGroup
+      Tags:
+        - Key: Name
+          Value: !Sub "${EnvironmentName}-relay-box"
+        - Key: Purpose
+          Value: SSM relay with mock Artifactory
+      UserData:
+        Fn::Base64: !Sub |
+          #!/bin/bash
+          set -euxo pipefail
+
+          # ---------------------------------------------------------------
+          # Install and configure nginx as a mock JFrog Artifactory server
+          # ---------------------------------------------------------------
+          dnf install -y nginx
+
+          # Create a mock Artifactory health-check and API response
+          mkdir -p /usr/share/nginx/html/artifactory/api
+
+          cat > /usr/share/nginx/html/artifactory/api/system/ping <<'PING'
+          OK
+          PING
+
+          cat > /usr/share/nginx/html/artifactory/api/system/version <<'VERSION'
+          {
+            "version": "7.77.0",
+            "revision": "mock-ssm-relay-demo",
+            "license": "Enterprise",
+            "addons": ["docker", "npm", "pypi", "maven"]
+          }
+          VERSION
+
+          cat > /usr/share/nginx/html/artifactory/api/repositories <<'REPOS'
+          [
+            {
+              "key": "libs-release-local",
+              "type": "LOCAL",
+              "packageType": "maven",
+              "url": "http://localhost:${MockArtifactoryPort}/artifactory/libs-release-local"
+            },
+            {
+              "key": "npm-remote",
+              "type": "REMOTE",
+              "packageType": "npm",
+              "url": "http://localhost:${MockArtifactoryPort}/artifactory/npm-remote"
+            },
+            {
+              "key": "docker-local",
+              "type": "LOCAL",
+              "packageType": "docker",
+              "url": "http://localhost:${MockArtifactoryPort}/artifactory/docker-local"
+            }
+          ]
+          REPOS
+
+          # Landing page
+          cat > /usr/share/nginx/html/index.html <<'HTML'
+          <!DOCTYPE html>
+          <html>
+          <head><title>Mock Artifactory - SSM Relay Demo</title></head>
+          <body>
+            <h1>Mock JFrog Artifactory</h1>
+            <p>This is a private Artifactory instance running inside a VPC
+               with <strong>no internet ingress</strong>.</p>
+            <p>You reached this server through an
+               <strong>AWS SSM port-forwarding session</strong>.</p>
+            <h2>Available Endpoints</h2>
+            <ul>
+              <li><a href="/artifactory/api/system/ping">/artifactory/api/system/ping</a></li>
+              <li><a href="/artifactory/api/system/version">/artifactory/api/system/version</a></li>
+              <li><a href="/artifactory/api/repositories">/artifactory/api/repositories</a></li>
+            </ul>
+          </body>
+          </html>
+          HTML
+
+          # Configure nginx to listen on the mock artifactory port
+          cat > /etc/nginx/conf.d/mock-artifactory.conf <<NGINX
+          server {
+              listen ${MockArtifactoryPort};
+              server_name _;
+
+              location / {
+                  root /usr/share/nginx/html;
+                  index index.html;
+                  default_type application/json;
+              }
+
+              location /artifactory/api/system/ping {
+                  alias /usr/share/nginx/html/artifactory/api/system/ping;
+                  default_type text/plain;
+              }
+
+              location /artifactory/api/system/version {
+                  alias /usr/share/nginx/html/artifactory/api/system/version;
+                  default_type application/json;
+              }
+
+              location /artifactory/api/repositories {
+                  alias /usr/share/nginx/html/artifactory/api/repositories;
+                  default_type application/json;
+              }
+          }
+          NGINX
+
+          # Disable the default server on port 80
+          sed -i 's/listen\s*80/listen 8080/' /etc/nginx/nginx.conf
+
+          systemctl enable nginx
+          systemctl start nginx
+
+          # Verify nginx is listening
+          sleep 2
+          curl -sf http://localhost:${MockArtifactoryPort}/artifactory/api/system/ping || echo "WARNING: nginx not yet responding"
+
+  # =========================================================================
+  # 6. IAM User with FINE-GRAINED SSM permissions
+  #    This user can ONLY start SSM port-forwarding sessions to instances
+  #    tagged with this stack's environment name.
+  # =========================================================================
+  SsmPortForwardUser:
+    Type: AWS::IAM::User
+    Properties:
+      UserName: !Sub "${EnvironmentName}-ssm-portforward-user"
+      Tags:
+        - Key: Name
+          Value: !Sub "${EnvironmentName}-ssm-portforward-user"
+        - Key: Purpose
+          Value: Fine-grained SSM port-forwarding only
+
+  SsmPortForwardPolicy:
+    Type: AWS::IAM::Policy
+    Properties:
+      PolicyName: !Sub "${EnvironmentName}-ssm-portforward-policy"
+      Users:
+        - !Ref SsmPortForwardUser
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          # Allow starting SSM port-forwarding sessions to this specific instance only.
+          # Both the instance ARN and the SSM document ARN must be listed together
+          # so AWS evaluates them as a single authorization decision.
+          - Sid: AllowPortForwardToRelayInstance
+            Effect: Allow
+            Action:
+              - ssm:StartSession
+            Resource:
+              - !Sub "arn:aws:ec2:${AWS::Region}:${AWS::AccountId}:instance/${RelayInstance}"
+              - !Sub "arn:aws:ssm:${AWS::Region}::document/AWS-StartPortForwardingSession"
+
+          # Allow the user to terminate and resume their own sessions only
+          - Sid: AllowTerminateOwnSession
+            Effect: Allow
+            Action:
+              - ssm:TerminateSession
+              - ssm:ResumeSession
+            Resource:
+              - !Sub "arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:session/${!aws:username}-*"
+
+          # Read-only: describe instances, SSM status, and sessions
+          - Sid: AllowDescribeInstances
+            Effect: Allow
+            Action:
+              - ssm:DescribeInstanceInformation
+              - ssm:GetConnectionStatus
+              - ssm:DescribeSessions
+              - ec2:DescribeInstances
+            Resource: "*"
+
+  # Access key for the SSM port-forward user
+  SsmPortForwardAccessKey:
+    Type: AWS::IAM::AccessKey
+    Properties:
+      UserName: !Ref SsmPortForwardUser
+
+# ---------------------------------------------------------------------------
+# Outputs
+# ---------------------------------------------------------------------------
+Outputs:
+  VpcId:
+    Description: VPC ID
+    Value: !Ref Vpc
+
+  PrivateSubnetAId:
+    Description: Private Subnet A ID
+    Value: !Ref PrivateSubnetA
+
+  PrivateSubnetBId:
+    Description: Private Subnet B ID
+    Value: !Ref PrivateSubnetB
+
+  RelayInstanceId:
+    Description: EC2 Instance ID of the relay box (use with SSM start-session)
+    Value: !Ref RelayInstance
+
+  RelayPrivateIp:
+    Description: Private IP of the relay box (not reachable from internet)
+    Value: !GetAtt RelayInstance.PrivateIp
+
+  MockArtifactoryPort:
+    Description: Port the mock Artifactory listens on inside the relay
+    Value: !Ref MockArtifactoryPort
+
+  SsmPortForwardUserArn:
+    Description: ARN of the IAM user with fine-grained SSM permissions
+    Value: !GetAtt SsmPortForwardUser.Arn
+
+  SsmPortForwardAccessKeyId:
+    Description: Access Key ID for the SSM port-forward user
+    Value: !Ref SsmPortForwardAccessKey
+
+  SsmPortForwardSecretAccessKey:
+    Description: Secret Access Key for the SSM port-forward user (sensitive)
+    Value: !GetAtt SsmPortForwardAccessKey.SecretAccessKey
+
+  SsmPortForwardCommand:
+    Description: >
+      Command to establish an SSM port-forwarding session from your local
+      machine to the private mock Artifactory.
+    Value: !Sub >
+      aws ssm start-session
+      --target ${RelayInstance}
+      --document-name AWS-StartPortForwardingSession
+      --parameters '{"portNumber":["${MockArtifactoryPort}"],"localPortNumber":["8081"]}'
+      --region ${AWS::Region}
+
+  ConnectivityTestCommand:
+    Description: >
+      After establishing the SSM tunnel, run this to verify connectivity
+      to the private mock Artifactory.
+    Value: "curl -s http://localhost:8081/artifactory/api/system/ping"
+
+  ArchitectureSummary:
+    Description: What this stack demonstrates
+    Value: >
+      Private VPC (no IGW) -> EC2 relay with SSM agent -> Mock Artifactory (nginx:8081).
+      Access via SSM port-forwarding only. IAM user scoped to port-forward sessions
+      targeting this specific instance. No inbound internet traffic possible.
