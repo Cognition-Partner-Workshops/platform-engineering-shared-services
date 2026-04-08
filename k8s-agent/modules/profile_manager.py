@@ -82,7 +82,8 @@ def save_profile(profile: ClusterProfile) -> str:
     profile.updated_at = now
 
     path = _profile_path(profile.name)
-    with open(path, "w") as f:
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w") as f:
         json.dump(asdict(profile), f, indent=2)
     return path
 
