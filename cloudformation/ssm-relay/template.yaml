@@ -235,6 +235,11 @@ Resources:
   # =========================================================================
   RelayInstance:
     Type: AWS::EC2::Instance
+    DependsOn:
+      - S3GatewayEndpoint
+      - SsmEndpoint
+      - SsmMessagesEndpoint
+      - Ec2MessagesEndpoint
     Properties:
       InstanceType: !Ref InstanceType
       ImageId: !Ref LatestAmiId
@@ -257,98 +262,60 @@ Resources:
           # ---------------------------------------------------------------
           dnf install -y nginx
 
-          # Create a mock Artifactory health-check and API response
-          mkdir -p /usr/share/nginx/html/artifactory/api
+          # Create mock Artifactory API response files
+          mkdir -p /usr/share/nginx/html/artifactory/api/system
 
-          cat > /usr/share/nginx/html/artifactory/api/system/ping <<'PING'
-          OK
-          PING
+          echo 'OK' > /usr/share/nginx/html/artifactory/api/system/ping
 
-          cat > /usr/share/nginx/html/artifactory/api/system/version <<'VERSION'
-          {
-            "version": "7.77.0",
-            "revision": "mock-ssm-relay-demo",
-            "license": "Enterprise",
-            "addons": ["docker", "npm", "pypi", "maven"]
-          }
-          VERSION
+          cat > /usr/share/nginx/html/artifactory/api/system/version <<'EOF'
+          {"version":"7.77.0","revision":"mock-ssm-relay-demo","license":"Enterprise","addons":["docker","npm","pypi","maven"]}
+          EOF
 
-          cat > /usr/share/nginx/html/artifactory/api/repositories <<'REPOS'
-          [
-            {
-              "key": "libs-release-local",
-              "type": "LOCAL",
-              "packageType": "maven",
-              "url": "http://localhost:${MockArtifactoryPort}/artifactory/libs-release-local"
-            },
-            {
-              "key": "npm-remote",
-              "type": "REMOTE",
-              "packageType": "npm",
-              "url": "http://localhost:${MockArtifactoryPort}/artifactory/npm-remote"
-            },
-            {
-              "key": "docker-local",
-              "type": "LOCAL",
-              "packageType": "docker",
-              "url": "http://localhost:${MockArtifactoryPort}/artifactory/docker-local"
-            }
-          ]
-          REPOS
+          cat > /usr/share/nginx/html/artifactory/api/repositories <<'EOF'
+          [{"key":"libs-release-local","type":"LOCAL","packageType":"maven"},{"key":"npm-remote","type":"REMOTE","packageType":"npm"},{"key":"docker-local","type":"LOCAL","packageType":"docker"}]
+          EOF
 
-          # Landing page
-          cat > /usr/share/nginx/html/index.html <<'HTML'
-          <!DOCTYPE html>
-          <html>
-          <head><title>Mock Artifactory - SSM Relay Demo</title></head>
-          <body>
-            <h1>Mock JFrog Artifactory</h1>
-            <p>This is a private Artifactory instance running inside a VPC
-               with <strong>no internet ingress</strong>.</p>
-            <p>You reached this server through an
-               <strong>AWS SSM port-forwarding session</strong>.</p>
-            <h2>Available Endpoints</h2>
-            <ul>
-              <li><a href="/artifactory/api/system/ping">/artifactory/api/system/ping</a></li>
-              <li><a href="/artifactory/api/system/version">/artifactory/api/system/version</a></li>
-              <li><a href="/artifactory/api/repositories">/artifactory/api/repositories</a></li>
-            </ul>
-          </body>
-          </html>
-          HTML
+          cat > /usr/share/nginx/html/index.html <<'EOF'
+          <html><head><title>Mock Artifactory - SSM Relay Demo</title></head>
+          <body><h1>Mock JFrog Artifactory</h1>
+          <p>Private instance inside VPC with no internet ingress. Reached via AWS SSM port-forwarding.</p>
+          <ul>
+          <li><a href="/artifactory/api/system/ping">/artifactory/api/system/ping</a></li>
+          <li><a href="/artifactory/api/system/version">/artifactory/api/system/version</a></li>
+          <li><a href="/artifactory/api/repositories">/artifactory/api/repositories</a></li>
+          </ul></body></html>
+          EOF
 
           # Configure nginx to listen on the mock artifactory port
-          cat > /etc/nginx/conf.d/mock-artifactory.conf <<NGINX
+          cat > /etc/nginx/conf.d/mock-artifactory.conf <<NGINXCONF
           server {
               listen ${MockArtifactoryPort};
               server_name _;
-
               location / {
                   root /usr/share/nginx/html;
                   index index.html;
                   default_type application/json;
               }
-
               location /artifactory/api/system/ping {
                   alias /usr/share/nginx/html/artifactory/api/system/ping;
                   default_type text/plain;
               }
-
               location /artifactory/api/system/version {
                   alias /usr/share/nginx/html/artifactory/api/system/version;
                   default_type application/json;
               }
-
               location /artifactory/api/repositories {
                   alias /usr/share/nginx/html/artifactory/api/repositories;
                   default_type application/json;
               }
           }
-          NGINX
+          NGINXCONF
 
-          # Disable the default server on port 80
-          sed -i 's/listen\s*80/listen 8080/' /etc/nginx/nginx.conf
+          # Disable the default server on port 80 to avoid conflicts
+          sed -E -i 's/listen[[:space:]]+80 /listen 8080 /' /etc/nginx/nginx.conf
+          sed -E -i 's/listen[[:space:]]+\[::\]:80 /listen [::]:8080 /' /etc/nginx/nginx.conf
 
+          nginx -t
           systemctl enable nginx
           systemctl start nginx
 
@@ -380,15 +347,25 @@ Resources:
       PolicyDocument:
         Version: "2012-10-17"
         Statement:
-          # Allow starting SSM port-forwarding sessions to this specific instance only.
-          # Both the instance ARN and the SSM document ARN must be listed together
-          # so AWS evaluates them as a single authorization decision.
-          - Sid: AllowPortForwardToRelayInstance
+          # Allow starting SSM sessions on this specific instance only.
+          # The SessionDocumentAccessCheck condition ensures the document
+          # resource (below) is also evaluated, restricting to port-forwarding.
+          - Sid: AllowStartSessionOnInstance
             Effect: Allow
             Action:
               - ssm:StartSession
             Resource:
               - !Sub "arn:aws:ec2:${AWS::Region}:${AWS::AccountId}:instance/${RelayInstance}"
+            Condition:
+              BoolIfExists:
+                ssm:SessionDocumentAccessCheck: "true"
+
+          # Allow only the port-forwarding SSM document (no interactive shell)
+          - Sid: AllowPortForwardDocumentOnly
+            Effect: Allow
+            Action:
+              - ssm:StartSession
+            Resource:
               - !Sub "arn:aws:ssm:${AWS::Region}::document/AWS-StartPortForwardingSession"
 
           # Allow the user to terminate and resume their own sessions only
