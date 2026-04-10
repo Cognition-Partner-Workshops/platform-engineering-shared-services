@@ -6,6 +6,8 @@ import subprocess
 
 
 # LLM Configuration
+# Provider: "openai" (OpenAI-compatible endpoint) or "ollama" (local Ollama)
+LLM_PROVIDER = os.getenv("LLM_PROVIDER", "openai")
 LLM_API_URL = os.getenv(
     "LLM_API_URL",
     "https://aigateway-intern.ad.infosys.com/aigateway/chat/completions",
@@ -15,10 +17,35 @@ LLM_MODEL = os.getenv("LLM_MODEL", "gpt-4")
 LLM_TEMPERATURE = float(os.getenv("LLM_TEMPERATURE", "0.3"))
 LLM_MAX_TOKENS = int(os.getenv("LLM_MAX_TOKENS", "4096"))
 
+# Ollama-specific defaults
+OLLAMA_BASE_URL = os.getenv("OLLAMA_BASE_URL", "http://10.73.98.113:11434")
+OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "llama3")
+
 
 def is_llm_configured() -> bool:
-    """Return True if the LLM endpoint and API key are both set."""
+    """Return True if the LLM is configured.
+
+    For Ollama, only the base URL is required (no API key).
+    For OpenAI-compatible endpoints, both URL and key are required.
+    """
+    if LLM_PROVIDER == "ollama":
+        return bool(OLLAMA_BASE_URL)
     return bool(LLM_API_URL and LLM_API_KEY)
+
+
+def get_active_llm_url() -> str:
+    """Return the effective chat completions URL based on the active provider."""
+    if LLM_PROVIDER == "ollama":
+        base = OLLAMA_BASE_URL.rstrip("/")
+        return f"{base}/api/chat"
+    return LLM_API_URL
+
+
+def get_active_model() -> str:
+    """Return the effective model name based on the active provider."""
+    if LLM_PROVIDER == "ollama":
+        return OLLAMA_MODEL
+    return LLM_MODEL
 
 
 # Application paths

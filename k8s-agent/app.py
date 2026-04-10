@@ -87,7 +87,7 @@ from modules.log_analyzer import (
     summarize_logs,
     analyze_istio_access_logs,
 )
-from modules.llm_client import query_llm, stream_llm
+from modules.llm_client import query_llm, stream_llm, list_ollama_models
 
 
 # ── Page Configuration ────────────────────────────────────────────────────
@@ -263,26 +263,81 @@ def render_sidebar():
 
         # ── LLM config ──
         with st.expander("LLM Settings"):
-            st.text_input(
-                "API URL",
-                value=config.LLM_API_URL,
-                key="llm_api_url",
-                help="Endpoint for the LLM API",
+            provider_options = ["openai", "ollama"]
+            _prov_idx = provider_options.index(config.LLM_PROVIDER) if config.LLM_PROVIDER in provider_options else 0
+            llm_provider = st.selectbox(
+                "Provider",
+                options=provider_options,
+                format_func=lambda p: {"openai": "OpenAI-compatible", "ollama": "Ollama (local)"}[p],
+                index=_prov_idx,
+                key="llm_provider_select",
+                help="Select 'Ollama (local)' to connect to a local Ollama instance",
             )
-            st.text_input(
-                "API Key",
-                value=config.LLM_API_KEY[:8] + "..." if config.LLM_API_KEY else "",
-                type="password",
-                key="llm_api_key_display",
-                disabled=True,
-                help="Set via LLM_API_KEY or INFOSYS_CODER_API_KEY env var",
-            )
-            st.selectbox(
-                "Model",
-                options=["gpt-4", "gpt-4o", "gpt-3.5-turbo"],
-                index=0,
-                key="llm_model_select",
-            )
+
+            if llm_provider == "ollama":
+                ollama_url = st.text_input(
+                    "Ollama URL",
+                    value=config.OLLAMA_BASE_URL,
+                    key="ollama_url_input",
+                    help="Base URL for your Ollama instance (e.g. http://10.73.98.113:11434)",
+                )
+                # Fetch models button
+                if st.button("Fetch available models", key="ollama_fetch_models"):
+                    with st.spinner("Connecting to Ollama..."):
+                        models = list_ollama_models(ollama_url)
+                        if models:
+                            st.session_state["_ollama_models"] = models
+                            st.success(f"Found {len(models)} model(s)")
+                        else:
+                            st.error(f"Could not connect to Ollama at {ollama_url}")
+                _cached_models = st.session_state.get("_ollama_models", [])
+                if _cached_models:
+                    st.selectbox(
+                        "Model",
+                        options=_cached_models,
+                        index=0,
+                        key="ollama_model_select",
+                    )
+                else:
+                    st.text_input(
+                        "Model",
+                        value=config.OLLAMA_MODEL,
+                        key="ollama_model_input",
+                        help="Model name (e.g. llama3, mistral, codellama)",
+                    )
+
+                # Apply Ollama settings at runtime
+                config.LLM_PROVIDER = "ollama"
+                config.OLLAMA_BASE_URL = ollama_url
+                _sel_model = st.session_state.get("ollama_model_select") or st.session_state.get("ollama_model_input", config.OLLAMA_MODEL)
+                config.OLLAMA_MODEL = _sel_model
+
+                if config.is_llm_configured():
+                    st.caption(f"✓ Ollama configured → `{config.OLLAMA_BASE_URL}` / `{config.OLLAMA_MODEL}`")
+                else:
+                    st.caption("Enter the Ollama URL above to enable AI features")
+            else:
+                st.text_input(
+                    "API URL",
+                    value=config.LLM_API_URL,
+                    key="llm_api_url",
+                    help="Endpoint for the LLM API",
+                )
+                st.text_input(
+                    "API Key",
+                    value=config.LLM_API_KEY[:8] + "..." if config.LLM_API_KEY else "",
+                    type="password",
+                    key="llm_api_key_display",
+                    disabled=True,
+                    help="Set via LLM_API_KEY or INFOSYS_CODER_API_KEY env var",
+                )
+                st.selectbox(
+                    "Model",
+                    options=["gpt-4", "gpt-4o", "gpt-3.5-turbo"],
+                    index=0,
+                    key="llm_model_select",
+                )
+                config.LLM_PROVIDER = "openai"
 
         return selected_page
 
@@ -1100,7 +1155,7 @@ echo 'Packages removed.'
         st.markdown("### AI Cluster Setup Advisor")
         if not is_llm_configured():
             st.info(
-                "LLM is not configured. Set `LLM_API_URL` and `LLM_API_KEY` "
+                "LLM is not configured. Select a provider (OpenAI or Ollama) in the sidebar LLM Settings, or set `LLM_API_URL` and `LLM_API_KEY` "
                 "environment variables to enable AI-powered recommendations."
             )
         else:
@@ -1183,7 +1238,7 @@ def page_cluster_debugger():
 
         if st.session_state.debug_results:
             if not is_llm_configured():
-                st.info("Enable AI analysis by setting `LLM_API_URL` and `LLM_API_KEY` env vars.")
+                st.info("Enable AI analysis by selecting a provider (OpenAI or Ollama) in the sidebar LLM Settings.")
             elif st.button("Analyze with AI", type="secondary"):
                 with st.spinner("AI is analyzing diagnostics..."):
                     analysis = analyze_diagnostics(
@@ -1237,7 +1292,7 @@ def page_cluster_debugger():
         st.markdown("### AI Debug Assistant")
         if not is_llm_configured():
             st.info(
-                "LLM is not configured. Set `LLM_API_URL` and `LLM_API_KEY` "
+                "LLM is not configured. Select a provider (OpenAI or Ollama) in the sidebar LLM Settings, or set `LLM_API_URL` and `LLM_API_KEY` "
                 "environment variables to enable AI-powered debugging."
             )
             st.markdown(
@@ -1571,7 +1626,7 @@ def page_monitoring_setup():
         st.markdown("### AI Monitoring Advisor")
         if not is_llm_configured():
             st.info(
-                "LLM is not configured. Set `LLM_API_URL` and `LLM_API_KEY` "
+                "LLM is not configured. Select a provider (OpenAI or Ollama) in the sidebar LLM Settings, or set `LLM_API_URL` and `LLM_API_KEY` "
                 "environment variables to enable AI-powered monitoring advice."
             )
         else:
@@ -2444,7 +2499,7 @@ def page_log_analysis():
         st.markdown("### AI-Powered Log Analysis")
         if not is_llm_configured():
             st.info(
-                "LLM is not configured. Set `LLM_API_URL` and `LLM_API_KEY` "
+                "LLM is not configured. Select a provider (OpenAI or Ollama) in the sidebar LLM Settings, or set `LLM_API_URL` and `LLM_API_KEY` "
                 "environment variables to enable AI-powered log analysis."
             )
             st.markdown(
@@ -4150,7 +4205,7 @@ def page_ai_assistant():
 
     if not is_llm_configured():
         st.info(
-            "LLM is not configured. Set `LLM_API_URL` and `LLM_API_KEY` "
+            "LLM is not configured. Select a provider (OpenAI or Ollama) in the sidebar LLM Settings, or set `LLM_API_URL` and `LLM_API_KEY` "
             "environment variables to enable the AI chat assistant."
         )
         st.markdown(
