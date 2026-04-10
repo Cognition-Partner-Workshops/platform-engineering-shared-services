@@ -1824,9 +1824,16 @@ def page_log_analysis():
             "**pattern mining** (Drain-style), and **auto-summarization**."
         )
 
+        st.info(
+            "**Istio access log analysis:** Select **Collect pod logs** and choose an "
+            "application pod with an Istio sidecar (e.g. `istio-proxy` container). "
+            "The pipeline auto-detects Envoy/Istio access logs and shows response time "
+            "analytics, status codes, per-path breakdowns, and slow requests."
+        )
+
         smart_mode = st.radio(
             "Analysis mode",
-            ["Collect from cluster", "Paste logs"],
+            ["Collect from cluster", "Collect pod logs", "Paste logs"],
             horizontal=True,
             key="smart_mode",
         )
@@ -1873,11 +1880,149 @@ def page_log_analysis():
             if "_smart_log_text" in st.session_state and not smart_log_text:
                 smart_log_text = st.session_state["_smart_log_text"]
 
+        elif smart_mode == "Collect pod logs":
+            st.markdown(
+                "Fetch logs from a specific pod — ideal for **Istio sidecar** access "
+                "logs (`istio-proxy` container) or any application pod."
+            )
+            spcol1, spcol2 = st.columns(2)
+            with spcol1:
+                if _cluster_namespaces:
+                    smart_pod_ns = st.selectbox(
+                        "Namespace", options=_cluster_namespaces,
+                        index=_cluster_namespaces.index("default") if "default" in _cluster_namespaces else 0,
+                        key="smart_pod_ns",
+                    )
+                else:
+                    smart_pod_ns = st.text_input("Namespace", value="default", key="smart_pod_ns")
+            with spcol2:
+                smart_pod_lines = st.number_input(
+                    "Lines to fetch", min_value=100, max_value=10000, value=1000, key="smart_pod_lines",
+                )
+
+            # Load pods button
+            if st.button("Load Pods", key="smart_load_pods"):
+                with st.spinner(f"Fetching pods in namespace '{smart_pod_ns}'..."):
+                    pod_result = get_pod_list(cp_node, namespace=smart_pod_ns, profile=profile)
+                    if pod_result.success and pod_result.stdout.strip():
+                        _sp_pods: list[dict] = []
+                        for line in pod_result.stdout.strip().split("\n"):
+                            parts = line.split()
+                            if len(parts) >= 2:
+                                _sp_pods.append({
+                                    "namespace": parts[0],
+                                    "name": parts[1],
+                                    "status": parts[2] if len(parts) > 2 else "Unknown",
+                                    "containers": parts[3] if len(parts) > 3 else "",
+                                })
+                        st.session_state["_smart_pod_list"] = _sp_pods
+                        st.session_state["_smart_pod_list_ns"] = smart_pod_ns
+                        st.success(f"Found {len(_sp_pods)} pod(s) in namespace '{smart_pod_ns}'.")
+                    elif pod_result.success:
+                        st.session_state["_smart_pod_list"] = []
+                        st.warning(f"No pods found in namespace '{smart_pod_ns}'.")
+                    else:
+                        st.error(f"Failed to fetch pods: {pod_result.stderr}")
+
+            # Pod & container selection
+            _sp_pods_loaded = st.session_state.get("_smart_pod_list", [])
+            _sp_pods_ns = st.session_state.get("_smart_pod_list_ns", "")
+
+            sp_col1, sp_col2 = st.columns(2)
+            with sp_col1:
+                if _sp_pods_loaded and _sp_pods_ns == smart_pod_ns:
+                    sp_pod_options = [f"{p['name']}  ({p['status']})" for p in _sp_pods_loaded]
+                    sp_selected_idx = st.selectbox(
+                        "Pod Name", options=range(len(sp_pod_options)),
+                        format_func=lambda i: sp_pod_options[i],
+                        key="smart_pod_select",
+                    )
+                    smart_pod_name = _sp_pods_loaded[sp_selected_idx]["name"] if sp_selected_idx is not None else ""
+                else:
+                    smart_pod_name = st.text_input(
+                        "Pod Name", placeholder="Click 'Load Pods' to get dropdown", key="smart_pod_name",
+                    )
+            with sp_col2:
+                # Container selection — show istio-proxy hint
+                if _sp_pods_loaded and _sp_pods_ns == smart_pod_ns and smart_pod_name:
+                    matching = [p for p in _sp_pods_loaded if p["name"] == smart_pod_name]
+                    container_names = []
+                    if matching and matching[0].get("containers"):
+                        container_names = [c.strip() for c in matching[0]["containers"].split(",") if c.strip()]
+                    if container_names:
+                        container_names = ["(all / default)"] + container_names
+                        # Pre-select istio-proxy if available
+                        default_idx = 0
+                        for idx, cn in enumerate(container_names):
+                            if cn == "istio-proxy":
+                                default_idx = idx
+                                break
+                        smart_pod_container = st.selectbox(
+                            "Container (select `istio-proxy` for Istio access logs)",
+                            options=container_names,
+                            index=default_idx,
+                            key="smart_pod_container",
+                        )
+                        if smart_pod_container == "(all / default)":
+                            smart_pod_container = ""
+                    else:
+                        smart_pod_container = st.text_input(
+                            "Container (e.g. istio-proxy)",
+                            value="istio-proxy",
+                            key="smart_pod_container_text",
+                        )
+                else:
+                    smart_pod_container = st.text_input(
+                        "Container (e.g. istio-proxy for Istio access logs)",
+                        value="istio-proxy",
+                        key="smart_pod_container_text2",
+                    )
+
+            # Fetch & analyze
+            smart_pod_since_opts = {
+                "Last 15 min": "15m",
+                "Last 1 hour": "1h",
+                "Last 6 hours": "6h",
+                "Last 24 hours": "24h",
+            }
+            smart_pod_since_label = st.selectbox(
+                "Time Range", list(smart_pod_since_opts.keys()), index=1, key="smart_pod_since",
+            )
+            smart_pod_since_k8s = smart_pod_since_opts[smart_pod_since_label]
+
+            if st.button("Fetch Pod Logs & Analyze", type="primary", key="smart_pod_collect"):
+                if not smart_pod_name:
+                    st.warning("Please select or enter a pod name.")
+                else:
+                    with st.spinner(f"Fetching logs from pod '{smart_pod_name}' (container: {smart_pod_container or 'default'})..."):
+                        pod_log_result = collect_pod_logs(
+                            cp_node,
+                            namespace=smart_pod_ns,
+                            pod_name=smart_pod_name,
+                            container=smart_pod_container,
+                            lines=smart_pod_lines,
+                            since_k8s=smart_pod_since_k8s,
+                            profile=profile,
+                        )
+                    if pod_log_result.success and pod_log_result.stdout.strip():
+                        smart_log_text = pod_log_result.stdout
+                        st.session_state["_smart_log_text"] = smart_log_text
+                        st.session_state["_smart_source"] = f"pod:{smart_pod_name}/{smart_pod_container or 'default'}"
+                        st.success(f"Fetched {len(smart_log_text.splitlines())} log lines from pod '{smart_pod_name}'.")
+                    elif pod_log_result.success:
+                        st.info(f"No logs returned from pod '{smart_pod_name}' for the selected time range.")
+                    else:
+                        st.error(f"Failed to fetch pod logs: {pod_log_result.stderr}")
+
+            # Persist across reruns
+            if "_smart_log_text" in st.session_state and not smart_log_text:
+                smart_log_text = st.session_state["_smart_log_text"]
+
         else:
             smart_log_text = st.text_area(
                 "Paste log output",
                 height=200,
-                placeholder="Paste your Kubernetes logs here for smart analysis...",
+                placeholder="Paste your Kubernetes / Istio access logs here for smart analysis...",
                 key="smart_paste",
             )
             if smart_log_text:
