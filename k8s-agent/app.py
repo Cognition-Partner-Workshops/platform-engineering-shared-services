@@ -576,7 +576,8 @@ def page_profile_manager():
                     st.markdown(f"**Updated:** {profile.updated_at[:10] if profile.updated_at else 'N/A'}")
                     if st.button("Set Active", key=f"activate_{profile.name}"):
                         st.session_state.active_profile = profile.name
-                        st.session_state.profile_selector = profile.name
+                        if "profile_selector" in st.session_state:
+                            del st.session_state["profile_selector"]
                         st.rerun()
                     if st.button("Delete", key=f"delete_{profile.name}", type="secondary"):
                         delete_profile(profile.name)

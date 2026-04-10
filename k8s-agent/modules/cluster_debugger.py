@@ -77,7 +77,7 @@ def _run_local_kubectl(kubeconfig_content: str, kubectl_args: str, timeout: int 
     kubeconfig_path = config.get_kubeconfig_path("_debug_temp")
     with open(kubeconfig_path, "w") as f:
         f.write(kubeconfig_content)
-    full_cmd = f"{kubectl} --kubeconfig={kubeconfig_path} {kubectl_args}"
+    full_cmd = f"{kubectl} --kubeconfig=\"{kubeconfig_path}\" {kubectl_args}"
     try:
         proc = subprocess.run(full_cmd, shell=True, capture_output=True, text=True, timeout=timeout)
         return SSHResult(

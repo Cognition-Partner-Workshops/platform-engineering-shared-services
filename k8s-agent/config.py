@@ -120,7 +120,7 @@ def fetch_namespaces(kubeconfig_content: str) -> list[str]:
         f.write(kubeconfig_content)
     try:
         proc = subprocess.run(
-            f"{kubectl} --kubeconfig={kc_path} get namespaces -o jsonpath='{{.items[*].metadata.name}}'",
+            f"{kubectl} --kubeconfig=\"{kc_path}\" get namespaces -o jsonpath='{{.items[*].metadata.name}}'",
             shell=True, capture_output=True, text=True, timeout=15,
         )
         if proc.returncode == 0 and proc.stdout.strip():
