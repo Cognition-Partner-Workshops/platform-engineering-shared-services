@@ -176,16 +176,41 @@ def render_sidebar():
         profile_names = [p.name for p in profiles]
 
         if profile_names:
+            _selector_options = ["(none)"] + profile_names
+            _current = st.session_state.get("active_profile")
+            _default_idx = (
+                profile_names.index(_current) + 1
+                if _current and _current in profile_names
+                else 0
+            )
+
+            # Sync widget key with active_profile before widget renders.
+            # Streamlit reads the widget value from session_state[key] when
+            # the key already exists, ignoring ``index``.  So we must write
+            # the desired option into session_state["profile_selector"]
+            # *before* the selectbox is instantiated.
+            if "profile_selector" not in st.session_state:
+                # First render or key was deleted — seed from active_profile
+                st.session_state["profile_selector"] = _selector_options[_default_idx]
+            elif st.session_state["profile_selector"] not in _selector_options:
+                # Profile was deleted — reset
+                st.session_state["profile_selector"] = "(none)"
+
+            def _on_profile_change():
+                sel = st.session_state.get("profile_selector", "(none)")
+                if sel != "(none)":
+                    st.session_state.active_profile = sel
+                else:
+                    st.session_state.active_profile = None
+
             selected = st.selectbox(
                 "Active Profile",
-                options=["(none)"] + profile_names,
-                index=(
-                    profile_names.index(st.session_state.active_profile) + 1
-                    if st.session_state.active_profile in profile_names
-                    else 0
-                ),
+                options=_selector_options,
                 key="profile_selector",
+                on_change=_on_profile_change,
             )
+
+            # Also keep active_profile in sync on this run
             if selected != "(none)":
                 st.session_state.active_profile = selected
                 profile = load_profile(selected)
@@ -475,6 +500,8 @@ def page_profile_manager():
                     )
                     path = save_profile(profile)
                     st.session_state.active_profile = name
+                    if "profile_selector" in st.session_state:
+                        del st.session_state["profile_selector"]
                     st.session_state._flash_message = ("success", f"Profile '{name}' created successfully! Select it from the sidebar to get started.")
                     st.rerun()
 
@@ -532,6 +559,8 @@ def page_profile_manager():
                 try:
                     save_profile(profile)
                     st.session_state.active_profile = import_name
+                    if "profile_selector" in st.session_state:
+                        del st.session_state["profile_selector"]
                     st.session_state._flash_message = (
                         "success",
                         f"Cluster '{import_name}' imported successfully! "
@@ -583,6 +612,8 @@ def page_profile_manager():
                         delete_profile(profile.name)
                         if st.session_state.active_profile == profile.name:
                             st.session_state.active_profile = None
+                        if "profile_selector" in st.session_state:
+                            del st.session_state["profile_selector"]
                         st.rerun()
 
     # ── Import / Export ───────────────────────────────────────────────────
