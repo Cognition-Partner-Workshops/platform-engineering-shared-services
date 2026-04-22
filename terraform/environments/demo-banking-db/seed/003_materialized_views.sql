@@ -49,21 +49,30 @@ SELECT
     b.branch_code,
     b.branch_name,
     b.city || ', ' || b.state AS location,
-    COUNT(DISTINCT a.account_id) AS total_accounts,
-    COUNT(DISTINCT a.customer_id) AS total_customers,
-    COALESCE(SUM(a.balance), 0) AS total_deposits,
-    ROUND(COALESCE(AVG(a.balance), 0), 2) AS avg_account_balance,
-    COUNT(DISTINCT e.employee_id) AS employee_count,
-    COALESCE(SUM(e.salary), 0) AS total_payroll,
-    COUNT(DISTINCT l.loan_id) AS active_loans,
-    COALESCE(SUM(l.outstanding_balance), 0) AS total_loan_portfolio,
+    COALESCE(accts.total_accounts, 0) AS total_accounts,
+    COALESCE(accts.total_customers, 0) AS total_customers,
+    COALESCE(accts.total_deposits, 0) AS total_deposits,
+    ROUND(COALESCE(accts.avg_account_balance, 0), 2) AS avg_account_balance,
+    COALESCE(emps.employee_count, 0) AS employee_count,
+    COALESCE(emps.total_payroll, 0) AS total_payroll,
+    COALESCE(lns.active_loans, 0) AS active_loans,
+    COALESCE(lns.total_loan_portfolio, 0) AS total_loan_portfolio,
     b.opened_date
 FROM banking.branches b
-LEFT JOIN banking.accounts a ON a.branch_id = b.branch_id AND a.status = 'ACTIVE'
-LEFT JOIN banking.employees e ON e.branch_id = b.branch_id AND e.is_active = TRUE
-LEFT JOIN banking.loans l ON l.branch_id = b.branch_id AND l.status IN ('CURRENT', 'DELINQUENT')
+LEFT JOIN (
+    SELECT branch_id, COUNT(*) AS total_accounts, COUNT(DISTINCT customer_id) AS total_customers,
+           SUM(balance) AS total_deposits, AVG(balance) AS avg_account_balance
+    FROM banking.accounts WHERE status = 'ACTIVE' GROUP BY branch_id
+) accts ON accts.branch_id = b.branch_id
+LEFT JOIN (
+    SELECT branch_id, COUNT(*) AS employee_count, SUM(salary) AS total_payroll
+    FROM banking.employees WHERE is_active = TRUE GROUP BY branch_id
+) emps ON emps.branch_id = b.branch_id
+LEFT JOIN (
+    SELECT branch_id, COUNT(*) AS active_loans, SUM(outstanding_balance) AS total_loan_portfolio
+    FROM banking.loans WHERE status IN ('CURRENT', 'DELINQUENT') GROUP BY branch_id
+) lns ON lns.branch_id = b.branch_id
 WHERE b.is_active = TRUE
-GROUP BY b.branch_id, b.branch_code, b.branch_name, b.city, b.state, b.opened_date
 ORDER BY total_deposits DESC
 WITH DATA;
 
