@@ -21,7 +21,7 @@ SELECT
     c.city || ', ' || c.state AS location,
     c.credit_score,
     COUNT(DISTINCT a.account_id) AS total_accounts,
-    COALESCE(SUM(a.balance) FILTER (WHERE at.type_code = 'CHECKING'), 0) AS checking_balance,
+    COALESCE(SUM(a.balance) FILTER (WHERE at.type_code IN ('CHECKING', 'PREMIUM', 'STUDENT', 'BUSINESS')), 0) AS checking_balance,
     COALESCE(SUM(a.balance) FILTER (WHERE at.type_code = 'SAVINGS'), 0) AS savings_balance,
     COALESCE(SUM(a.balance) FILTER (WHERE at.type_code IN ('MONEY_MKT', 'CD_6MO', 'CD_12MO')), 0) AS investment_balance,
     COALESCE(SUM(a.balance), 0) AS total_deposit_balance,
