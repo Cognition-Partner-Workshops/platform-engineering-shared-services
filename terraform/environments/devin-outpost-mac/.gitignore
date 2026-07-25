@@ -12,3 +12,4 @@ crash.log
 
 # local apply logs
 apply.log
+destroy.log
