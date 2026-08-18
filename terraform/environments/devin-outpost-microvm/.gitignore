@@ -18,5 +18,5 @@ __pycache__/
 .build/
 
 # local apply logs
-apply.log
-destroy.log
+apply*.log
+destroy*.log
