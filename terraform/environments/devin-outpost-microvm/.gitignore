@@ -1,0 +1,22 @@
+.terraform/
+.terraform.lock.hcl
+terraform.tfstate
+terraform.tfstate.*
+.terraform.tfstate.lock.info
+crash.log
+*.tfvars
+!example.tfvars
+
+# Saved plans embed variable values, including the outpost token
+tfplan
+*.tfplan
+
+__pycache__/
+*.pyc
+
+# Build output: worker artifact + vendored reconciler package
+.build/
+
+# local apply logs
+apply.log
+destroy.log
