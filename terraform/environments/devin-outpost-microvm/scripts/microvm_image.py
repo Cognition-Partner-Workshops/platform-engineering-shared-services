@@ -46,6 +46,23 @@ def get_image(client, image_arn):
         raise
 
 
+def wait_while_deleting(client, image_arn, timeout, poll=5):
+    """The image, or None once it is gone.
+
+    An image still DELETING from a previous run rejects both create and update,
+    so recreating one under the same name has to wait the deletion out.
+    """
+    deadline = time.time() + timeout
+    while True:
+        image = get_image(client, image_arn)
+        if image is None or image["state"] != "DELETING":
+            return image
+        if time.time() >= deadline:
+            raise SystemExit(f"timed out after {timeout}s waiting for {image_arn} to delete")
+        print("  waiting for previous image to finish deleting", flush=True)
+        time.sleep(poll)
+
+
 def create(args, client):
     build = {
         "baseImageArn": args.base_image_arn,
@@ -71,7 +88,7 @@ def create(args, client):
         },
     }
 
-    existing = get_image(client, args.image_arn)
+    existing = wait_while_deleting(client, args.image_arn, args.timeout)
     if existing is None:
         print(f"creating microvm image {args.name}", flush=True)
         client.create_microvm_image(name=args.name, **build)

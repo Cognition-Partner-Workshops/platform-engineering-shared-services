@@ -117,6 +117,13 @@ aws lambda invoke --function-name devin-outpost-microvm-reconciler /dev/stdout  
   so the lifecycle still belongs to Terraform. Swap it for the real resources
   once they ship.
 
+  The lifecycle is split across two `terraform_data` resources on purpose.
+  `microvm_image` owns the image's *existence*, and its destroy step terminates
+  every running MicroVM — so it is only ever replaced when the image identity
+  changes. `microvm_image_version` publishes a new version when the worker
+  changes, which running MicroVMs never see. Collapsing the two would make an
+  ordinary worker deploy kill every in-flight session.
+
 ## Layout
 
 | Path | |

@@ -129,14 +129,12 @@ resource "aws_iam_role_policy" "worker" {
   policy = data.aws_iam_policy_document.worker.json
 }
 
+# Owns the image's existence, and nothing else: its destroy step drains every
+# running MicroVM, so replacing it kills all in-flight sessions. Only the image's
+# identity may trigger that -- worker content changes go through the version
+# resource below, which publishes into this same image and leaves workers alone.
 resource "terraform_data" "microvm_image" {
-  # Rebuilds on a worker source change; the script turns that into a new image
-  # version rather than a replacement.
-  triggers_replace = {
-    artifact = aws_s3_object.worker.key
-    memory   = var.microvm_memory_mib
-    port     = local.worker_hook_port
-  }
+  triggers_replace = local.microvm_image_arn
 
   input = {
     region     = var.region
@@ -144,6 +142,27 @@ resource "terraform_data" "microvm_image" {
     image_arn  = local.microvm_image_arn
     script     = "${path.module}/scripts/microvm_image.py"
     python_bin = var.python_bin
+  }
+
+  provisioner "local-exec" {
+    when = destroy
+    command = join(" ", [
+      self.input.python_bin, self.input.script, "delete",
+      "--region", self.input.region,
+      "--name", self.input.name,
+      "--image-arn", self.input.image_arn,
+    ])
+  }
+}
+
+# Creates the image on the first apply and publishes a new version whenever the
+# worker changes. The script is idempotent, and a new version only applies to
+# MicroVMs started after it, so running workers are untouched.
+resource "terraform_data" "microvm_image_version" {
+  triggers_replace = {
+    artifact = aws_s3_object.worker.key
+    memory   = var.microvm_memory_mib
+    port     = local.worker_hook_port
   }
 
   provisioner "local-exec" {
@@ -161,17 +180,7 @@ resource "terraform_data" "microvm_image" {
     ])
   }
 
-  provisioner "local-exec" {
-    when = destroy
-    command = join(" ", [
-      self.input.python_bin, self.input.script, "delete",
-      "--region", self.input.region,
-      "--name", self.input.name,
-      "--image-arn", self.input.image_arn,
-    ])
-  }
-
-  depends_on = [aws_iam_role_policy.image_build]
+  depends_on = [aws_iam_role_policy.image_build, terraform_data.microvm_image]
 }
 
 # --- Reconciler ------------------------------------------------------------
@@ -326,7 +335,7 @@ resource "aws_lambda_function" "reconciler" {
   depends_on = [
     aws_cloudwatch_log_group.reconciler,
     aws_iam_role_policy.reconciler,
-    terraform_data.microvm_image,
+    terraform_data.microvm_image_version,
   ]
 }
 

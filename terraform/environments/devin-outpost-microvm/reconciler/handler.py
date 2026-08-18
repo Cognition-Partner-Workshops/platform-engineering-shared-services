@@ -17,7 +17,6 @@ pure: the whole session-to-MicroVM lifecycle mapping is then testable without a
 queue server or an AWS account.
 """
 
-import hashlib
 import json
 import logging
 import os
@@ -25,6 +24,7 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+import uuid
 
 import boto3
 
@@ -248,9 +248,7 @@ class Reconciler:
             "runHookPayload": json.dumps({k: v for k, v in payload.items() if v}),
             "maximumDurationInSeconds": self.max_duration,
             "logging": {"cloudWatch": {"logGroup": self.log_group, "logStream": session_id}},
-            # Deterministic so a retry after a timed-out RunMicrovm reuses the
-            # existing MicroVM instead of stranding a second one.
-            "clientToken": hashlib.sha256(session_id.encode()).hexdigest()[:64],
+            "clientToken": self.reserve_attempt(session_id),
         }
         if self.ingress_connectors:
             request["ingressNetworkConnectors"] = self.ingress_connectors
@@ -261,15 +259,38 @@ class Reconciler:
         # only. With a policy set it would be suspended mid-session.
 
         microvm = self.microvms.run_microvm(**request)
-        self.table.put_item(
-            Item={
-                "session_id": session_id,
-                "microvm_id": microvm["microvmId"],
-                "updated_at": int(time.time()),
-                "expires_at": int(time.time()) + self.record_ttl,
-            }
+        self.table.update_item(
+            Key={"session_id": session_id},
+            UpdateExpression="SET microvm_id = :m, updated_at = :n",
+            ExpressionAttributeValues={":m": microvm["microvmId"], ":n": int(time.time())},
         )
         log.info("session %s -> microvm %s", session_id, microvm["microvmId"])
+
+    def reserve_attempt(self, session_id):
+        """The RunMicrovm idempotency token for this session's current launch.
+
+        Written before RunMicrovm so that retrying a call that timed out reuses
+        the MicroVM it already started rather than stranding a second one. It has
+        to be per-launch rather than per-session: a session gets a fresh MicroVM
+        after a suspend or a lost claim, and reusing the token there would hand
+        back the terminated one. `tear_down` drops the record, so the next launch
+        reserves a new token.
+        """
+        now = int(time.time())
+        record = self.table.update_item(
+            Key={"session_id": session_id},
+            UpdateExpression=(
+                "SET attempt_token = if_not_exists(attempt_token, :t), "
+                "updated_at = :n, expires_at = :e"
+            ),
+            ExpressionAttributeValues={
+                ":t": uuid.uuid4().hex,
+                ":n": now,
+                ":e": now + self.record_ttl,
+            },
+            ReturnValues="ALL_NEW",
+        )["Attributes"]
+        return record["attempt_token"]
 
     def tear_down(self, session_id, microvm_id):
         if microvm_id:
@@ -281,9 +302,13 @@ class Reconciler:
         try:
             self.client.release(session_id)
         except urllib.error.HTTPError as error:
-            if not is_conflict(error):
+            # 409: the claim already moved on. 404/410: the session is gone from
+            # the queue. Either way the record has nothing left to track, and
+            # keeping it would replay this teardown every pass until its TTL.
+            if not is_conflict(error) and error.code not in (404, 410):
                 raise
-        self.table.delete_item(Key={"session_id": session_id})
+        finally:
+            self.table.delete_item(Key={"session_id": session_id})
 
     def terminate_untracked(self):
         """Terminate MicroVMs from our image that no record points at.
