@@ -91,6 +91,15 @@ aws logs tail /devin/outpost/devin-outpost-microvm/workers --follow   # one stre
 aws lambda invoke --function-name devin-outpost-microvm-reconciler /dev/stdout   # skip the schedule
 ```
 
+## Putting workers in a VPC
+
+Workers default to the AWS-managed `INTERNET_EGRESS` connector: plain internet,
+no VPC, so they can reach nothing private. Set `egress_connector_arn` to a VPC
+egress connector and the reconciler launches every worker through it, at which
+point the VPC's subnets and security groups decide what a worker can reach.
+`terraform/environments/devin-outpost-vpc-demo` builds such a VPC and
+demonstrates the difference between a permitted and a restricted worker.
+
 ## Limits and trade-offs
 
 - **8 hour ceiling per session.** `maximumDurationInSeconds` caps at 28800, and

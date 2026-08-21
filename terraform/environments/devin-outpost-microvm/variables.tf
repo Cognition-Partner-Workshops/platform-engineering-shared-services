@@ -93,6 +93,17 @@ variable "enable_ingress" {
   default     = false
 }
 
+variable "egress_connector_arn" {
+  description = <<-EOT
+    Network connector the workers egress through. Empty means the AWS-managed
+    INTERNET_EGRESS connector: plain internet, no VPC. Point it at a VPC egress
+    connector (see the devin-outpost-vpc-demo stack) to place workers inside a VPC,
+    where their reachability is governed by that VPC's subnets and security groups.
+  EOT
+  type        = string
+  default     = ""
+}
+
 variable "log_retention_days" {
   description = "CloudWatch log retention for the reconciler, image builds and workers."
   type        = number

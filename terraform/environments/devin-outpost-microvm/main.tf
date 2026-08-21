@@ -10,7 +10,7 @@ locals {
   connector_prefix  = "arn:aws:lambda:${var.region}:aws:network-connector:aws-network-connector"
 
   ingress_connector = "${local.connector_prefix}:${var.enable_ingress ? "ALL_INGRESS" : "NO_INGRESS"}"
-  egress_connector  = "${local.connector_prefix}:INTERNET_EGRESS"
+  egress_connector  = var.egress_connector_arn != "" ? var.egress_connector_arn : "${local.connector_prefix}:INTERNET_EGRESS"
 
   worker_hook_port = 8080
   worker_source    = "${path.module}/worker"
@@ -259,9 +259,8 @@ data "aws_iam_policy_document" "reconciler" {
     effect = "Allow"
     actions = [
       "dynamodb:DeleteItem",
-      "dynamodb:GetItem",
-      "dynamodb:PutItem",
       "dynamodb:Scan",
+      "dynamodb:UpdateItem",
     ]
     resources = [aws_dynamodb_table.sessions.arn]
   }
@@ -277,18 +276,23 @@ data "aws_iam_policy_document" "reconciler" {
     resources = ["*"]
   }
 
+  # Attaching a connector to a MicroVM is authorized separately from RunMicrovm,
+  # which is what keeps a caller from placing workers on a network it was not
+  # granted.
+  statement {
+    effect    = "Allow"
+    actions   = ["lambda:PassNetworkConnector"]
+    resources = [local.ingress_connector, local.egress_connector]
+  }
+
   # run-microvm hands the worker role to the MicroVM, which requires the
-  # reconciler to be allowed to pass it.
+  # reconciler to be allowed to pass it. RunMicrovm does not populate
+  # iam:PassedToService, so the grant is scoped by role instead of by service;
+  # the worker role exists only for this stack and only writes worker logs.
   statement {
     effect    = "Allow"
     actions   = ["iam:PassRole"]
     resources = [aws_iam_role.worker.arn]
-
-    condition {
-      test     = "StringEquals"
-      variable = "iam:PassedToService"
-      values   = ["lambda.amazonaws.com"]
-    }
   }
 }
 
