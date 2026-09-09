@@ -50,9 +50,9 @@ variable "master_password" {
 }
 
 variable "publicly_accessible" {
-  description = "Whether the RDS instance is publicly accessible"
+  description = "Whether the RDS instance gets a public IP. Defaults to false; when enabled, allowed_cidr_blocks must list specific trusted CIDRs (VPN/office egress) and must not contain 0.0.0.0/0 or ::/0."
   type        = bool
-  default     = true
+  default     = false
 }
 
 variable "vpc_cidr" {
@@ -62,9 +62,17 @@ variable "vpc_cidr" {
 }
 
 variable "allowed_cidr_blocks" {
-  description = "CIDR blocks allowed to connect to the database"
+  description = "CIDR blocks allowed to connect to the database on 5432/tcp. Empty (default) restricts ingress to the module's own VPC CIDR. Wildcard CIDRs (0.0.0.0/0, ::/0) are rejected."
   type        = list(string)
-  default     = ["0.0.0.0/0"]
+  default     = []
+
+  validation {
+    condition = alltrue([
+      for cidr in var.allowed_cidr_blocks :
+      !contains(["0.0.0.0/0", "::/0"], cidr) && !can(regex("/0$", cidr))
+    ])
+    error_message = "allowed_cidr_blocks must not contain wildcard CIDRs (0.0.0.0/0, ::/0); list specific trusted CIDRs instead."
+  }
 }
 
 variable "tags" {
