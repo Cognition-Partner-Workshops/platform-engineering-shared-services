@@ -1,7 +1,9 @@
 ################################################################################
 # RDS PostgreSQL Instance
 #
-# Provisions a single-AZ PostgreSQL database with configurable public access.
+# Provisions a single-AZ PostgreSQL database. Private (no public IP, ingress
+# limited to the module VPC) by default; public access requires explicitly
+# opting in and listing specific trusted CIDRs.
 # Designed for demo/prototype workloads — not intended for production use.
 ################################################################################
 
@@ -75,6 +77,10 @@ resource "aws_route_table_association" "b" {
 # Security Group — allows PostgreSQL from allowed CIDRs
 ################################################################################
 
+locals {
+  ingress_cidr_blocks = length(var.allowed_cidr_blocks) > 0 ? var.allowed_cidr_blocks : [var.vpc_cidr]
+}
+
 resource "aws_security_group" "rds" {
   name_prefix = "${var.identifier}-rds-"
   vpc_id      = aws_vpc.this.id
@@ -85,7 +91,7 @@ resource "aws_security_group" "rds" {
     from_port   = 5432
     to_port     = 5432
     protocol    = "tcp"
-    cidr_blocks = var.allowed_cidr_blocks
+    cidr_blocks = local.ingress_cidr_blocks
   }
 
   egress {
@@ -143,4 +149,11 @@ resource "aws_db_instance" "this" {
   backup_retention_period = 0
 
   tags = var.tags
+
+  lifecycle {
+    precondition {
+      condition     = !var.publicly_accessible || length(var.allowed_cidr_blocks) > 0
+      error_message = "publicly_accessible = true requires allowed_cidr_blocks to list specific trusted CIDRs; a public instance must not fall back to the default ingress."
+    }
+  }
 }

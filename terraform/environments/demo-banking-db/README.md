@@ -6,9 +6,9 @@ Built for quick demos showing how Devin can connect to a data layer via JDBC or 
 
 ## Architecture
 
-- **RDS PostgreSQL 16** on `db.t4g.micro` (single-AZ, publicly accessible)
+- **RDS PostgreSQL 16** on `db.t4g.micro` (single-AZ, private by default)
 - Dedicated VPC with public subnets and internet gateway
-- Security group open on port 5432 (configurable CIDR)
+- Security group on port 5432 restricted to the VPC CIDR by default; trusted operator CIDRs can be allow-listed (wildcards such as `0.0.0.0/0` are rejected)
 - S3 remote state backend with DynamoDB locking
 
 ## Quick Start
@@ -27,6 +27,16 @@ cd terraform/environments/demo-banking-db
 terraform init
 terraform apply
 ```
+
+By default the instance has no public IP and only accepts connections from inside its VPC (e.g. via a bastion, VPN, or SSM port-forward). To connect directly from a workstation, opt in explicitly and allow-list only your egress IP:
+
+```bash
+terraform apply \
+  -var 'publicly_accessible=true' \
+  -var 'allowed_cidr_blocks=["203.0.113.10/32"]'
+```
+
+`publicly_accessible=true` without `allowed_cidr_blocks`, or any wildcard CIDR (`0.0.0.0/0`, `::/0`), is rejected at plan time.
 
 ### Seed the Database
 

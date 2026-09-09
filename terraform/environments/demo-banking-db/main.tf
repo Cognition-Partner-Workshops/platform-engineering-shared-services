@@ -1,9 +1,13 @@
 ################################################################################
 # Demo Banking Database
 #
-# Provisions a publicly accessible RDS PostgreSQL instance seeded with
-# banking-themed data. Intended for short-lived demos showcasing JDBC/MCP
-# connector integration, DDL introspection, and materialized view queries.
+# Provisions an RDS PostgreSQL instance seeded with banking-themed data.
+# Intended for short-lived demos showcasing JDBC/MCP connector integration,
+# DDL introspection, and materialized view queries.
+#
+# The database is private by default. To reach it from outside the VPC, set
+# publicly_accessible = true AND allowed_cidr_blocks to specific trusted
+# operator CIDRs (VPN/office egress). Wildcard CIDRs are rejected.
 #
 # Teardown:
 #   cd terraform/environments/demo-banking-db
@@ -60,10 +64,10 @@ module "rds" {
   engine_version        = "16.4"
   allocated_storage     = 20
   max_allocated_storage = 50
-  publicly_accessible   = true
+  publicly_accessible   = var.publicly_accessible
 
   vpc_cidr            = "10.100.0.0/16"
-  allowed_cidr_blocks = ["0.0.0.0/0"]
+  allowed_cidr_blocks = var.allowed_cidr_blocks
 
   tags = local.tags
 }
@@ -88,6 +92,18 @@ variable "db_password" {
   description = "Database master password"
   type        = string
   sensitive   = true
+}
+
+variable "publicly_accessible" {
+  description = "Assign a public IP to the RDS instance. Requires allowed_cidr_blocks to list specific trusted CIDRs."
+  type        = bool
+  default     = false
+}
+
+variable "allowed_cidr_blocks" {
+  description = "Trusted CIDRs allowed to reach PostgreSQL (5432/tcp), e.g. [\"203.0.113.10/32\"]. Empty restricts access to the database VPC. Wildcards (0.0.0.0/0) are rejected."
+  type        = list(string)
+  default     = []
 }
 
 ################################################################################
