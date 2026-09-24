@@ -1,0 +1,107 @@
+# Jaeger (v2, all-in-one) Helm chart overrides
+# Chart: jaegertracing/jaeger
+# Release: jaeger (namespace: monitoring)
+#
+# In-memory storage (no external DB), ClusterIP only. Traces arrive via the
+# OpenTelemetry Collector (otel-collector.monitoring.svc.cluster.local) which
+# exports OTLP/gRPC to jaeger.monitoring.svc.cluster.local:4317.
+
+fullnameOverride: jaeger
+
+# Disable everything that assumes Elasticsearch / Cassandra.
+provisionDataStore:
+  cassandra: false
+  elasticsearch: false
+  kafka: false
+spark:
+  enabled: false
+esIndexCleaner:
+  enabled: false
+esRollover:
+  enabled: false
+esLookback:
+  enabled: false
+
+jaeger:
+  enabled: true
+  replicas: 1
+  image:
+    # Jaeger >= 2.21 dropped the v1 HTTP query API (/api/services, /api/traces),
+    # which the Grafana Jaeger datasource still relies on.
+    tag: "2.20.0"
+  resources:
+    requests:
+      cpu: 50m
+      memory: 128Mi
+    limits:
+      cpu: 500m
+      memory: 512Mi
+  ingress:
+    enabled: true
+    ingressClassName: nginx
+    pathType: Prefix
+    annotations:
+      nginx.ingress.kubernetes.io/ssl-redirect: "true"
+      nginx.ingress.kubernetes.io/auth-type: basic
+      nginx.ingress.kubernetes.io/auth-secret: observability-basic-auth
+      nginx.ingress.kubernetes.io/auth-realm: "Jaeger"
+    hosts:
+      - jaeger.otterworks.app
+    # No secretName: ingress-nginx serves the cert-manager wildcard as default cert.
+    tls:
+      - hosts:
+          - jaeger.otterworks.app
+
+# Full Jaeger v2 config: OTLP in, in-memory storage, query UI + healthcheck.
+userconfig:
+  service:
+    extensions: [jaeger_storage, jaeger_query, healthcheckv2]
+    pipelines:
+      traces:
+        receivers: [otlp]
+        processors: [batch]
+        exporters: [jaeger_storage_exporter]
+    telemetry:
+      resource:
+        service.name: jaeger
+      metrics:
+        level: detailed
+        readers:
+          - pull:
+              exporter:
+                prometheus:
+                  host: 0.0.0.0
+                  port: 8888
+  extensions:
+    healthcheckv2:
+      use_v2: true
+      http:
+        endpoint: 0.0.0.0:13133
+    jaeger_query:
+      storage:
+        traces: primary_store
+      ui:
+        config_file: /etc/jaeger/ui-config.json
+    jaeger_storage:
+      backends:
+        primary_store:
+          memory:
+            max_traces: 50000
+  receivers:
+    otlp:
+      protocols:
+        grpc:
+          endpoint: 0.0.0.0:4317
+        http:
+          endpoint: 0.0.0.0:4318
+  processors:
+    batch: {}
+  exporters:
+    jaeger_storage_exporter:
+      trace_storage: primary_store
+
+uiconfig:
+  dependencies:
+    menuEnabled: true
+  monitor:
+    menuEnabled: false

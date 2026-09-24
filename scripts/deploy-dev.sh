@@ -93,12 +93,11 @@ helm upgrade --install cert-manager jetstack/cert-manager \
 echo "  Applying ClusterIssuers..."
 kubectl apply -f "$REPO_ROOT/helm-releases/cert-manager/cluster-issuer.yaml"
 
-# Prometheus + Grafana
-echo "  Installing kube-prometheus-stack..."
-helm upgrade --install prometheus prometheus-community/kube-prometheus-stack \
-  -f "$REPO_ROOT/helm-releases/monitoring/prometheus/values.yaml" \
-  -f "$REPO_ROOT/helm-releases/monitoring/grafana/values.yaml" \
-  -n monitoring --create-namespace --wait --timeout 5m
+# Observability stack: kube-prometheus-stack (Prometheus, Alertmanager, Grafana),
+# Jaeger + OpenTelemetry Collector. Webhook URLs are taken from
+# DEVIN_WEBHOOK_URL / SLACK_WEBHOOK_URL if set (see scripts/deploy-observability.sh).
+echo "  Installing observability stack (monitoring namespace)..."
+"$SCRIPT_DIR/deploy-observability.sh"
 
 # Argo CD
 echo "  Installing Argo CD..."
