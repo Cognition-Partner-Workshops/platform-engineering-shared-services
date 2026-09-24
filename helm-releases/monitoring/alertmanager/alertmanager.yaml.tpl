@@ -9,8 +9,15 @@
 #   DEVIN_WEBHOOK_URL     Devin Automation incoming-webhook URL
 #   DEVIN_WEBHOOK_SECRET  the Automation's one-time webhook secret, sent as X-Webhook-Secret
 #   SLACK_WEBHOOK_URL     Slack incoming-webhook URL
-# When unset, both URLs default to the in-cluster alert-sink so the config still
-# validates and deliveries can be observed in `kubectl logs deploy/alert-sink`.
+#   SLACK_ROUTE / SLACK_RECEIVER
+#                         the slack-oncall route and receiver blocks (from
+#                         slack-route.yaml.frag / slack-receiver.yaml.frag);
+#                         empty when SLACK_WEBHOOK_URL is unset, because the
+#                         Slack notifier rejects any reply that is not Slack's
+#                         `ok`, so pointing it at the echo sink fails every send
+# When DEVIN_WEBHOOK_URL is unset it defaults to the in-cluster alert-sink so the
+# config still validates and deliveries can be observed in
+# `kubectl logs deploy/alert-sink`.
 global:
   resolve_timeout: 5m
 
@@ -25,10 +32,7 @@ route:
       matchers:
         - page = "devin"
       continue: true
-    - receiver: slack-oncall
-      matchers:
-        - page = "devin"
-      continue: true
+${SLACK_ROUTE}
 
 receivers:
   - name: "null"
@@ -45,16 +49,7 @@ receivers:
             # The whole file already lives in a Kubernetes Secret.
             X-Webhook-Secret:
               values: ["${DEVIN_WEBHOOK_SECRET}"]
-  - name: slack-oncall
-    slack_configs:
-      - api_url: "${SLACK_WEBHOOK_URL}"
-        channel: "#oncall"
-        send_resolved: true
-        title: '[{{ .Status | toUpper }}] {{ .CommonLabels.alertname }} ({{ .CommonLabels.namespace }})'
-        text: >-
-          {{ range .Alerts }}*{{ .Labels.severity | default "info" }}* {{ .Annotations.summary | default .Labels.alertname }}
-          {{ .Annotations.description }}
-          {{ end }}
+${SLACK_RECEIVER}
 
 inhibit_rules:
   - source_matchers:

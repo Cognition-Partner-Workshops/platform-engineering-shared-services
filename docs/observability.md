@@ -44,7 +44,8 @@ Environment variables understood by the script:
 |---|---|---|
 | `DEVIN_WEBHOOK_URL` | `http://alert-sink.monitoring.svc.cluster.local:8080/devin-automation` | `devin-automation` receiver |
 | `DEVIN_WEBHOOK_SECRET` | `unset` | sent as `X-Webhook-Secret` on every `devin-automation` delivery (Devin Automations reject deliveries without it) |
-| `SLACK_WEBHOOK_URL` | `http://alert-sink.monitoring.svc.cluster.local:8080/slack-oncall` | `slack-oncall` receiver (`slack_configs.api_url`) |
+| `SLACK_WEBHOOK_URL` | unset | `slack-oncall` receiver (`slack_configs.api_url`). When unset the `slack-oncall` route and receiver are omitted from the rendered config: the Slack notifier treats any reply other than Slack's `ok` as a failed send, so pointing it at the echo sink would fail 100% of deliveries and page `AlertmanagerFailedToSendAlerts`. |
+| `SLACK_CHANNEL` | `#oncall` | channel for the `slack-oncall` receiver |
 | `GRAFANA_ADMIN_PASSWORD` | random, generated once | Grafana `admin` password (Secret `grafana-admin`) |
 | `OBS_BASIC_AUTH_USER` / `OBS_BASIC_AUTH_PASSWORD` | `ops` / random, generated once | nginx basic auth for Prometheus, Alertmanager, Jaeger (Secret `observability-basic-auth`) |
 
@@ -119,9 +120,9 @@ because no selector label is required.
 
 ### Alerts — `PrometheusRule`
 
-Alerts labelled `page: devin` are routed to **both** the `devin-automation`
-webhook and the `slack-oncall` receiver (`continue: true`). Everything else goes
-to the `null` receiver. Grouping: `alertname,namespace`; `group_wait: 10s`,
+Alerts labelled `page: devin` are routed to the `devin-automation` webhook and,
+when `SLACK_WEBHOOK_URL` is set, **also** to the `slack-oncall` receiver
+(`continue: true`). Everything else goes to the `null` receiver. Grouping: `alertname,namespace`; `group_wait: 10s`,
 `group_interval: 30s`, `repeat_interval: 1h`.
 
 ```yaml
@@ -230,8 +231,10 @@ DEVIN_WEBHOOK_URL='https://.../new' DEVIN_WEBHOOK_SECRET='...' SLACK_WEBHOOK_URL
 or only the Secret, without touching Helm releases:
 
 ```bash
-export DEVIN_WEBHOOK_URL='https://.../new' DEVIN_WEBHOOK_SECRET='...' SLACK_WEBHOOK_URL='https://hooks.slack.com/...'
-envsubst '${DEVIN_WEBHOOK_URL} ${DEVIN_WEBHOOK_SECRET} ${SLACK_WEBHOOK_URL}' \
+export DEVIN_WEBHOOK_URL='https://.../new' DEVIN_WEBHOOK_SECRET='...' SLACK_WEBHOOK_URL='https://hooks.slack.com/...' SLACK_CHANNEL='#oncall'
+export SLACK_ROUTE="$(<helm-releases/monitoring/alertmanager/slack-route.yaml.frag)"   # "" to omit Slack
+export SLACK_RECEIVER="$(envsubst '${SLACK_WEBHOOK_URL} ${SLACK_CHANNEL}' <helm-releases/monitoring/alertmanager/slack-receiver.yaml.frag)"
+envsubst '${DEVIN_WEBHOOK_URL} ${DEVIN_WEBHOOK_SECRET} ${SLACK_ROUTE} ${SLACK_RECEIVER}' \
   < helm-releases/monitoring/alertmanager/alertmanager.yaml.tpl \
   | kubectl -n monitoring create secret generic alertmanager-config \
       --from-file=alertmanager.yaml=/dev/stdin --dry-run=client -o yaml \

@@ -12,9 +12,11 @@
 #
 # Environment (all optional):
 #   DEVIN_WEBHOOK_URL       Devin Automation incoming-webhook URL for page=devin alerts
+#                           (defaults to http://alert-sink.monitoring.svc:8080/...)
 #   DEVIN_WEBHOOK_SECRET    the Automation's webhook secret (sent as X-Webhook-Secret)
-#   SLACK_WEBHOOK_URL       Slack incoming-webhook URL for page=devin alerts
-#                           (both default to http://alert-sink.monitoring.svc:8080/...)
+#   SLACK_WEBHOOK_URL       Slack incoming-webhook URL for page=devin alerts; when
+#                           unset the slack-oncall route is omitted entirely
+#   SLACK_CHANNEL           Slack channel for slack-oncall (default: #oncall)
 #   GRAFANA_ADMIN_PASSWORD  Grafana admin password (generated on first run if unset)
 #   OBS_BASIC_AUTH_USER     Basic-auth user for prometheus/alertmanager/jaeger ingresses (default: ops)
 #   OBS_BASIC_AUTH_PASSWORD Basic-auth password (generated on first run if unset)
@@ -38,8 +40,9 @@ OTEL_CHART_VERSION="${OTEL_CHART_VERSION:-0.173.1}"
 
 SINK_BASE="http://alert-sink.${NAMESPACE}.svc.cluster.local:8080"
 export DEVIN_WEBHOOK_URL="${DEVIN_WEBHOOK_URL:-${SINK_BASE}/devin-automation}"
-export SLACK_WEBHOOK_URL="${SLACK_WEBHOOK_URL:-${SINK_BASE}/slack-oncall}"
 export DEVIN_WEBHOOK_SECRET="${DEVIN_WEBHOOK_SECRET:-unset}"
+export SLACK_WEBHOOK_URL="${SLACK_WEBHOOK_URL:-}"
+export SLACK_CHANNEL="${SLACK_CHANNEL:-#oncall}"
 
 KUBECTL=(kubectl)
 HELM=(helm)
@@ -90,14 +93,25 @@ log "Ensuring namespace ${NAMESPACE}..."
   app.kubernetes.io/part-of=observability platform/team=platform --overwrite >/dev/null
 
 log "Rendering Alertmanager config Secret (alertmanager-config)..."
+# The Slack notifier treats any reply other than Slack's own `ok` as a failed
+# send, so the slack-oncall route is only rendered when a real webhook is set.
+if [[ -n "$SLACK_WEBHOOK_URL" ]]; then
+  SLACK_ROUTE="$(<"$VALUES_DIR/alertmanager/slack-route.yaml.frag")"
+  # shellcheck disable=SC2016  # envsubst takes the literal variable list
+  SLACK_RECEIVER="$(envsubst '${SLACK_WEBHOOK_URL} ${SLACK_CHANNEL}' <"$VALUES_DIR/alertmanager/slack-receiver.yaml.frag")"
+else
+  SLACK_ROUTE=""
+  SLACK_RECEIVER=""
+fi
+export SLACK_ROUTE SLACK_RECEIVER
 # shellcheck disable=SC2016  # envsubst takes the literal variable list
-envsubst '${DEVIN_WEBHOOK_URL} ${DEVIN_WEBHOOK_SECRET} ${SLACK_WEBHOOK_URL}' \
+envsubst '${DEVIN_WEBHOOK_URL} ${DEVIN_WEBHOOK_SECRET} ${SLACK_ROUTE} ${SLACK_RECEIVER}' \
   <"$VALUES_DIR/alertmanager/alertmanager.yaml.tpl" \
   | "${KUBECTL[@]}" -n "$NAMESPACE" create secret generic alertmanager-config \
       --from-file=alertmanager.yaml=/dev/stdin --dry-run=client -o yaml \
   | "${KUBECTL[@]}" apply -f -
 [[ "$DEVIN_WEBHOOK_URL" == "$SINK_BASE"* ]] && echo "    DEVIN_WEBHOOK_URL unset -> routing devin-automation to alert-sink"
-[[ "$SLACK_WEBHOOK_URL" == "$SINK_BASE"* ]] && echo "    SLACK_WEBHOOK_URL unset -> routing slack-oncall to alert-sink"
+[[ -z "$SLACK_WEBHOOK_URL" ]] && echo "    SLACK_WEBHOOK_URL unset -> slack-oncall route omitted"
 
 if ! "${KUBECTL[@]}" -n "$NAMESPACE" get secret grafana-admin >/dev/null 2>&1 || [[ -n "${GRAFANA_ADMIN_PASSWORD:-}" ]]; then
   log "Writing Grafana admin Secret (grafana-admin)..."
