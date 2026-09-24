@@ -40,8 +40,11 @@ receivers:
         max_alerts: 0
         http_config:
           http_headers:
+            # `values`, not `secrets`: prometheus-operator re-marshals this file and
+            # writes Secret-typed fields back as the literal string "<secret>".
+            # The whole file already lives in a Kubernetes Secret.
             X-Webhook-Secret:
-              secrets: ["${DEVIN_WEBHOOK_SECRET}"]
+              values: ["${DEVIN_WEBHOOK_SECRET}"]
   - name: slack-oncall
     slack_configs:
       - api_url: "${SLACK_WEBHOOK_URL}"
