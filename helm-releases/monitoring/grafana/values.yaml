@@ -1,26 +1,68 @@
 # Grafana values (included via kube-prometheus-stack)
 grafana:
   enabled: true
-  adminPassword: changeme
+  # Admin credentials come from the `grafana-admin` Secret, created by
+  # scripts/deploy-observability.sh (GRAFANA_ADMIN_PASSWORD env or generated).
+  admin:
+    existingSecret: grafana-admin
+    userKey: admin-user
+    passwordKey: admin-password
   persistence:
     enabled: true
+    storageClassName: gp2
     size: 5Gi
   resources:
     requests:
-      cpu: 100m
-      memory: 128Mi
+      cpu: 50m
+      memory: 192Mi
     limits:
       cpu: 500m
-      memory: 256Mi
-  dashboardProviders:
-    dashboardproviders.yaml:
-      apiVersion: 1
-      providers:
-        - name: default
-          orgId: 1
-          folder: ''
-          type: file
-          disableDeletion: false
-          editable: true
-          options:
-            path: /var/lib/grafana/dashboards/default
+      memory: 512Mi
+  ingress:
+    enabled: true
+    ingressClassName: nginx
+    annotations:
+      nginx.ingress.kubernetes.io/ssl-redirect: "true"
+    hosts:
+      - grafana.otterworks.app
+    path: /
+    pathType: Prefix
+    tls:
+      - hosts:
+          - grafana.otterworks.app
+  grafana.ini:
+    server:
+      root_url: https://grafana.otterworks.app
+    analytics:
+      check_for_updates: false
+  sidecar:
+    resources:
+      requests:
+        cpu: 10m
+        memory: 32Mi
+      limits:
+        cpu: 100m
+        memory: 128Mi
+    dashboards:
+      enabled: true
+      label: grafana_dashboard
+      labelValue: "1"
+      # Tenants ship dashboards as ConfigMaps labelled grafana_dashboard=1 in
+      # their own namespace; folderAnnotation lets them pick a folder.
+      searchNamespace: ALL
+      folderAnnotation: grafana_folder
+      provider:
+        foldersFromFilesStructure: true
+    datasources:
+      enabled: true
+      # Provisions the Prometheus + Alertmanager datasources for this release.
+      defaultDatasourceEnabled: true
+      alertmanager:
+        enabled: true
+  additionalDataSources:
+    - name: Jaeger
+      type: jaeger
+      uid: jaeger
+      access: proxy
+      url: http://jaeger.monitoring.svc.cluster.local:16686
+      editable: false
