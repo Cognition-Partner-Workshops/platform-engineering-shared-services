@@ -29,7 +29,8 @@ one exists. Control-plane scrapers that do not work on EKS (`kubeEtcd`,
 ./scripts/deploy-observability.sh
 
 # with real webhook targets
-DEVIN_WEBHOOK_URL='https://.../webhook' \
+DEVIN_WEBHOOK_URL='https://.../api/webhooks/automations/<org>/<automation>' \
+DEVIN_WEBHOOK_SECRET='<secret returned when the Automation was created>' \
 SLACK_WEBHOOK_URL='https://hooks.slack.com/services/...' \
 ./scripts/deploy-observability.sh
 ```
@@ -42,6 +43,7 @@ Environment variables understood by the script:
 | Variable | Default | Purpose |
 |---|---|---|
 | `DEVIN_WEBHOOK_URL` | `http://alert-sink.monitoring.svc.cluster.local:8080/devin-automation` | `devin-automation` receiver |
+| `DEVIN_WEBHOOK_SECRET` | `unset` | sent as `X-Webhook-Secret` on every `devin-automation` delivery (Devin Automations reject deliveries without it) |
 | `SLACK_WEBHOOK_URL` | `http://alert-sink.monitoring.svc.cluster.local:8080/slack-oncall` | `slack-oncall` receiver (`slack_configs.api_url`) |
 | `GRAFANA_ADMIN_PASSWORD` | random, generated once | Grafana `admin` password (Secret `grafana-admin`) |
 | `OBS_BASIC_AUTH_USER` / `OBS_BASIC_AUTH_PASSWORD` | `ops` / random, generated once | nginx basic auth for Prometheus, Alertmanager, Jaeger (Secret `observability-basic-auth`) |
@@ -221,15 +223,15 @@ than `AlertmanagerConfig` CRDs or the chart's inline `alertmanager.config`:
 ## Rotating the webhook URLs
 
 ```bash
-DEVIN_WEBHOOK_URL='https://.../new' SLACK_WEBHOOK_URL='https://hooks.slack.com/...' \
+DEVIN_WEBHOOK_URL='https://.../new' DEVIN_WEBHOOK_SECRET='...' SLACK_WEBHOOK_URL='https://hooks.slack.com/...' \
   ./scripts/deploy-observability.sh
 ```
 
 or only the Secret, without touching Helm releases:
 
 ```bash
-export DEVIN_WEBHOOK_URL='https://.../new' SLACK_WEBHOOK_URL='https://hooks.slack.com/...'
-envsubst '${DEVIN_WEBHOOK_URL} ${SLACK_WEBHOOK_URL}' \
+export DEVIN_WEBHOOK_URL='https://.../new' DEVIN_WEBHOOK_SECRET='...' SLACK_WEBHOOK_URL='https://hooks.slack.com/...'
+envsubst '${DEVIN_WEBHOOK_URL} ${DEVIN_WEBHOOK_SECRET} ${SLACK_WEBHOOK_URL}' \
   < helm-releases/monitoring/alertmanager/alertmanager.yaml.tpl \
   | kubectl -n monitoring create secret generic alertmanager-config \
       --from-file=alertmanager.yaml=/dev/stdin --dry-run=client -o yaml \

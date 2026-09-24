@@ -6,9 +6,10 @@
 # helm-releases/monitoring/prometheus/values.yaml.
 #
 # Variables (from the environment at apply time, never committed):
-#   DEVIN_WEBHOOK_URL  Devin Automation incoming-webhook URL
-#   SLACK_WEBHOOK_URL  Slack incoming-webhook URL
-# When unset, both default to the in-cluster alert-sink so the config still
+#   DEVIN_WEBHOOK_URL     Devin Automation incoming-webhook URL
+#   DEVIN_WEBHOOK_SECRET  the Automation's one-time webhook secret, sent as X-Webhook-Secret
+#   SLACK_WEBHOOK_URL     Slack incoming-webhook URL
+# When unset, both URLs default to the in-cluster alert-sink so the config still
 # validates and deliveries can be observed in `kubectl logs deploy/alert-sink`.
 global:
   resolve_timeout: 5m
@@ -34,8 +35,13 @@ receivers:
   - name: devin-automation
     webhook_configs:
       - url: "${DEVIN_WEBHOOK_URL}"
-        send_resolved: true
+        # firing only: a resolved notification must never start a responder session
+        send_resolved: false
         max_alerts: 0
+        http_config:
+          http_headers:
+            X-Webhook-Secret:
+              secrets: ["${DEVIN_WEBHOOK_SECRET}"]
   - name: slack-oncall
     slack_configs:
       - api_url: "${SLACK_WEBHOOK_URL}"

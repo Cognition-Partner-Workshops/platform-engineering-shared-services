@@ -12,6 +12,7 @@
 #
 # Environment (all optional):
 #   DEVIN_WEBHOOK_URL       Devin Automation incoming-webhook URL for page=devin alerts
+#   DEVIN_WEBHOOK_SECRET    the Automation's webhook secret (sent as X-Webhook-Secret)
 #   SLACK_WEBHOOK_URL       Slack incoming-webhook URL for page=devin alerts
 #                           (both default to http://alert-sink.monitoring.svc:8080/...)
 #   GRAFANA_ADMIN_PASSWORD  Grafana admin password (generated on first run if unset)
@@ -38,6 +39,7 @@ OTEL_CHART_VERSION="${OTEL_CHART_VERSION:-0.173.1}"
 SINK_BASE="http://alert-sink.${NAMESPACE}.svc.cluster.local:8080"
 export DEVIN_WEBHOOK_URL="${DEVIN_WEBHOOK_URL:-${SINK_BASE}/devin-automation}"
 export SLACK_WEBHOOK_URL="${SLACK_WEBHOOK_URL:-${SINK_BASE}/slack-oncall}"
+export DEVIN_WEBHOOK_SECRET="${DEVIN_WEBHOOK_SECRET:-unset}"
 
 KUBECTL=(kubectl)
 HELM=(helm)
@@ -89,7 +91,7 @@ log "Ensuring namespace ${NAMESPACE}..."
 
 log "Rendering Alertmanager config Secret (alertmanager-config)..."
 # shellcheck disable=SC2016  # envsubst takes the literal variable list
-envsubst '${DEVIN_WEBHOOK_URL} ${SLACK_WEBHOOK_URL}' \
+envsubst '${DEVIN_WEBHOOK_URL} ${DEVIN_WEBHOOK_SECRET} ${SLACK_WEBHOOK_URL}' \
   <"$VALUES_DIR/alertmanager/alertmanager.yaml.tpl" \
   | "${KUBECTL[@]}" -n "$NAMESPACE" create secret generic alertmanager-config \
       --from-file=alertmanager.yaml=/dev/stdin --dry-run=client -o yaml \
