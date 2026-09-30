@@ -1,0 +1,18 @@
+# https://docs.devin.ai/onboard-devin/environment-yaml
+# Commands run from the repo root.
+# Install project dependencies (runs every session).
+maintenance: |
+  (cd cdk && npm install)
+# Reference info for agent
+knowledge:
+  - name: build
+    contents: |
+      (cd cdk && npm run build)
+  - name: test
+    contents: |
+      # No test directory exists yet; jest is configured but has no tests.
+      (cd cdk && npm test)
+  - name: lint
+    contents: |
+      # No dedicated linter configured. tsc strict build serves as typecheck.
+      (cd cdk && npm run build)
